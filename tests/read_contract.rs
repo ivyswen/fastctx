@@ -1099,7 +1099,7 @@ fn read_lossy_rendering_of_an_actual_non_utf8_filename_has_the_exact_boundary_er
     let lossy = normalized(&path);
     assert!(lossy.contains('\u{FFFD}'));
     let mut input = request(&path);
-    input.file_path = lossy.clone();
+    input.file_path = Some(lossy.clone());
     assert_eq!(
         error_text(read_file(input)),
         format!(

@@ -102,9 +102,9 @@ fn validate_entries(entries: &[BatchReadEntry]) -> Result<(), String> {
         } else {
             parsed
         };
-        let mut key = display_path(&key_path);
+        let key = display_path(&key_path);
         #[cfg(windows)]
-        key.make_ascii_lowercase();
+        let key = key.to_ascii_lowercase();
         if !seen.insert(key) {
             return Err(format!(
                 "Duplicate path in files: {}. List each file once.",
