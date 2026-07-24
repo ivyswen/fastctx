@@ -8,7 +8,13 @@ use std::process::Command;
 
 #[test]
 fn independent_o200k_oracle_keeps_high_entropy_outputs_below_the_budget() {
-    const BUDGET: usize = 256;
+    // The batch case has to return a continuation note carrying three absolute paths,
+    // and temp roots differ per platform: macOS hands out
+    // /private/var/folders/<hash>/T/, which costs far more tokens than Linux's /tmp.
+    // Below roughly 384 the batch call refuses on macOS alone, and padding a fixture
+    // path to compensate proves nothing, because the tokenizer collapses repeated
+    // characters that a real hash segment never has (2026-07-24).
+    const BUDGET: usize = 512;
 
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("entropy.txt");
