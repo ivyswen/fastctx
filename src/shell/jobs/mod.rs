@@ -1736,6 +1736,70 @@ mod tests {
     }
 
     #[test]
+    fn a_capture_failure_on_a_direct_log_keeps_the_exit_status_and_points_at_the_log() {
+        let budget = TokenBudget {
+            value: 8_500,
+            variable: "FASTCTX_TOKEN_BUDGET",
+        };
+        let rendered = format_snapshot(
+            "j-000003",
+            0,
+            &OutputSnapshot {
+                status: exited(17, 1),
+                head: vec![StoredLine {
+                    seq: 1,
+                    bytes: b"output".to_vec(),
+                    total_bytes: 6,
+                    stream_encoding: None,
+                    legacy_text: None,
+                    known_truncated: false,
+                }],
+                tail: Vec::new(),
+                unread_first: 1,
+                unread_last: 1,
+                all_unread_loaded: true,
+                total_lines: 1,
+                legacy_loss: false,
+                capture_error: Some(CaptureErrorRecord {
+                    after_seq: 1,
+                    reason: "disk unavailable".to_string(),
+                }),
+                default_encoding: None,
+                anchor: 0,
+                direct_log: Some(PathBuf::from("/jobs/j-000003/output.log")),
+            },
+            None,
+            budget,
+        )
+        .unwrap();
+        assert!(
+            rendered
+                .response
+                .contains("output capture failed after seq 1: disk unavailable"),
+            "{}",
+            rendered.response
+        );
+        assert!(
+            rendered
+                .response
+                .contains("This does not kill the process; its exit status remains available"),
+            "{}",
+            rendered.response
+        );
+        assert!(
+            rendered.response.contains("output.log") && rendered.response.contains("stops here.)"),
+            "{}",
+            rendered.response
+        );
+        assert!(
+            rendered.response.contains("exited 17"),
+            "{}",
+            rendered.response
+        );
+        assert!(!rendered.response.contains("legacy record"));
+    }
+
+    #[test]
     fn running_no_output_terminal_stops_recommending_wait_growth_at_the_maximum() {
         let budget = TokenBudget {
             value: 8_500,

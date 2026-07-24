@@ -1138,6 +1138,14 @@ fn killing_the_supervisor_reports_interrupted_and_leaves_no_command_descendant()
     assert!(second.close().success());
 }
 
+// Provoking a capture failure means making a write fail on a handle the supervisor
+// already holds, because the log is opened before `run_background` answers. Windows
+// mandatory locking does that from the outside; POSIX offers no equivalent, since
+// renaming or unlinking the job directory is invisible to an open descriptor, which
+// keeps writing to the same inode. The note itself, and its fallback to the exit
+// record, are locked on every platform by the `format_snapshot` unit tests in
+// `src/shell/jobs/mod.rs` (2026-07-24).
+#[cfg(windows)]
 #[test]
 fn capture_failure_keeps_the_command_running_and_falls_back_to_the_exit_record() {
     let _serial = shell_contract_guard();
@@ -1157,16 +1165,8 @@ fn capture_failure_keeps_the_command_running_and_falls_back_to_the_exit_record()
     let job_id = started_job_id(mcp_text(&started));
     let jobs = temp.path().join(".fastctx").join("jobs");
     let original = jobs.join(&job_id);
-    #[cfg(unix)]
-    let displaced = jobs.join(format!("{job_id}.displaced"));
-    #[cfg(unix)]
-    std::fs::rename(&original, &displaced).unwrap();
-    #[cfg(windows)]
     let capture_block = lock_output_log(&original.join("output.log"));
     wait_until(Duration::from_secs(5), || continued.exists());
-    #[cfg(unix)]
-    std::fs::rename(&displaced, &original).unwrap();
-    #[cfg(windows)]
     drop(capture_block);
 
     let final_text = wait_for_complete_from(&mut session, &job_id, Some(0));
@@ -1684,6 +1684,7 @@ fn expected_legacy_code_page_label() -> Option<&'static str> {
     None
 }
 
+#[cfg(windows)]
 fn wait_until(mut timeout: Duration, mut predicate: impl FnMut() -> bool) {
     let step = Duration::from_millis(20);
     while !predicate() {
