@@ -383,13 +383,15 @@ direct_only_tool_namespaces = ["mcp__fastctx"]
 
 Apply maintains this setting automatically and writes a guidance block with explicit markers to `~/.codex/AGENTS.md`. The guidance scopes FastCtx to local-file reading, searching, and finding, tells the model to read only what the task needs, and directs several known files into one `files=[...]` read call.
 
-The control terminal provides three output tiers. Each keeps FastCtx's internal budget at 85% of the host limit so responses close before Codex can truncate their terminal status:
+The control terminal provides three output tiers. Each keeps FastCtx's internal budget at 90% of the host limit so responses close before Codex can truncate their terminal status:
 
-- `Compact`: host limit 10,000; FastCtx budget 8,500;
-- `Standard`: the default, with host limit 20,000 and FastCtx budget 17,000;
-- `High`: host limit 30,000; FastCtx budget 25,500.
+- `Compact`: host limit 20,000; FastCtx budget 18,000;
+- `Standard`: the default, with host limit 60,000 and FastCtx budget 54,000;
+- `High`: host limit 100,000; FastCtx budget 90,000.
 
 Higher output tiers allow larger results per call and consume context faster. Choose a tier according to the task.
+
+Only `read` grows with the tier; the other four long-output tools keep a share sized for what they actually need, so raising the tier buys packing capacity for multi-file reads rather than inflating every result. Each tool's share can be set to any whole percentage in the control terminal, and a share left alone follows the tier.
 
 <details>
 <summary>Manual MCP registration</summary>
