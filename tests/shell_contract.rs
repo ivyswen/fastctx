@@ -30,6 +30,118 @@ fn enable_shell_adds_exactly_five_tools_to_the_file_server() {
 }
 
 #[test]
+fn background_status_tracks_only_known_jobs_and_consumes_terminal_entries_explicitly() {
+    let _serial = shell_contract_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let probe = temp.path().join("probe.txt");
+    std::fs::write(&probe, "probe\n").unwrap();
+    let read_arguments = serde_json::json!({"file_path": normalized(&probe)});
+    let mut session = shell_session(temp.path(), None);
+
+    let running_start = session.call(
+        "run_background",
+        serde_json::json!({"command": "sleep 30", "login_shell": false}),
+    );
+    let running = started_job_id(mcp_text(&running_start));
+    assert!(!mcp_text(&running_start).contains("(Background:"));
+
+    let read = session.call("read", read_arguments.clone());
+    let read_text = mcp_text(&read);
+    let read_lines = read_text.lines().collect::<Vec<_>>();
+    assert!(
+        read_lines[read_lines.len() - 2].starts_with(&format!("(Background: {running} running ")),
+        "{read_text}"
+    );
+    assert!(read_lines.last().unwrap().starts_with("(Complete:"));
+
+    let missing = session.call(
+        "read",
+        serde_json::json!({"file_path": normalized(&temp.path().join("missing.txt"))}),
+    );
+    assert_eq!(missing["result"]["isError"], true);
+    assert!(!mcp_text(&missing).contains("(Background:"));
+
+    let mut other = shell_session(temp.path(), None);
+    let isolated = other.call("read", read_arguments.clone());
+    assert!(!mcp_text(&isolated).contains("(Background:"));
+    assert!(other.close().success());
+
+    let finished_start = session.call(
+        "run_background",
+        serde_json::json!({"command": "exit 7", "login_shell": false}),
+    );
+    let finished = started_job_id(mcp_text(&finished_start));
+    let start_status = mcp_text(&finished_start)
+        .lines()
+        .find(|line| line.starts_with("(Background:"))
+        .unwrap();
+    assert!(start_status.contains(&running), "{start_status}");
+    assert!(!start_status.contains(&finished), "{start_status}");
+
+    let exit_record = temp
+        .path()
+        .join(".fastctx")
+        .join("jobs")
+        .join(&finished)
+        .join("exit.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !exit_record.exists() {
+        assert!(Instant::now() < deadline, "job {finished} did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let both = session.call("read", read_arguments.clone());
+    let both_status = mcp_text(&both)
+        .lines()
+        .find(|line| line.starts_with("(Background:"))
+        .unwrap();
+    assert!(both_status.contains(&format!("{running} running ")));
+    assert!(both_status.contains(&format!("{finished} exited 7")));
+
+    let listed = session.call(
+        "job_list",
+        serde_json::json!({"status": "all", "limit": 100}),
+    );
+    let list_status = mcp_text(&listed)
+        .lines()
+        .find(|line| line.starts_with("(Background:"))
+        .unwrap();
+    assert!(list_status.contains(&running));
+    assert!(list_status.contains(&finished));
+    let after_list = session.call("read", read_arguments.clone());
+    let after_list_status = mcp_text(&after_list)
+        .lines()
+        .find(|line| line.starts_with("(Background:"))
+        .unwrap();
+    assert!(after_list_status.contains(&running));
+    assert!(after_list_status.contains(&finished));
+
+    let consumed = session.call(
+        "job_output",
+        serde_json::json!({"job_id": &finished, "wait_ms": 0}),
+    );
+    let consumed_status = mcp_text(&consumed)
+        .lines()
+        .find(|line| line.starts_with("(Background:"))
+        .unwrap();
+    assert!(consumed_status.contains(&running));
+    assert!(!consumed_status.contains(&finished));
+    let after_output = session.call("read", read_arguments.clone());
+    let after_output_status = mcp_text(&after_output)
+        .lines()
+        .find(|line| line.starts_with("(Background:"))
+        .unwrap();
+    assert!(after_output_status.contains(&running));
+    assert!(!after_output_status.contains(&finished));
+
+    let killed = session.call("job_kill", serde_json::json!({"job_id": &running}));
+    assert!(!mcp_text(&killed).contains("(Background:"));
+    let empty = session.call("read", read_arguments);
+    assert!(!mcp_text(&empty).contains("(Background:"));
+    assert!(session.close().success());
+}
+
+#[test]
 fn foreground_run_preserves_order_normalizes_output_and_marks_long_line_loss() {
     let _serial = shell_contract_guard();
     let temp = tempfile::tempdir().unwrap();
@@ -88,7 +200,7 @@ fn foreground_run_preserves_order_normalizes_output_and_marks_long_line_loss() {
     assert!(text.starts_with(&"0".repeat(2_000)));
     assert!(text.contains("... [line truncated: 400000 bytes total]"));
     assert!(text.ends_with(
-        "(Partial: exited 0; 1 line shown, but one or more long lines were truncated at 2000 chars. Redirect to a file (command > file 2>&1) and inspect the long line with the read tool's hex view or grep.)"
+        "(Partial: exited 0; 1 line shown, but one or more long lines were truncated at 2000 chars.)"
     ));
     assert_no_shell_artifacts(temp.path());
     assert!(session.close().success());
@@ -204,7 +316,7 @@ fn foreground_delivery_time_decoding_covers_explicit_auto_bom_and_lossy_paths() 
         "{long_gbk_text}"
     );
     assert!(long_gbk_text.ends_with(
-        "(Partial: exited 0; 1 line shown, but one or more long lines were truncated at 2000 chars. Redirect to a file (command > file 2>&1) and inspect the long line with the read tool's hex view or grep.)"
+        "(Partial: exited 0; 1 line shown, but one or more long lines were truncated at 2000 chars.)"
     ));
 
     assert!(session.close().success());
@@ -252,9 +364,8 @@ fn foreground_budget_uses_head_and_tail_without_writing_a_spill_file() {
     assert!(text.contains("line-200"), "{text}");
     assert!(text.contains("... ["), "{text}");
     assert!(text.contains(" of 200 lines; exited 0."), "{text}");
-    assert!(text.ends_with(
-        "Re-run with output redirected to a file (command > file 2>&1) and page it with the read tool.)"
-    ));
+    assert!(text.contains("(Partial: showing the first "), "{text}");
+    assert!(text.ends_with(" of 200 lines; exited 0.)"), "{text}");
     assert_no_shell_artifacts(temp.path());
     assert!(session.close().success());
 }
@@ -521,7 +632,7 @@ fn job_output_wait_window_delivers_accumulated_output_without_returning_on_each_
     assert_eq!(job_body_lines(mcp_text(&output)), ["first", "second"]);
     assert!(
         mcp_text(&output).ends_with(&format!(
-            "(Partial: job {job_id} is running; 2 new lines shown. Call job_output again for more, or do other work first and check back.)"
+            "(Partial: job {job_id} is running; 2 new lines shown. Call job_output again for more, or move on and check back.)"
         )),
         "{}",
         mcp_text(&output)
@@ -727,7 +838,7 @@ fn background_raw_bytes_support_default_decoding_and_same_page_explicit_rereads(
     assert_eq!(
         lossy,
         format!(
-            "{}\n\n����\n\n(Partial: job {job_id} is running; 1 new line shown. Call job_output again for more, or do other work first and check back.)",
+            "{}\n\n����\n\n(Partial: job {job_id} is running; 1 new line shown. Call job_output again for more, or move on and check back.)",
             expected_job_garble_note(4, 0)
         )
     );
@@ -738,7 +849,7 @@ fn background_raw_bytes_support_default_decoding_and_same_page_explicit_rereads(
     assert_eq!(
         restored,
         format!(
-            "中文\n\n(Note: decoded from GBK as requested; output is UTF-8.)\n(Partial: job {job_id} is running; 1 new line shown. Call job_output again for more, or do other work first and check back.)"
+            "中文\n\n(Note: decoded from GBK as requested; output is UTF-8.)\n(Partial: job {job_id} is running; 1 new line shown. Call job_output again for more, or move on and check back.)"
         )
     );
     let killed = second.call("job_kill", serde_json::json!({"job_id": job_id}));
@@ -760,14 +871,14 @@ fn background_raw_bytes_support_default_decoding_and_same_page_explicit_rereads(
     assert_eq!(
         inherited,
         format!(
-            "中文\n\n(Note: decoded from GBK as requested; output is UTF-8.)\n(Partial: job {default_id} is running; 1 new line shown. Call job_output again for more, or do other work first and check back.)"
+            "中文\n\n(Note: decoded from GBK as requested; output is UTF-8.)\n(Partial: job {default_id} is running; 1 new line shown. Call job_output again for more, or move on and check back.)"
         )
     );
     let overridden = wait_for_job_page(&mut second, &default_id, Some("utf-8"), "after_seq=0");
     assert_eq!(
         overridden,
         format!(
-            "{}\n\n����\n\n(Partial: job {default_id} is running; 1 new line shown. Call job_output again for more, or do other work first and check back.)",
+            "{}\n\n����\n\n(Partial: job {default_id} is running; 1 new line shown. Call job_output again for more, or move on and check back.)",
             expected_job_garble_note(4, 0)
         )
     );
@@ -797,7 +908,7 @@ fn background_default_utf8_decoding_stays_fixed_across_pages() {
     assert_eq!(
         first,
         format!(
-            "{}\n\n����\n\n(Partial: job {job_id} is running; 1 new line shown. Call job_output again for more, or do other work first and check back.)",
+            "{}\n\n����\n\n(Partial: job {job_id} is running; 1 new line shown. Call job_output again for more, or move on and check back.)",
             expected_job_garble_note(4, 0)
         )
     );
@@ -805,7 +916,7 @@ fn background_default_utf8_decoding_stays_fixed_across_pages() {
     assert_eq!(
         second,
         format!(
-            "{}\n\n����\n\n(Partial: job {job_id} is running; 1 new line shown. Call job_output again for more, or do other work first and check back.)",
+            "{}\n\n����\n\n(Partial: job {job_id} is running; 1 new line shown. Call job_output again for more, or move on and check back.)",
             expected_job_garble_note(4, 1)
         )
     );
@@ -933,7 +1044,7 @@ fn global_background_limit_and_job_ids_survive_across_server_instances() {
         );
         assert!(
             mcp_text(&output).ends_with(&format!(
-                "(Partial: job {id} is running; no new output within 0 ms. Call job_output again with a larger wait_ms (up to 60000), or do other work first and check back.)"
+                "(Partial: job {id} is running; no new output within 0 ms. Move on and check back, or raise wait_ms if you have nothing else to do.)"
             )),
             "{}",
             mcp_text(&output)
@@ -966,9 +1077,13 @@ fn job_list_defaults_to_running_uses_the_saved_page_size_and_requires_explicit_h
         .collect::<Vec<_>>();
 
     let default_page = mcp_text(&session.call("job_list", serde_json::json!({}))).to_string();
-    assert!(default_page.contains(&running[1]), "{default_page}");
-    assert!(!default_page.contains(&running[0]), "{default_page}");
-    assert!(!default_page.contains(&finished), "{default_page}");
+    let default_page_body = default_page
+        .split("\n\n(Background:")
+        .next()
+        .expect("job list response has a body");
+    assert!(default_page_body.contains(&running[1]), "{default_page}");
+    assert!(!default_page_body.contains(&running[0]), "{default_page}");
+    assert!(!default_page_body.contains(&finished), "{default_page}");
     assert!(
         default_page.ends_with("Call job_list again with status=\"running\", limit=1, offset=1.)"),
         "{default_page}"
@@ -976,8 +1091,12 @@ fn job_list_defaults_to_running_uses_the_saved_page_size_and_requires_explicit_h
 
     let finished_page =
         mcp_text(&session.call("job_list", serde_json::json!({"status": "finished"}))).to_string();
-    assert!(finished_page.contains(&finished), "{finished_page}");
-    assert!(!finished_page.contains(&running[0]), "{finished_page}");
+    let finished_page_body = finished_page
+        .split("\n\n(Background:")
+        .next()
+        .expect("job list response has a body");
+    assert!(finished_page_body.contains(&finished), "{finished_page}");
+    assert!(!finished_page_body.contains(&running[0]), "{finished_page}");
 
     let all = mcp_text(&session.call(
         "job_list",
@@ -1312,8 +1431,8 @@ fn shell_error_catalog_uses_fastctx_names_and_rejects_invalid_inputs() {
         ),
         (
             "job_output",
-            serde_json::json!({"job_id": "missing", "wait_ms": 60001}),
-            "Invalid wait_ms value: 60001. Expected an integer from 0 to 60000.",
+            serde_json::json!({"job_id": "missing", "wait_ms": 240001}),
+            "Invalid wait_ms value: 240001. Expected an integer from 0 to 240000.",
         ),
         (
             "job_output",
@@ -1453,7 +1572,8 @@ fn bash_quote(path: &Path) -> String {
 }
 
 fn started_job_id(text: &str) -> String {
-    let body = text
+    let terminal = text.lines().last().unwrap_or(text);
+    let body = terminal
         .strip_prefix("(Complete: job ")
         .and_then(|value| value.strip_suffix(".)"))
         .unwrap_or_else(|| {
@@ -1468,7 +1588,8 @@ fn started_job_id(text: &str) -> String {
 }
 
 fn started_job_log(text: &str) -> String {
-    let body = text
+    let terminal = text.lines().last().unwrap_or(text);
+    let body = terminal
         .strip_prefix("(Complete: job ")
         .and_then(|value| value.strip_suffix(".)"))
         .unwrap_or_else(|| panic!("invalid run_background terminal: {text:?}"));

@@ -1,13 +1,17 @@
 //! Persistent background jobs whose supervisors and records outlive every MCP server session.
 
 pub(crate) mod admission;
+mod background;
 mod host;
 mod identity;
 mod model;
 mod output_log;
 mod store;
 
-use crate::budget::{TokenBudget, estimate_tokens};
+use crate::budget::{
+    GLOBAL_TOKEN_BUDGET_ENV, JOB_OUTPUT_TOKEN_BUDGET_ENV, TokenBudget, estimate_tokens,
+    relax_tool_token_budget, tool_token_budget_for_required,
+};
 use crate::control::paths::ControlPaths;
 use crate::model::ToolResponse;
 use crate::paths::display_path;
@@ -24,7 +28,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const KILL_ACK_TIMEOUT: Duration = Duration::from_secs(6);
 const REGISTRY_POLL: Duration = Duration::from_millis(20);
@@ -35,6 +39,7 @@ pub(crate) struct JobManager {
     executable: Result<PathBuf, String>,
     admission_generation: Result<u64, String>,
     cursors: Arc<Mutex<HashMap<String, u64>>>,
+    background: background::BackgroundTracker,
 }
 
 #[derive(Clone, Debug)]
@@ -164,6 +169,7 @@ impl JobManager {
                 .map_err(|error| format!("Cannot locate the running fastctx binary: {error}")),
             admission_generation,
             cursors: Arc::new(Mutex::new(HashMap::new())),
+            background: background::BackgroundTracker::default(),
         }
     }
 
@@ -229,18 +235,21 @@ impl JobManager {
             ));
         }
 
-        let budget = match global_token_budget() {
+        let log_path = job_dir.join(model::OUTPUT_LOG_FILE);
+        let terminal = format!(
+            "(Complete: job {job_id} started; log at {}.)",
+            display_path(&log_path)
+        );
+        let budget = match tool_token_budget_for_required(
+            GLOBAL_TOKEN_BUDGET_ENV,
+            estimate_tokens(&terminal),
+        ) {
             Ok(budget) => budget,
             Err(error) => {
                 store::remove_reserved_job(&job_dir);
                 return ToolResponse::error(error);
             }
         };
-        let log_path = job_dir.join(model::OUTPUT_LOG_FILE);
-        let terminal = format!(
-            "(Complete: job {job_id} started; log at {}.)",
-            display_path(&log_path)
-        );
         if estimate_tokens(&terminal) > budget.value {
             store::remove_reserved_job(&job_dir);
             return ToolResponse::error(budget_too_small_message(budget));
@@ -257,7 +266,10 @@ impl JobManager {
             origin: store::origin_snapshot(&server_cwd),
         };
         match host::launch_supervisor(executable, &spec) {
-            Ok(()) => ToolResponse::text(terminal),
+            Ok(()) => {
+                self.background.track_id(&job_id, SystemTime::now());
+                ToolResponse::text(terminal)
+            }
             Err(error) => {
                 let live = store::read_json::<model::JobMeta>(
                     &job_dir.join(model::META_FILE),
@@ -286,7 +298,7 @@ impl JobManager {
             Ok(paths) => paths,
             Err(error) => return ToolResponse::error(error),
         };
-        let budget = match job_output_token_budget() {
+        let mut budget = match job_output_token_budget() {
             Ok(budget) => budget,
             Err(error) => return ToolResponse::error(error),
         };
@@ -308,8 +320,14 @@ impl JobManager {
                 );
             }
             let record = match store::find_record(&paths.jobs_dir, job_id) {
-                Ok(Some(record)) => record,
-                Ok(None) => return missing_job(job_id),
+                Ok(Some(record)) => {
+                    self.background.track_record(&record, SystemTime::now());
+                    record
+                }
+                Ok(None) => {
+                    self.background.remove(job_id);
+                    return missing_job(job_id);
+                }
                 Err(error) => return ToolResponse::error(error),
             };
             let capture_failed = match store::capture_error(&record) {
@@ -336,18 +354,47 @@ impl JobManager {
                 ));
             }
         };
-        let snapshot = match load_output_snapshot(&record, anchor, default_encoding, budget) {
-            Ok(snapshot) => snapshot,
-            Err(error) => return ToolResponse::error(error),
-        };
-        let page = match format_snapshot(job_id, wait_ms, &snapshot, encoding, budget) {
-            Ok(page) => page,
-            Err(error) => return ToolResponse::error(error),
+        let page = loop {
+            let snapshot = match load_output_snapshot(&record, anchor, default_encoding, budget) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    if error.to_ascii_lowercase().contains("too small to return") {
+                        match relax_tool_token_budget(JOB_OUTPUT_TOKEN_BUDGET_ENV) {
+                            Ok(Some(expanded)) => {
+                                budget = expanded;
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(config_error) => return ToolResponse::error(config_error),
+                        }
+                    }
+                    return ToolResponse::error(error);
+                }
+            };
+            match format_snapshot(job_id, wait_ms, &snapshot, encoding, budget) {
+                Ok(page) => break page,
+                Err(error) => {
+                    if error.to_ascii_lowercase().contains("too small to return") {
+                        match relax_tool_token_budget(JOB_OUTPUT_TOKEN_BUDGET_ENV) {
+                            Ok(Some(expanded)) => {
+                                budget = expanded;
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(config_error) => return ToolResponse::error(config_error),
+                        }
+                    }
+                    return ToolResponse::error(error);
+                }
+            }
         };
         if let Some(cursor_seq) = page.cursor_seq {
             let mut cursors = self.cursors.lock().unwrap();
             let cursor = cursors.entry(job_id.to_string()).or_insert(0);
             *cursor = (*cursor).max(cursor_seq);
+        }
+        if !record.status.is_running() {
+            self.background.remove(job_id);
         }
         ToolResponse::text(page.response)
     }
@@ -358,14 +405,27 @@ impl JobManager {
             Err(error) => return ToolResponse::error(error),
         };
         let killed = format!("(Complete: job {job_id} killed.)");
-        let budget = match global_token_budget() {
+        let required = [
+            estimate_tokens(&killed),
+            estimate_tokens(&format!(
+                "(Complete: job {job_id} had already exited with code {}.)",
+                i32::MIN
+            )),
+            estimate_tokens(&format!(
+                "(Complete: job {job_id} had already been interrupted.)"
+            )),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        let budget = match tool_token_budget_for_required(GLOBAL_TOKEN_BUDGET_ENV, required) {
             Ok(budget) => budget,
             Err(error) => return ToolResponse::error(error),
         };
         if estimate_tokens(&killed) > budget.value {
             return ToolResponse::error(budget_too_small_message(budget));
         }
-        match terminate(paths, job_id) {
+        let response = match terminate(paths, job_id) {
             Ok(KillState::Killed) => ToolResponse::text(killed),
             Ok(KillState::AlreadyExited(code)) => global_terminal(format!(
                 "(Complete: job {job_id} had already exited with code {code}.)"
@@ -373,8 +433,17 @@ impl JobManager {
             Ok(KillState::AlreadyInterrupted) => global_terminal(format!(
                 "(Complete: job {job_id} had already been interrupted.)"
             )),
-            Err(error) => ToolResponse::error(error),
+            Err(error) => {
+                if matches!(store::find_record(&paths.jobs_dir, job_id), Ok(None)) {
+                    self.background.remove(job_id);
+                }
+                return ToolResponse::error(error);
+            }
+        };
+        if !response.is_error {
+            self.background.remove(job_id);
         }
+        response
     }
 
     pub(crate) fn list(
@@ -403,6 +472,18 @@ impl JobManager {
 
     fn paths(&self) -> Result<&ControlPaths, String> {
         self.paths.as_ref().map_err(Clone::clone)
+    }
+
+    pub(crate) fn background_status_at(
+        &self,
+        exclude: Option<&str>,
+        now: SystemTime,
+    ) -> Option<crate::background_status::BackgroundStatus> {
+        if !self.background.has_candidates(exclude) {
+            return None;
+        }
+        let paths = self.paths().ok()?;
+        self.background.snapshot(paths, exclude, now)
     }
 }
 
@@ -828,17 +909,17 @@ fn output_terminal(
     if let JobStatus::Running = snapshot.status {
         if shown > 0 {
             return format!(
-                "(Partial: job {job_id} is running; {shown} new {} shown. Call job_output again for more, or do other work first and check back.)",
+                "(Partial: job {job_id} is running; {shown} new {} shown. Call job_output again for more, or move on and check back.)",
                 plural(shown as u64, "line", "lines")
             );
         }
-        if wait_ms < 60_000 {
+        if wait_ms < crate::shell::MAX_BLOCKING_CALL_MS {
             return format!(
-                "(Partial: job {job_id} is running; no new output within {wait_ms} ms. Call job_output again with a larger wait_ms (up to 60000), or do other work first and check back.)"
+                "(Partial: job {job_id} is running; no new output within {wait_ms} ms. Move on and check back, or raise wait_ms if you have nothing else to do.)"
             );
         }
         return format!(
-            "(Partial: job {job_id} is running; no new output within {wait_ms} ms. It may stay quiet for a long time, or never exit — do other work first and check back.)"
+            "(Partial: job {job_id} is running; no new output within {wait_ms} ms. It may stay quiet for a long time, or never exit — move on and check back.)"
         );
     }
     if let Some(path) = snapshot.direct_log.as_ref() {
@@ -902,11 +983,28 @@ fn format_job_list(
     offset: u64,
     limit: u64,
 ) -> ToolResponse {
-    let budget = match global_token_budget() {
+    let mut budget = match global_token_budget() {
         Ok(budget) => budget,
         Err(error) => return ToolResponse::error(error),
     };
-    format_job_list_with_budget(records, status, offset, limit, budget)
+    loop {
+        let response = format_job_list_with_budget(records.clone(), status, offset, limit, budget);
+        let starved = response.is_error
+            && response.content.iter().any(|content| {
+                matches!(content, crate::ToolContent::Text(text) if text.to_ascii_lowercase().contains("too small to return"))
+            });
+        if starved {
+            match relax_tool_token_budget(GLOBAL_TOKEN_BUDGET_ENV) {
+                Ok(Some(expanded)) => {
+                    budget = expanded;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => return ToolResponse::error(error),
+            }
+        }
+        return response;
+    }
 }
 
 fn format_job_list_with_budget(
@@ -1645,6 +1743,7 @@ mod tests {
             executable: Ok(temp.path().join("fastctx")),
             admission_generation: Ok(generation),
             cursors: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            background: super::background::BackgroundTracker::default(),
         };
         let mut admission = super::admission::AdmissionGuard::acquire(&paths).unwrap();
         admission.advance_generation().unwrap();
@@ -1824,14 +1923,16 @@ mod tests {
         assert!(
             immediate
                 .response
-                .contains("with a larger wait_ms (up to 60000)")
+                .contains("raise wait_ms if you have nothing else to do")
         );
-        let maximum = format_snapshot("j-000001", 60_000, &snapshot, None, budget).unwrap();
+        assert!(!immediate.response.contains("60000"));
+        assert!(!immediate.response.contains("240000"));
+        let maximum = format_snapshot("j-000001", 240_000, &snapshot, None, budget).unwrap();
         assert!(
             maximum
                 .response
                 .contains("It may stay quiet for a long time, or never exit")
         );
-        assert!(!maximum.response.contains("larger wait_ms"));
+        assert!(!maximum.response.contains("raise wait_ms"));
     }
 }

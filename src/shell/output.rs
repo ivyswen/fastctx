@@ -2,7 +2,7 @@
 
 use crate::budget::{
     JOB_OUTPUT_TOKEN_BUDGET_ENV, RUN_TOKEN_BUDGET_ENV, TokenBudget, estimate_tokens, token_budget,
-    tool_token_budget,
+    tool_token_budget, tool_token_budget_for_required,
 };
 use crate::model::ToolResponse;
 use crate::shell::apply_patch_hint;
@@ -72,7 +72,6 @@ pub(crate) fn capture_foreground(mut reader: impl Read) -> std::io::Result<Captu
 
 /// Rejects an unusably small run budget before a command can cause side effects.
 pub(crate) fn validate_run_budget(timeout_ms: u64) -> Result<TokenBudget, String> {
-    let budget = run_token_budget()?;
     let maximum = u64::MAX;
     let drop_note = dropped_note(maximum).expect("a positive count always creates a note");
     let ring_loss_terminal = window_terminal(i32::MIN, None, 0, 0, maximum);
@@ -85,11 +84,11 @@ pub(crate) fn validate_run_budget(timeout_ms: u64) -> Result<TokenBudget, String
         format!("(Complete: exited {}; no output.)", i32::MIN),
         format!("(Complete: exited {}; {maximum} lines.)", i32::MIN),
         format!(
-            "(Partial: exited {}; {maximum} lines shown, but one or more long lines were truncated at 2000 chars. Redirect to a file (command > file 2>&1) and inspect the long line with the read tool's hex view or grep.)",
+            "(Partial: exited {}; {maximum} lines shown, but one or more long lines were truncated at 2000 chars.)",
             i32::MIN
         ),
         format!(
-            "(Partial: showing the first 0 and last 0 of {maximum} lines; exited {}. Re-run with output redirected to a file (command > file 2>&1) and page it with the read tool.)",
+            "(Partial: showing the first 0 and last 0 of {maximum} lines; exited {}.)",
             i32::MIN
         ),
         format!(
@@ -103,10 +102,13 @@ pub(crate) fn validate_run_budget(timeout_ms: u64) -> Result<TokenBudget, String
         ),
         ring_loss,
     ];
-    if candidates
+    let required = candidates
         .iter()
-        .all(|candidate| estimate_tokens(candidate) <= budget.value)
-    {
+        .map(|candidate| estimate_tokens(candidate))
+        .max()
+        .unwrap_or(0);
+    let budget = tool_token_budget_for_required(RUN_TOKEN_BUDGET_ENV, required)?;
+    if required <= budget.value {
         Ok(budget)
     } else {
         Err(budget_too_small_message(budget))
@@ -136,7 +138,9 @@ pub(crate) fn budget_too_small_message(budget: TokenBudget) -> String {
 }
 
 pub(crate) fn terminal_response(terminal: String, budget: TokenBudget) -> ToolResponse {
-    if estimate_tokens(&terminal) <= budget.value {
+    let required = estimate_tokens(&terminal);
+    let budget = tool_token_budget_for_required(budget.variable, required).unwrap_or(budget);
+    if required <= budget.value {
         ToolResponse::text(terminal)
     } else {
         ToolResponse::error(budget_too_small_message(budget))
@@ -227,7 +231,7 @@ fn full_terminal(
         ),
         None if total == 0 => format!("(Complete: exited {exit_code}; no output.)"),
         None if had_truncation => format!(
-            "(Partial: exited {exit_code}; {total} {} shown, but one or more long lines were truncated at 2000 chars. Redirect to a file (command > file 2>&1) and inspect the long line with the read tool's hex view or grep.)",
+            "(Partial: exited {exit_code}; {total} {} shown, but one or more long lines were truncated at 2000 chars.)",
             plural(total, "line", "lines")
         ),
         None => format!(
@@ -246,7 +250,7 @@ fn window_terminal(
 ) -> String {
     match timeout_ms {
         None => format!(
-            "(Partial: showing the first {first} and last {last} of {total} lines; exited {exit_code}. Re-run with output redirected to a file (command > file 2>&1) and page it with the read tool.)"
+            "(Partial: showing the first {first} and last {last} of {total} lines; exited {exit_code}.)"
         ),
         Some(timeout) => format!(
             "(Partial: timed out after {timeout} ms and the process tree was killed; showing the first {first} and last {last} of {total} captured lines. Increase timeout_ms or use run_background.)"
@@ -464,7 +468,7 @@ mod tests {
         assert_eq!(
             format_foreground_with_budget(&long, "true", 0, None, None, budget(8_500)),
             crate::ToolResponse::text(format!(
-                "{long_line}\n\n(Partial: exited 0; 1 line shown, but one or more long lines were truncated at 2000 chars. Redirect to a file (command > file 2>&1) and inspect the long line with the read tool's hex view or grep.)"
+                "{long_line}\n\n(Partial: exited 0; 1 line shown, but one or more long lines were truncated at 2000 chars.)"
             ))
         );
         assert_eq!(
@@ -500,9 +504,8 @@ mod tests {
         assert!(text.contains("line-001"), "{text}");
         assert!(text.contains("line-200"), "{text}");
         assert!(text.contains("... ["), "{text}");
-        assert!(text.ends_with(
-            "Re-run with output redirected to a file (command > file 2>&1) and page it with the read tool.)"
-        ));
+        assert!(text.contains("(Partial: showing the first "), "{text}");
+        assert!(text.ends_with("of 200 lines; exited 0.)"), "{text}");
         assert!(crate::budget::estimate_tokens(text) <= 160);
     }
 
@@ -538,7 +541,7 @@ mod tests {
         );
         assert_eq!(
             window_terminal(42, None, 2, 9, 20),
-            "(Partial: showing the first 2 and last 9 of 20 lines; exited 42. Re-run with output redirected to a file (command > file 2>&1) and page it with the read tool.)"
+            "(Partial: showing the first 2 and last 9 of 20 lines; exited 42.)"
         );
         assert_eq!(
             window_terminal(137, Some(500), 1, 8, 20),

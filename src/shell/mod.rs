@@ -18,11 +18,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-const MAX_TIMEOUT_MS: u64 = 240_000;
+pub(crate) const MAX_BLOCKING_CALL_MS: u64 = 240_000;
 const DEFAULT_WAIT_MS: u64 = 30_000;
-const MAX_WAIT_MS: u64 = 60_000;
 
 fn default_login_shell() -> bool {
     true
@@ -78,7 +78,7 @@ pub struct JobOutputRequest {
     pub job_id: String,
     /// How long this query may take, in milliseconds. It returns earlier only when the job ends.
     /// Use 0 for an immediate snapshot.
-    #[schemars(default = "default_wait_ms", range(min = 0, max = 60_000))]
+    #[schemars(default = "default_wait_ms", range(min = 0, max = 240_000))]
     pub wait_ms: Option<u64>,
     /// Return output after this line number of the job's log. Omit to continue where your last
     /// call left off; pass it to re-read a stretch you already saw, for example with a different
@@ -157,7 +157,7 @@ impl FastShell {
             return ToolResponse::error("Invalid command: it must be a non-empty string.");
         }
         let timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
-        if !(1..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
+        if !(1..=MAX_BLOCKING_CALL_MS).contains(&timeout_ms) {
             return invalid_timeout(timeout_ms);
         }
         if let Err(error) = output::validate_run_budget(timeout_ms) {
@@ -228,9 +228,9 @@ impl FastShell {
         cancelled: impl Fn() -> bool,
     ) -> ToolResponse {
         let wait_ms = request.wait_ms.unwrap_or(DEFAULT_WAIT_MS);
-        if wait_ms > MAX_WAIT_MS {
+        if wait_ms > MAX_BLOCKING_CALL_MS {
             return ToolResponse::error(format!(
-                "Invalid wait_ms value: {wait_ms}. Expected an integer from 0 to 60000."
+                "Invalid wait_ms value: {wait_ms}. Expected an integer from 0 to 240000."
             ));
         }
         let encoding = match request
@@ -276,6 +276,13 @@ impl FastShell {
             offset as u64,
             request.limit.map(|limit| limit as u64),
         )
+    }
+
+    pub(crate) fn background_status(
+        &self,
+        exclude: Option<&str>,
+    ) -> Option<crate::background_status::BackgroundStatus> {
+        self.jobs.background_status_at(exclude, SystemTime::now())
     }
 }
 
@@ -338,12 +345,12 @@ mod tests {
         assert_eq!(
             shell.job_output(JobOutputRequest {
                 job_id: "missing".to_string(),
-                wait_ms: Some(60_001),
+                wait_ms: Some(240_001),
                 after_seq: None,
                 encoding: None,
             }),
             crate::ToolResponse::error(
-                "Invalid wait_ms value: 60001. Expected an integer from 0 to 60000."
+                "Invalid wait_ms value: 240001. Expected an integer from 0 to 240000."
             )
         );
     }

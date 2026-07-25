@@ -21,10 +21,17 @@ and concurrent jobs. `job_list` defaults to running jobs, with explicit
 finished/all views, and `fastshell.job_list_limit` controls its default page
 size (20, valid range 1–100). All three settings take effect immediately.
 `job_output` is a query with a caller-chosen delay: intermediate lines never
-end the wait, and every current-format job keeps a plain log file that `read`
-and `grep` can open for anything a response leaves out. Records from the
-preceding segmented format remain readable without pretending to have direct
-log coordinates or output that their original rolling window already evicted.
+end the wait (`wait_ms` is 0–240000 ms, default 30000), and every current-format
+job keeps a plain log file that `read` and `grep` can open for anything a
+response leaves out. `Complete` appears only after a job ends; servers and
+watchers may never reach it. Records from the preceding segmented format remain
+readable without pretending to have direct log coordinates or output that
+their original rolling window already evicted.
+While one server tracks jobs it started or queried, each successful text result
+also carries a one-line background readout of their current state and elapsed
+time. It refreshes only on tool calls; it is not a push notification, and
+nothing arrives if the caller stops. Finished entries remain until that server
+handles them with `job_output` or `job_kill`.
 
 grep/glob retains automatic CPU parallelism by default. The TUI can set the
 machine-level `search.max_cpu_cores` to any integer from 1 through the detected

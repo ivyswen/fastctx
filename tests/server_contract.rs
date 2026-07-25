@@ -37,24 +37,19 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
         read.description.as_deref(),
         Some(concat!(
             "Read one file (text, image, or PDF) or a batch of text files from the local\n",
-            "filesystem. Text returns 1-based `N<tab>content` lines, 2000 per page; page\n",
-            "with offset/limit. To read several text files in one call, pass\n",
-            "files=[{\"path\": ...}, ...] (1-32 entries, each with optional offset, limit,\n",
-            "and encoding) instead of file_path: contents are delivered in request order\n",
-            "within one token budget, per-file problems are reported inline without\n",
-            "failing the batch, and a Partial note returns the exact files array for the\n",
-            "next call. Images (PNG/JPG/GIF/WebP/BMP) are shown to you visually. PDFs\n",
-            "return the selected pages' text layer (pdf_mode=\"text\", default) or each\n",
-            "page rendered as an image (pdf_mode=\"image\"). Text mode requires `pages`\n",
-            "over 10 pages; image mode defaults to 4 pages. Max 20 pages per call.\n",
-            "view=\"hex\" dumps any file's raw bytes. PDFs, images, and hex view are\n",
-            "single-file only. Text output is always UTF-8; omit encoding for\n",
-            "conservative auto-detection — if uncertain it returns an error listing\n",
-            "candidate encodings instead of guessed text, so pass encoding (e.g. \"gbk\")\n",
-            "only when you know the source encoding or a prior read reported ambiguity.\n",
-            "Paths must be absolute. Text, PDF, and hex responses end with a Complete or\n",
-            "Partial status — continue only with the exact parameters a Partial note\n",
-            "provides."
+            "filesystem. Paths must be absolute. Text returns 1-based `N<tab>content`\n",
+            "lines, 2000 per page; page with offset/limit. For several text files in one\n",
+            "call, pass files=[{\"path\": ...}, ...] instead of file_path: one token\n",
+            "budget, per-file problems reported inline without failing the batch, and a\n",
+            "Partial note returns the exact files array for the next call. Images\n",
+            "(PNG/JPG/GIF/WebP/BMP) are shown to you visually. PDFs return the selected\n",
+            "pages' text layer or those pages rendered as images; image mode defaults to\n",
+            "4 pages. view=\"hex\" dumps any file's raw bytes. PDFs, images, and hex view\n",
+            "are single-file only. Text output is always UTF-8; when auto-detection is\n",
+            "not confident it returns an error listing candidate encodings instead of\n",
+            "guessed text, so pass encoding only then. Text, PDF, and hex responses end\n",
+            "with a Complete or Partial status — continue only with the exact parameters\n",
+            "a Partial note provides."
         ))
     );
     assert!(
@@ -98,21 +93,18 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
         grep.description.as_deref(),
         Some(concat!(
             "Fast regex content search (ripgrep engine; Rust regex, no lookaround). Output\n",
-            "modes: \"files_with_matches\" (default, paths only), \"content\" (matching lines,\n",
-            "optional context), \"count\" (per-file occurrence counts — total matches, not\n",
-            "matching-line count), \"summary\" (global totals only).\n",
-            "Respects .gitignore; searches hidden files; skips .git and binaries. Files are\n",
-            "decoded to UTF-8 before searching; files whose encoding can't be determined, or\n",
-            "that change during a directory search, are skipped and listed —\n",
-            "pass fallback_encoding (directory) or encoding (single file) to resolve encoding;\n",
-            "a changing single-file target returns an error. Matching is line-by-line: `^` and\n",
-            "`$` anchor line boundaries and are CRLF-aware. Set multiline=true for patterns\n",
-            "spanning lines (`.` matches newlines; `\\n` also matches `\\r\\n`). A path component\n",
-            "of the form ~fastctx~b...~ (reversible bytes/UTF-8) or ~fastctx~w...~ (Windows\n",
-            "UTF-16) is a filename escape; copy that whole component verbatim in later calls\n",
-            "and do not decode or rewrite it. The last line of every successful result states\n",
-            "Complete or Partial — continue only with the exact offset a Partial note provides;\n",
-            "errors are self-contained."
+            "modes: \"files_with_matches\" (default, paths only), \"content\", \"count\" (total\n",
+            "matches, not matching lines), \"summary\" (global totals). Respects .gitignore;\n",
+            "searches hidden files; skips .git and binaries. Files are decoded to UTF-8\n",
+            "before searching; files whose encoding can't be determined, or that change\n",
+            "during a directory search, are skipped and listed; a changing single-file\n",
+            "target returns an error. Matching is line-by-line: `^` and `$` anchor line\n",
+            "boundaries and are CRLF-aware. A path component of the form ~fastctx~b...~\n",
+            "(reversible bytes/UTF-8) or ~fastctx~w...~ (Windows UTF-16) is a filename\n",
+            "escape; copy that whole component verbatim in later calls and do not decode\n",
+            "or rewrite it. The last line of every successful result states Complete or\n",
+            "Partial — continue only with the exact offset a Partial note provides; errors\n",
+            "are self-contained."
         ))
     );
     assert_eq!(
@@ -138,15 +130,15 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
         glob.description.as_deref(),
         Some(concat!(
             "Find files by glob pattern, e.g. \"**/*.rs\" or \"src/**/*.ts\". Returns absolute\n",
-            "paths sorted by path (or newest first with sort=\"modified\"), 100 per page.\n",
-            "filter_mode \"project\" (default) respects .gitignore and skips .git;\n",
-            "filter_mode \"all\" lists everything. Omit `path` to search the session working\n",
-            "directory — omit the field entirely, never pass \"null\" or \"undefined\". A path\n",
-            "component of the form ~fastctx~b...~ (reversible bytes/UTF-8) or ~fastctx~w...~\n",
-            "(Windows UTF-16) is a filename escape; copy that whole component verbatim in\n",
-            "later calls and do not decode or rewrite it. The last line of every successful\n",
-            "result states Complete or Partial — continue only with the exact offset a Partial\n",
-            "note provides; errors are self-contained."
+            "paths sorted by path (or newest first with sort=\"modified\"), 100 per page by\n",
+            "default. filter_mode defaults to \"project\" (respects .gitignore, skips .git);\n",
+            "\"all\" lists everything. Omit `path` entirely for the session working directory\n",
+            "— never pass \"null\" or \"undefined\". A path component of the form ~fastctx~b...~\n",
+            "(reversible bytes/UTF-8) or ~fastctx~w...~ (Windows UTF-16) is a filename\n",
+            "escape; copy that whole component verbatim in later calls and do not decode or\n",
+            "rewrite it. The last line of every successful result states Complete or Partial\n",
+            "— continue only with the exact offset a Partial note provides; errors are\n",
+            "self-contained."
         ))
     );
     assert_eq!(
@@ -265,13 +257,11 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
             "and return its merged stdout+stderr with the exit code. Write POSIX bash —\n",
             "never PowerShell. Commands must be non-interactive: there is no TTY or\n",
             "stdin; use flags like -y or --no-edit. A non-zero exit code is a normal\n",
-            "result, not an error. Oversized output is truncated (with a note); to get\n",
-            "the full output, redirect it to a file (command > file 2>&1) and page that\n",
-            "file with the read tool. Default timeout 120000 ms (max 240000) — start\n",
-            "anything longer with run_background. cwd must be absolute when given.\n",
-            "If the output looks garbled (U+FFFD), pass encoding with the source\n",
-            "encoding label (e.g. \"gbk\"). ",
-            "The last line states Complete or Partial."
+            "result, not an error. Oversized output is truncated; for the full output,\n",
+            "redirect it to a file (command > file 2>&1) and page that file with read.\n",
+            "Default timeout 120000 ms, ceiling 240000 — start anything that may outlast\n",
+            "it with run_background. If output looks garbled (U+FFFD), pass encoding\n",
+            "(e.g. \"gbk\"). The last line states Complete or Partial."
         ))
     );
     assert_eq!(run.input_schema["required"], serde_json::json!(["command"]));
@@ -293,14 +283,17 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
         background.description.as_deref(),
         Some(concat!(
             "Start a bash command as a background job and return its job_id\n",
-            "immediately. Use for builds, tests, servers, or anything that may exceed\n",
-            "two minutes. Jobs run independently of this session: they survive server\n",
-            "and Codex restarts, and their output and exit code stay retrievable by\n",
-            "job_id afterwards. Check on it with job_output; stop with job_kill;\n",
-            "rediscover past jobs with job_list. There is no timeout — a job runs\n",
-            "until it exits or is killed. Everything the job prints is also kept in a\n",
-            "plain log file whose path is returned here: read or grep it with the read\n",
-            "tool for anything job_output does not show."
+            "immediately. Use for builds, tests, servers, or anything that may outlast\n",
+            "run's four-minute maximum. Jobs survive server and Codex restarts; their\n",
+            "output and exit code stay retrievable by job_id. Check on it with\n",
+            "job_output; stop with job_kill; rediscover past jobs with job_list. There\n",
+            "is no timeout: a job runs until it exits or is killed. Everything it\n",
+            "prints is kept in a plain log file whose path is returned here; read or\n",
+            "grep that path for anything job_output does not show. While your jobs\n",
+            "run, every FastCtx result carries a one-line background status naming\n",
+            "each job and how long it has run, just above the closing Complete or\n",
+            "Partial line. It is a readout, not a notification: it refreshes only when\n",
+            "you call a tool, so keep working — nothing reaches you if you stop."
         ))
     );
     assert_eq!(
@@ -326,20 +319,17 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
         output.description.as_deref(),
         Some(concat!(
             "Query a background job: its status (running, exited with its code, or\n",
-            "interrupted) plus the newest output you have not been shown yet. wait_ms\n",
-            "is how long this query may take (0-60000, default 30000): it returns as\n",
-            "soon as the job reaches a terminal state, and otherwise waits the window\n",
-            "out — intermediate output does not end the wait. Pass wait_ms=0 for an\n",
-            "immediate snapshot. Long output is windowed: you get the newest lines that\n",
-            "fit, plus the start of the log on the first call, and a note naming the\n",
-            "exact lines that were skipped. Nothing is lost — the job's whole output is\n",
-            "a plain log file on disk, and its line numbers are the seq numbers used\n",
-            "here, so read or grep that path for anything not shown. Works for jobs\n",
-            "started in earlier sessions. If output looks garbled (U+FFFD), call again\n",
-            "with encoding set to the source encoding (e.g. \"gbk\") — stored bytes are\n",
-            "re-decoded losslessly. Complete appears only once the job ends; a job that\n",
-            "never exits never reports it, so take what you need and do other work\n",
-            "instead of polling."
+            "interrupted) plus output you have not been shown yet. Works for jobs\n",
+            "started in earlier sessions. Long output is windowed: the newest lines\n",
+            "that fit, the start of the log on the first call, and a note naming the\n",
+            "exact lines skipped. The job's whole output is a plain log file on disk\n",
+            "whose line numbers are the seq numbers used here, so read or grep that\n",
+            "path for anything not shown. The call blocks up to wait_ms, so raise it\n",
+            "only when you have nothing else to do. If output looks garbled (U+FFFD),\n",
+            "call again with encoding set to the source encoding (e.g. \"gbk\").\n",
+            "Complete appears only once the job ends; servers and watchers never reach\n",
+            "it. Take what you need and keep working — the background status on your\n",
+            "next result carries this job's state."
         ))
     );
     // A running job is always Partial, and a dev server or watch never reaches a terminal
@@ -360,7 +350,7 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
     assert_eq!(output.input_schema["properties"]["wait_ms"]["minimum"], 0);
     assert_eq!(
         output.input_schema["properties"]["wait_ms"]["maximum"],
-        60_000
+        240_000
     );
     assert_eq!(
         output.input_schema["properties"]["wait_ms"]["default"],
@@ -373,13 +363,10 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
     assert_eq!(
         list.description.as_deref(),
         Some(concat!(
-            "List background jobs across all FastCtx sessions for the current user.\n",
-            "status defaults to running; use finished to inspect exited or interrupted\n",
-            "records, or all only when both lifecycles are needed. Results are newest\n",
-            "first within each lifecycle. limit defaults to the current-user\n",
-            "fastshell.job_list_limit setting (20 initially, maximum 100), and offset\n",
-            "continues a page. Finished records remain available until the job storage\n",
-            "limit evicts the oldest."
+            "List background jobs across all FastCtx sessions for the current user. Use\n",
+            "status=\"all\" only when both lifecycles are needed. Results are newest first\n",
+            "within each lifecycle. Finished records remain available until the job\n",
+            "storage limit evicts the oldest."
         ))
     );
     assert!(
@@ -409,19 +396,49 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
         replace.description.as_deref(),
         Some(concat!(
             "Batch find-and-replace across a file or directory (Rust regex, same engine\n",
-            "as grep; no lookaround). replacement supports $1/${name} groups, $$ for a\n",
-            "literal $; a reference to an undefined capture group is rejected before any\n",
-            "write; an empty replacement deletes the match (include \\n in the\n",
-            "pattern to delete whole lines). Matching is leftmost-first and\n",
-            "non-overlapping; unlike grep, `^`/`$` anchor the whole file by default —\n",
-            "use (?m) for per-line anchors. Respects .gitignore; skips .git, binaries, and files\n",
-            "whose encoding cannot be determined (listed, never silent). Each file is\n",
-            "written atomically with a concurrent-modification check, preserving its\n",
-            "original encoding, BOM, and line endings. path is required. Set\n",
-            "dry_run=true to preview; set max_replacements to cap the blast radius. The\n",
-            "last line states Complete or Partial."
+            "as grep; no lookaround). A reference to an undefined capture group is\n",
+            "rejected before any write. To delete whole lines, include \\n in the\n",
+            "pattern. Matching is leftmost-first and non-overlapping; unlike grep,\n",
+            "`^`/`$` anchor the whole file by default — use (?m) for per-line anchors.\n",
+            "Respects .gitignore; skips .git and binaries; files whose encoding cannot\n",
+            "be determined are skipped and listed. Each file is written atomically with\n",
+            "a concurrent-modification check, preserving its original encoding, BOM, and\n",
+            "line endings. The last line states Complete or Partial."
         ))
     );
+
+    let descriptions = tools
+        .iter()
+        .filter_map(|tool| tool.description.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let job_notes = format!(
+        "{}\n{}",
+        include_str!("../src/shell/output.rs"),
+        include_str!("../src/shell/jobs/mod.rs")
+    );
+    for forbidden in [
+        "will be told",
+        "will be notified",
+        "wait for it to tell you",
+        "notify you when",
+        "tell you when it",
+        "wait until notified",
+    ] {
+        assert!(
+            !descriptions.to_ascii_lowercase().contains(forbidden),
+            "tool descriptions must not promise a push notification: {forbidden}"
+        );
+        assert!(
+            !job_notes.to_ascii_lowercase().contains(forbidden),
+            "running and terminal notes must not promise push delivery: {forbidden}"
+        );
+    }
+    assert!(
+        !job_notes.to_ascii_lowercase().contains("notification"),
+        "only the run_background description may use notification, and only in its explicit negation"
+    );
+    assert!(descriptions.contains("It is a readout, not a notification"));
     assert_eq!(
         replace.input_schema["required"],
         serde_json::json!(["pattern", "replacement", "path"])

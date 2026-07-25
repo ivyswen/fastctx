@@ -731,7 +731,7 @@ fn noninteractive_apply_migrates_an_unstamped_cli_only_home_once_before_applying
         "FASTCTX_TOKEN_BUDGET = \"17000\"",
         "FASTCTX_GREP_TOKEN_BUDGET = \"8500\"",
         "FASTCTX_GLOB_TOKEN_BUDGET = \"4300\"",
-        "FASTCTX_RUN_TOKEN_BUDGET = \"4300\"",
+        "FASTCTX_RUN_TOKEN_BUDGET = \"8500\"",
         "FASTCTX_JOB_OUTPUT_TOKEN_BUDGET = \"4300\"",
     ] {
         assert!(codex.contains(expected), "missing {expected:?}:\n{codex}");

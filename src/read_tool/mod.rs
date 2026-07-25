@@ -56,7 +56,7 @@ pub struct ReadRequest {
     /// The number of lines to read (default 2000).
     #[schemars(range(min = 1))]
     pub limit: Option<usize>,
-    /// Page range for PDF files, e.g. "1-5", "3", "10-20". Max 20 pages per call. Required for PDFs with more than 10 pages.
+    /// Page range for PDF files, e.g. "1-5", "3", "10-20". Max 20 pages per call. Required in text mode for PDFs with more than 10 pages.
     pub pages: Option<String>,
     /// PDF only: "text" (default) returns the selected pages' text layer; "image" returns each selected page rendered as a PNG image.
     #[schemars(with = "Option<pdf::PdfMode>")]

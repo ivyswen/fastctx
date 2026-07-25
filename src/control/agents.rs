@@ -55,13 +55,13 @@ const SHELL_GUIDANCE: &str = concat!(
     "\n",
     "Commands must be non-interactive (no TTY): use flags like -y\n",
     "or --no-edit, and expect editors/pagers to be disabled. For anything\n",
-    "that may run longer than two minutes, use `mcp__fastctx__run_background`,\n",
-    "poll `mcp__fastctx__job_output`, and stop it with\n",
-    "`mcp__fastctx__job_kill`. Background jobs run independently of this\n",
-    "session and survive restarts; rediscover an earlier job with\n",
-    "`mcp__fastctx__job_list` and resume polling it by job_id. A non-zero\n",
-    "exit code is a normal result. The last line of every result says\n",
-    "`Complete` or `Partial`.\n"
+    "that may outlast run's four-minute maximum, use\n",
+    "`mcp__fastctx__run_background`, check on it with\n",
+    "`mcp__fastctx__job_output`, and stop it with `mcp__fastctx__job_kill`.\n",
+    "Background jobs run independently of this session and survive restarts;\n",
+    "rediscover an earlier job with `mcp__fastctx__job_list` and read its\n",
+    "output by job_id. A non-zero exit code is a normal result. The last line\n",
+    "of every result says `Complete` or `Partial`.\n"
 );
 /// Separator bytes inserted and therefore owned by Apply between user content and the private section.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -439,13 +439,13 @@ mod tests {
             "call, or in Codex's built-in shell — never through the FastCtx tools.\n\n",
             "Commands must be non-interactive (no TTY): use flags like -y\n",
             "or --no-edit, and expect editors/pagers to be disabled. For anything\n",
-            "that may run longer than two minutes, use `mcp__fastctx__run_background`,\n",
-            "poll `mcp__fastctx__job_output`, and stop it with\n",
-            "`mcp__fastctx__job_kill`. Background jobs run independently of this\n",
-            "session and survive restarts; rediscover an earlier job with\n",
-            "`mcp__fastctx__job_list` and resume polling it by job_id. A non-zero\n",
-            "exit code is a normal result. The last line of every result says\n",
-            "`Complete` or `Partial`.\n",
+            "that may outlast run's four-minute maximum, use\n",
+            "`mcp__fastctx__run_background`, check on it with\n",
+            "`mcp__fastctx__job_output`, and stop it with `mcp__fastctx__job_kill`.\n",
+            "Background jobs run independently of this session and survive restarts;\n",
+            "rediscover an earlier job with `mcp__fastctx__job_list` and read its\n",
+            "output by job_id. A non-zero exit code is a normal result. The last line\n",
+            "of every result says `Complete` or `Partial`.\n",
         );
         let end = "<!-- fastctx:end -->";
         for (fastshell, expected) in [
@@ -467,6 +467,13 @@ mod tests {
                 .collect::<BTreeSet<_>>();
             assert_eq!(referenced, published);
             assert!(actual.contains("mcp__fastctx__replace"));
+            for forbidden in [
+                "will be told",
+                "will be notified",
+                "wait for it to tell you",
+            ] {
+                assert!(!actual.to_ascii_lowercase().contains(forbidden));
+            }
             for removed in ["copy", "cut", "paste", "clips", "drop"] {
                 assert!(!actual.contains(&format!("mcp__fastctx__{removed}")));
             }

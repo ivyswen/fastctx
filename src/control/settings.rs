@@ -386,7 +386,7 @@ impl Default for ToolBudgets {
             read: ToolBudgetLevel::Inherit,
             grep: ToolBudgetLevel::Percent50,
             glob: ToolBudgetLevel::Percent25,
-            run: ToolBudgetLevel::Percent25,
+            run: ToolBudgetLevel::Percent50,
             job_output: ToolBudgetLevel::Percent25,
         }
     }
@@ -957,7 +957,7 @@ mod tests {
         assert_eq!(defaults.read, ToolBudgetLevel::Inherit);
         assert_eq!(defaults.grep, ToolBudgetLevel::Percent50);
         assert_eq!(defaults.glob, ToolBudgetLevel::Percent25);
-        assert_eq!(defaults.run, ToolBudgetLevel::Percent25);
+        assert_eq!(defaults.run, ToolBudgetLevel::Percent50);
         assert_eq!(defaults.job_output, ToolBudgetLevel::Percent25);
     }
 

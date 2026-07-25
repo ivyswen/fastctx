@@ -13,10 +13,17 @@ The optional terminal publishes `run`, `run_background`, `job_output`,
 survive MCP server and Codex restarts. Current-format jobs keep their complete
 output log and exit status addressable by job id under `~/.fastctx/jobs/`.
 `job_output` is a query with a caller-chosen delay: it returns when the job
-ends or when `wait_ms` elapses, showing the newest output not yet seen, and
-names the log path and exact line numbers for anything it leaves out. Records
-from the preceding segmented format remain readable but do not claim direct
-log coordinates or recover output their original rolling window evicted.
+ends or when `wait_ms` (0–240000 ms, default 30000) elapses, showing the newest
+output not yet seen, and names the log path and exact line numbers for anything
+it leaves out. Intermediate output does not end the wait. `Complete` appears
+only after a job ends; servers and watchers may never reach it. Records from
+the preceding segmented format remain readable but do not claim direct log
+coordinates or recover output their original rolling window evicted.
+While one server tracks jobs it started or queried, each successful text result
+also carries a one-line background readout of their current state and elapsed
+time. It refreshes only on tool calls; it is not a push notification, and
+nothing arrives if the caller stops. Finished entries remain until that server
+handles them with `job_output` or `job_kill`.
 
 On Windows, all FastCtx-owned non-interactive children run without allocating
 a console window; no caller flag is required. Commands that explicitly launch
