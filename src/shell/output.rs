@@ -373,10 +373,13 @@ fn join_notes(first: Option<&str>, second: Option<&str>) -> Option<String> {
     }
 }
 
+/// Reports ring-buffer loss as a bare fact: what to do about it is the caller's
+/// call, and the only remedy would be re-running a command whose sheer output
+/// volume makes heavy side effects likely (2026-07-25).
 pub(crate) fn dropped_note(dropped: u64) -> Option<String> {
     (dropped > 0).then(|| {
         format!(
-            "(Note: {dropped} earlier {} {} dropped from the buffer and cannot be retrieved; redirect the command to a file for the full log.)",
+            "(Note: {dropped} earlier {} {} dropped from the buffer and cannot be retrieved.)",
             plural(dropped, "line", "lines"),
             if dropped == 1 { "was" } else { "were" }
         )
@@ -519,7 +522,7 @@ mod tests {
             crate::ToolContent::Image { .. } => panic!("expected text"),
         };
         assert!(text.starts_with(
-            "(Note: 1 earlier line was dropped from the buffer and cannot be retrieved; redirect the command to a file for the full log.)"
+            "(Note: 1 earlier line was dropped from the buffer and cannot be retrieved.)"
         ));
         assert!(text.contains("of 2 lines; exited 0."));
     }
@@ -529,7 +532,7 @@ mod tests {
         assert_eq!(compose_lines(&[String::new()], "(status)"), "\n\n(status)");
         assert_eq!(
             dropped_note(2).unwrap(),
-            "(Note: 2 earlier lines were dropped from the buffer and cannot be retrieved; redirect the command to a file for the full log.)"
+            "(Note: 2 earlier lines were dropped from the buffer and cannot be retrieved.)"
         );
     }
 
