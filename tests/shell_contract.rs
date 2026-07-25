@@ -399,6 +399,7 @@ fn foreground_output_over_eight_mib_runs_to_natural_exit_and_reports_true_line_c
 fn foreground_timeout_kills_descendants_and_keeps_captured_output() {
     let _serial = shell_contract_guard();
     let temp = tempfile::tempdir().unwrap();
+    let spawned = temp.path().join("spawned.txt");
     let marker = temp.path().join("orphan.txt");
     let mut session = shell_session(temp.path(), None);
     let complete = session.call(
@@ -407,30 +408,37 @@ fn foreground_timeout_kills_descendants_and_keeps_captured_output() {
     );
     assert_eq!(mcp_text(&complete), "(Complete: exited 0; no output.)");
 
-    // A non-login shell starts deterministically fast (it never sources
-    // /etc/profile), so `printf started` reliably runs inside the 500 ms window
-    // before the kill. A login shell's startup can exceed 500 ms under heavy
-    // concurrent load, killing the command mid-startup and losing the captured
-    // line — a test-timing artifact, not a product fault. The tree-kill semantics
-    // under test are identical in either mode; the background non-login timeout
-    // test covers the login-independent path too.
+    // Two independent deadlines have to hold: the shell must reach `printf
+    // started` before the kill, and the descendant must still be sleeping when
+    // the kill lands. A login shell is avoided because sourcing /etc/profile can
+    // outlast either window, and the timeout is 2000 ms because a cold Git Bash
+    // on a loaded CI runner has needed more than 500 ms just to start, which lost
+    // the captured line and failed this test for a reason the product had no part
+    // in. The descendant writes `spawned.txt` immediately, so a shell too slow to
+    // fork it cannot pass the tree-kill assertion vacuously. Every gap here is one
+    // second wide; do not shrink them back. (2026-07-25)
     let response = session.call(
         "run",
         serde_json::json!({
             "command": format!(
-                "(sleep 1; printf orphan > {}) & printf started; sleep 5",
+                "(printf spawned > {}; sleep 3; printf orphan > {}) & printf started; sleep 10",
+                bash_quote(&spawned),
                 bash_quote(&marker)
             ),
-            "timeout_ms": 500,
+            "timeout_ms": 2_000,
             "login_shell": false
         }),
     );
     assert_eq!(response["result"]["isError"], false);
     assert_eq!(
         mcp_text(&response),
-        "started\n\n(Partial: timed out after 500 ms and the process tree was killed; 1 line captured. Increase timeout_ms or use run_background.)"
+        "started\n\n(Partial: timed out after 2000 ms and the process tree was killed; 1 line captured. Increase timeout_ms or use run_background.)"
     );
-    std::thread::sleep(Duration::from_millis(1_300));
+    assert!(
+        spawned.exists(),
+        "the descendant never started, so the tree kill would prove nothing"
+    );
+    std::thread::sleep(Duration::from_millis(2_500));
     assert!(
         !marker.exists(),
         "a timed-out descendant survived the tree kill"
