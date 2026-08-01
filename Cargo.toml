@@ -61,7 +61,7 @@ strsim = "0.11.1"
 sys-locale = "0.3.2"
 tar = "0.4.44"
 time = { version = "0.3.53", features = ["formatting", "macros", "parsing"] }
-tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.18", features = ["rt"] }
 toml_edit = { version = "0.22.27", features = ["serde"] }
 tempfile = "3.23.0"
@@ -74,7 +74,7 @@ zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 libc = "0.2.186"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [build-dependencies]
 flate2 = "1.1.5"

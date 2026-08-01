@@ -151,40 +151,45 @@ struct PrivateAcl {
     dacl: *mut windows_sys::Win32::Security::ACL,
 }
 
+/// Owner-and-System descriptor used while creating one private named-pipe instance.
+pub(crate) struct PrivateSecurityDescriptor {
+    descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+}
+
+impl PrivateSecurityDescriptor {
+    pub(crate) fn new() -> Result<Self, String> {
+        let user_sid = current_process_user_sid_string()?;
+        let descriptor = private_descriptor(
+            Path::new(r"\\.\pipe\fastctx-engine"),
+            "control-center IPC",
+            &user_sid,
+            false,
+        )?;
+        Ok(Self { descriptor })
+    }
+
+    pub(crate) fn security_attributes(&self) -> windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                as u32,
+            lpSecurityDescriptor: self.descriptor,
+            bInheritHandle: 0,
+        }
+    }
+}
+
+impl Drop for PrivateSecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(self.descriptor);
+        }
+    }
+}
+
 impl PrivateAcl {
     fn new(path: &Path, label: &str, user_sid: &str) -> Result<Self, String> {
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-        };
         use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
-
-        // 2026-07-22: TokenUser is stable across UAC's elevated and filtered tokens;
-        // Owner Rights can resolve to Administrators and lock the filtered token out.
-        let system_ace = if user_sid.eq_ignore_ascii_case("S-1-5-18") {
-            ""
-        } else {
-            "(A;OICI;FA;;;SY)"
-        };
-        let descriptor_text = format!("D:P(A;OICI;FA;;;{user_sid}){system_ace}")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let mut descriptor = std::ptr::null_mut();
-        let converted = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                descriptor_text.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                std::ptr::null_mut(),
-            )
-        };
-        if converted == 0 {
-            return Err(format!(
-                "Cannot build the private ACL for the {label} directory {}: {}",
-                crate::paths::display_path(path),
-                std::io::Error::last_os_error()
-            ));
-        }
+        let descriptor = private_descriptor(path, label, user_sid, true)?;
 
         let mut present = 0;
         let mut defaulted = 0;
@@ -258,6 +263,48 @@ impl PrivateAcl {
         }
         Ok(())
     }
+}
+
+fn private_descriptor(
+    path: &Path,
+    label: &str,
+    user_sid: &str,
+    inheritable: bool,
+) -> Result<windows_sys::Win32::Security::PSECURITY_DESCRIPTOR, String> {
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+
+    // 2026-07-22: TokenUser is stable across UAC's elevated and filtered tokens;
+    // Owner Rights can resolve to Administrators and lock the filtered token out.
+    let ace_flags = if inheritable { "OICI" } else { "" };
+    let rights = if inheritable { "FA" } else { "GA" };
+    let system_ace = if user_sid.eq_ignore_ascii_case("S-1-5-18") {
+        String::new()
+    } else {
+        format!("(A;{ace_flags};{rights};;;SY)")
+    };
+    let descriptor_text = format!("D:P(A;{ace_flags};{rights};;;{user_sid}){system_ace}")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = std::ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor_text.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(format!(
+            "Cannot build the private ACL for the {label} path {}: {}",
+            crate::paths::display_path(path),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(descriptor)
 }
 
 impl Drop for PrivateAcl {

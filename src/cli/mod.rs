@@ -94,6 +94,19 @@ enum Command {
     #[cfg(unix)]
     #[command(hide = true)]
     JobWatch { pid: u32, started: String },
+    /// Internal short-lived control-center detach bootstrap.
+    #[command(hide = true)]
+    RuntimeBootstrap,
+    /// Internal per-user control center.
+    #[command(hide = true)]
+    RuntimeHost {
+        /// Test-only idle override; production bootstraps always use ten minutes.
+        #[arg(long, hide = true)]
+        idle_timeout_ms: Option<u64>,
+        /// Test-only maintenance override; production bootstraps use one minute.
+        #[arg(long, hide = true)]
+        maintenance_interval_ms: Option<u64>,
+    },
     /// Internal updater helper copied outside the active installation.
     #[command(hide = true)]
     UpdateHelper {
@@ -149,6 +162,10 @@ pub async fn run() -> Result<ExitCode, String> {
 async fn run_cli(cli: Cli) -> Result<ExitCode, String> {
     let implicit_tui =
         cli.command.is_none() && io::stdin().is_terminal() && io::stdout().is_terminal();
+    let internal = is_internal_command(&cli.command);
+    if !internal && let Ok(paths) = ControlPaths::discover() {
+        crate::update::cleanup_replaced_binaries(&paths);
+    }
     match cli.command {
         Some(Command::Serve {
             enable_shell,
@@ -177,6 +194,17 @@ async fn run_cli(cli: Cli) -> Result<ExitCode, String> {
             crate::shell::jobs::run_host_entry()?;
             Ok(ExitCode::SUCCESS)
         }
+        Some(Command::RuntimeBootstrap) => {
+            crate::runtime::run_bootstrap_entry()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Some(Command::RuntimeHost {
+            idle_timeout_ms,
+            maintenance_interval_ms,
+        }) => {
+            crate::runtime::run_host_entry(idle_timeout_ms, maintenance_interval_ms).await?;
+            Ok(ExitCode::SUCCESS)
+        }
         #[cfg(unix)]
         Some(Command::JobWatch { pid, started }) => {
             crate::shell::jobs::run_watchdog_entry(pid, started)?;
@@ -195,6 +223,30 @@ async fn run_cli(cli: Cli) -> Result<ExitCode, String> {
             run_tui_with_check(paths)
         }
         None => run_server().await,
+    }
+}
+
+fn is_internal_command(command: &Option<Command>) -> bool {
+    let common = matches!(
+        command,
+        Some(
+            Command::JobHost
+                | Command::RuntimeBootstrap
+                | Command::RuntimeHost { .. }
+                | Command::UpdateHelper { .. }
+        )
+    );
+    #[cfg(unix)]
+    {
+        common
+            || matches!(
+                command,
+                Some(Command::JobBootstrap | Command::JobWatch { .. })
+            )
+    }
+    #[cfg(not(unix))]
+    {
+        common
     }
 }
 
@@ -289,11 +341,26 @@ pub async fn run_server() -> Result<ExitCode, String> {
 
 /// Starts the single server with the requested optional tool groups.
 pub async fn run_server_with_options(options: ServerOptions) -> Result<ExitCode, String> {
-    let paths = ControlPaths::discover()?;
-    let executor = load_search_executor(&paths)?;
+    let environment = crate::runtime::capture_proxy_environment()?;
     let parent = crate::process_identity::parent_identity_from_environment()?;
+    match crate::runtime::connect_or_start(options, &environment).await {
+        Ok(stream) => return crate::runtime::forward_stdio(stream, parent).await,
+        Err(error) => eprintln!(
+            "fastctx: control center unavailable ({error}); falling back to a full standalone MCP server."
+        ),
+    }
+    let session = crate::session::SessionContext::from_environment(environment)?;
+    let executor = load_search_executor(&session.control_paths)?;
     let stdin = crate::stdio_transport::DetachedStdin::start()?;
-    run_server_with_io_and_executor(options, parent, stdin, tokio::io::stdout(), executor).await
+    run_server_with_io_and_executor(
+        options,
+        parent,
+        stdin,
+        tokio::io::stdout(),
+        executor,
+        session,
+    )
+    .await
 }
 
 fn load_search_executor(paths: &ControlPaths) -> Result<Arc<GrepGlobExecutor>, String> {
@@ -319,8 +386,15 @@ async fn run_server_with_io<W>(
 where
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
 {
-    run_server_with_io_and_executor(options, parent, stdin, stdout, GrepGlobExecutor::shared())
-        .await
+    run_server_with_io_and_executor(
+        options,
+        parent,
+        stdin,
+        stdout,
+        GrepGlobExecutor::shared(),
+        crate::session::SessionContext::library_default(),
+    )
+    .await
 }
 
 async fn run_server_with_io_and_executor<W>(
@@ -329,6 +403,7 @@ async fn run_server_with_io_and_executor<W>(
     stdin: crate::stdio_transport::DetachedStdin,
     stdout: W,
     executor: Arc<GrepGlobExecutor>,
+    session: Arc<crate::session::SessionContext>,
 ) -> Result<ExitCode, String>
 where
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
@@ -337,9 +412,13 @@ where
     let stdin_read_error = stdin.read_error_receiver();
     let stdin_read_error_wait = wait_for_stdin_read_error(stdin_read_error.clone());
     tokio::pin!(stdin_read_error_wait);
-    let service = match FastCtxServer::with_options_and_executor(options, executor)
-        .serve((stdin, stdout))
-        .await
+    let service = match FastCtxServer::with_session_and_runtime(
+        options,
+        session,
+        crate::server::SharedRuntime::new(executor),
+    )
+    .serve((stdin, stdout))
+    .await
     {
         Ok(service) => service,
         Err(error) => {
@@ -498,6 +577,7 @@ fn run_apply(
         ApplyOptions {
             tier: tier.unwrap_or(saved.tier),
             tool_budgets: saved.tool_budgets,
+            output_guard_enabled: saved.output_guard.enabled,
             fastshell_enabled: saved.fastshell.enabled,
             current_executable: std::env::current_exe()
                 .map_err(|error| format!("Cannot locate the running fastctx binary: {error}"))?,

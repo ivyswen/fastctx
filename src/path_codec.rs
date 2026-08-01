@@ -258,7 +258,7 @@ pub(crate) fn resolve_search_root(
 ) -> Result<ResolvedRoot, String> {
     let parsed = match input {
         Some(input) => parse_input_path(input).map_err(|error| error.to_string())?,
-        None => std::env::current_dir()
+        None => crate::session::current_dir()
             .map_err(|error| format!("Cannot access the session working directory: {error}"))?,
     };
 
@@ -313,7 +313,7 @@ fn missing_absolute_search_path_message(parsed: &Path) -> String {
 }
 
 fn missing_relative_search_path_message(parsed: &Path) -> String {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = crate::session::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let resolved = cwd.join(parsed);
     let mut note = format!(
         "Note: the session working directory is {}.",
@@ -331,7 +331,7 @@ fn missing_relative_search_path_message(parsed: &Path) -> String {
 }
 
 fn current_dir_display() -> String {
-    std::env::current_dir()
+    crate::session::current_dir()
         .ok()
         .and_then(|path| canonical_existing(&path).ok().or(Some(path)))
         .map(|path| display_path(&path))

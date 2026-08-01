@@ -3,7 +3,7 @@
 use super::identity::{identity_is_alive, process_identity, supervisor_isolation_warning};
 use super::model::{
     CAPTURE_ERROR_FILE, CaptureErrorRecord, EXIT_FILE, ExitRecord, JOB_SCHEMA_VERSION, JobMeta,
-    LaunchSpec, META_FILE, TerminationKind,
+    LaunchSpec, META_FILE, OUTPUT_TRUNCATION_FILE, OutputTruncationRecord, TerminationKind,
 };
 use super::output_log::OutputLogWriter;
 use super::store::{
@@ -36,7 +36,7 @@ pub(crate) fn launch_supervisor(
 ) -> Result<(), String> {
     let encoded = serde_json::to_vec(spec)
         .map_err(|error| format!("Cannot encode the background job launch request: {error}"))?;
-    let mut child = spawn_detached(executable)?;
+    let mut child = spawn_detached(executable, &spec.environment, &spec.cwd)?;
     let mut stdin = child.stdin.take().ok_or_else(|| {
         "Cannot start the background job supervisor: its launch pipe was not created.".to_string()
     })?;
@@ -90,11 +90,18 @@ pub(crate) fn launch_supervisor(
     }
 }
 
-fn spawn_detached(executable: &std::path::Path) -> Result<Child, String> {
+fn spawn_detached(
+    executable: &std::path::Path,
+    environment: &crate::session::SessionEnvironment,
+    cwd: &std::path::Path,
+) -> Result<Child, String> {
     #[cfg(unix)]
     {
-        Command::new(executable)
+        let mut command = Command::new(executable);
+        environment.configure_command(&mut command);
+        command
             .arg("job-bootstrap")
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -108,10 +115,17 @@ fn spawn_detached(executable: &std::path::Path) -> Result<Child, String> {
             CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
         };
 
-        fn command(executable: &std::path::Path, flags: u32) -> Command {
+        fn command(
+            executable: &std::path::Path,
+            flags: u32,
+            environment: &crate::session::SessionEnvironment,
+            cwd: &std::path::Path,
+        ) -> Command {
             let mut command = Command::new(executable);
+            environment.configure_command(&mut command);
             command
                 .arg("job-host")
+                .current_dir(cwd)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
@@ -120,11 +134,22 @@ fn spawn_detached(executable: &std::path::Path) -> Result<Child, String> {
         }
 
         let detached = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
-        match command(executable, detached | CREATE_BREAKAWAY_FROM_JOB).spawn() {
+        match command(
+            executable,
+            detached | CREATE_BREAKAWAY_FROM_JOB,
+            environment,
+            cwd,
+        )
+        .spawn()
+        {
             Ok(child) => Ok(child),
-            Err(error) if error.raw_os_error() == Some(5) => command(executable, detached)
-                .spawn()
-                .map_err(|error| format!("Cannot start the background job supervisor: {error}.")),
+            Err(error) if error.raw_os_error() == Some(5) => {
+                command(executable, detached, environment, cwd)
+                    .spawn()
+                    .map_err(|error| {
+                        format!("Cannot start the background job supervisor: {error}.")
+                    })
+            }
             Err(error) => Err(format!(
                 "Cannot start the background job supervisor: {error}."
             )),
@@ -132,8 +157,11 @@ fn spawn_detached(executable: &std::path::Path) -> Result<Child, String> {
     }
     #[cfg(not(any(unix, windows)))]
     {
-        Command::new(executable)
+        let mut command = Command::new(executable);
+        environment.configure_command(&mut command);
+        command
             .arg("job-host")
+            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -183,8 +211,13 @@ pub(crate) fn run_bootstrap() -> Result<(), String> {
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("Cannot locate the background job supervisor binary: {error}"))?;
-    let mut child = Command::new(executable)
+    let spec: LaunchSpec = serde_json::from_slice(&launch)
+        .map_err(|error| format!("Cannot parse the background job launch request: {error}"))?;
+    let mut command = Command::new(executable);
+    spec.environment.configure_command(&mut command);
+    let mut child = command
         .arg("job-host")
+        .current_dir(&spec.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::null())
@@ -224,9 +257,16 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
         .map(crate::shell::encoding::validate_output_encoding)
         .transpose()
         .map_err(|error| format!("Cannot start the background job supervisor: {error}"))?;
-    let mut process = spawn_bash(&spec.bash, &spec.command, &spec.cwd, spec.login_shell)
-        .map_err(|error| format!("Cannot start the command: {error}."))?;
-    let mut watchdog = match WatchdogGuard::arm(process.id()) {
+    let mut process = spawn_bash(
+        &spec.bash,
+        &spec.command,
+        &spec.cwd,
+        spec.login_shell,
+        &spec.environment,
+        &spec.utf8_locale,
+    )
+    .map_err(|error| format!("Cannot start the command: {error}."))?;
+    let mut watchdog = match WatchdogGuard::arm(process.id(), &spec.environment, &spec.cwd) {
         Ok(watchdog) => watchdog,
         Err(error) => {
             let _ = process.terminate_tree();
@@ -252,7 +292,7 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
         isolation_warning: supervisor_isolation_warning(),
     };
     let output = process.take_output();
-    let mut log = match OutputLogWriter::new(&spec.job_dir) {
+    let mut log = match OutputLogWriter::with_limit(&spec.job_dir, spec.output_limit_bytes) {
         Ok(log) => Some(log),
         Err(error) => {
             let _ = process.terminate_tree();
@@ -285,6 +325,7 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
     let mut total_lines = 0_u64;
     let mut had_loss = false;
     let mut capture_error = None;
+    let mut output_truncation = None;
     let (status, termination) = loop {
         drain_output_events(
             &events,
@@ -293,6 +334,7 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
             &mut total_lines,
             &mut had_loss,
             &mut capture_error,
+            &mut output_truncation,
         );
         if let Some(writer) = log.as_mut()
             && let Err(error) = writer.flush_if_idle()
@@ -377,6 +419,7 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
             &mut total_lines,
             &mut had_loss,
             &mut capture_error,
+            &mut output_truncation,
         );
         if reader.is_finished() {
             break;
@@ -403,6 +446,7 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
         &mut total_lines,
         &mut had_loss,
         &mut capture_error,
+        &mut output_truncation,
     );
     if let Some(writer) = log.as_mut() {
         if let Err(error) = writer.finish() {
@@ -422,11 +466,12 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
     let exit = ExitRecord {
         exit_code: status,
         total_lines,
-        had_loss: had_loss || capture_error.is_some(),
+        had_loss: had_loss || capture_error.is_some() || output_truncation.is_some(),
         ended_at: utc_now(),
         ended_at_unix_nanos: unix_nanos_now(),
         termination,
         capture_error,
+        output_truncation,
     };
     write_atomic_json(&spec.job_dir.join(EXIT_FILE), &exit)
         .map_err(|error| format!("Cannot write the background job exit record: {error}"))
@@ -491,6 +536,7 @@ fn drain_output_events(
     total_lines: &mut u64,
     had_loss: &mut bool,
     capture_error: &mut Option<CaptureErrorRecord>,
+    output_truncation: &mut Option<OutputTruncationRecord>,
 ) {
     while let Ok(event) = events.try_recv() {
         match event {
@@ -507,6 +553,30 @@ fn drain_output_events(
                             had_loss,
                             capture_error,
                         ),
+                    }
+                }
+                if output_truncation.is_none()
+                    && let Some(writer) = log.as_ref().filter(|writer| writer.quota_exceeded())
+                {
+                    let record = OutputTruncationRecord {
+                        limit_bytes: writer.byte_limit(),
+                        persisted_log_bytes: writer.persisted_log_bytes(),
+                        persisted_index_bytes: writer.persisted_index_bytes(),
+                        after_seq: writer.total_lines(),
+                    };
+                    *had_loss = true;
+                    output_truncation.clone_from(&Some(record.clone()));
+                    if let Err(error) =
+                        write_atomic_json(&directory.join(OUTPUT_TRUNCATION_FILE), &record)
+                    {
+                        capture_failure(
+                            directory,
+                            log,
+                            total_lines,
+                            format!("cannot persist the background output quota notice: {error}"),
+                            had_loss,
+                            capture_error,
+                        );
                     }
                 }
             }
@@ -568,7 +638,11 @@ struct WatchdogGuard {
 
 #[cfg(unix)]
 impl WatchdogGuard {
-    fn arm(process_pid: u32) -> Result<Self, String> {
+    fn arm(
+        process_pid: u32,
+        environment: &crate::session::SessionEnvironment,
+        cwd: &std::path::Path,
+    ) -> Result<Self, String> {
         use std::os::unix::process::CommandExt;
 
         let identity = process_identity(process_pid).ok_or_else(|| {
@@ -580,11 +654,13 @@ impl WatchdogGuard {
         let executable = std::env::current_exe()
             .map_err(|error| format!("Cannot locate the orphan-protection helper: {error}"))?;
         let mut command = Command::new(executable);
+        environment.configure_command(&mut command);
         command
             .arg("job-watch")
             .arg(identity.pid.to_string())
             .arg(&identity.started)
             .stdin(Stdio::from(reader))
+            .current_dir(cwd)
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         unsafe {
@@ -615,7 +691,11 @@ struct WatchdogGuard;
 
 #[cfg(not(unix))]
 impl WatchdogGuard {
-    fn arm(_process_pid: u32) -> Result<Self, String> {
+    fn arm(
+        _process_pid: u32,
+        _environment: &crate::session::SessionEnvironment,
+        _cwd: &std::path::Path,
+    ) -> Result<Self, String> {
         Ok(Self)
     }
 

@@ -20,6 +20,13 @@ pub(crate) fn update_check_directory() -> PathBuf {
     runtime_component("update-check")
 }
 
+pub(crate) fn control_center_directory() -> PathBuf {
+    runtime_component("engine")
+}
+
+#[cfg(windows)]
+pub(crate) use windows::PrivateSecurityDescriptor;
+
 pub(crate) fn ensure_private_directory(path: &Path, label: &str) -> Result<(), String> {
     validate_private_directory_path(path, label)?;
     #[cfg(unix)]

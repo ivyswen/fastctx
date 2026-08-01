@@ -11,9 +11,11 @@ use crate::control::apply::{
 };
 use crate::control::config_i18n::{self, ConfigMessages};
 use crate::control::doctor::{self, DoctorReport};
+use crate::control::guard_i18n::{self, GuardMessages};
 use crate::control::i18n::{ALL_LANGUAGES, Language, Messages};
 use crate::control::job_i18n::{self, JobMessages};
 use crate::control::paths::ControlPaths;
+use crate::control::provider::{self, CompactionSupport, EffectiveOutput};
 use crate::control::settings::{self, FastCtxSettings};
 use crate::search_parallelism::{self, SearchParallelismInputError};
 use crate::shell::jobs::{self, JobSummary};
@@ -49,6 +51,7 @@ pub(crate) enum Screen {
     Config,
     ConfigCpuEdit,
     ConfigBudgetEdit(ConfigItemId),
+    ConfigOutputGuardConfirm,
     ConfigResetConfirm,
     ConfigResetting,
     Jobs,
@@ -175,6 +178,7 @@ struct ActiveUpdateCheck {
 pub(crate) struct App {
     pub paths: ControlPaths,
     pub settings: FastCtxSettings,
+    pub(crate) provider_detection: provider::ProviderDetection,
     pub language: Language,
     pub screen: Screen,
     pub selected: usize,
@@ -223,6 +227,7 @@ impl App {
         let startup_settings = settings::load_for_startup(&paths)?;
         let migration_notice_pending = startup_settings.migration_notice;
         let settings = startup_settings.settings;
+        let provider_detection = provider::detect_path(&paths.codex_config);
         let running_job_count = jobs::running_summaries(&paths)
             .ok()
             .map(|running| running.len());
@@ -253,21 +258,30 @@ impl App {
             let messages = update_copy::messages(notice_language);
             match notice.outcome {
                 crate::update::FinalizeOutcome::Updated => Toast {
-                    message: messages.updated.replace("{version}", &notice.version),
+                    message: format!(
+                        "{}\n{}",
+                        messages.updated.replace("{version}", &notice.version),
+                        messages.restart_codex
+                    ),
                     warning: false,
                 },
                 crate::update::FinalizeOutcome::RuntimeUpdated => Toast {
-                    message: messages
-                        .updated_runtime
-                        .replace("{version}", &notice.version),
+                    message: format!(
+                        "{}\n{}",
+                        messages
+                            .updated_runtime
+                            .replace("{version}", &notice.version),
+                        messages.restart_codex
+                    ),
                     warning: false,
                 },
                 crate::update::FinalizeOutcome::RuntimeUnchanged(detail) => Toast {
                     message: format!(
-                        "{}: {detail}",
+                        "{}: {detail}\n{}",
                         messages
                             .runtime_unchanged
-                            .replace("{version}", &notice.version)
+                            .replace("{version}", &notice.version),
+                        messages.restart_codex
                     ),
                     warning: true,
                 },
@@ -322,6 +336,7 @@ impl App {
             running_job_count,
             paths,
             settings,
+            provider_detection,
             language,
             screen,
             selected,
@@ -387,6 +402,31 @@ impl App {
             self.language
         };
         config_i18n::messages(language)
+    }
+
+    pub(crate) fn guard_messages(&self) -> &'static GuardMessages {
+        let language = if self.settings.language.is_none() {
+            Language::En
+        } else {
+            self.language
+        };
+        guard_i18n::messages(language)
+    }
+
+    /// Whether the visible provider currently locks the effective output tier to Guarded.
+    pub(crate) fn output_guard_active(&self) -> bool {
+        self.config_draft.output_guard_enabled
+            && self.provider_detection.support == CompactionSupport::Local
+    }
+
+    /// Concrete output policy shown by the configuration UI.
+    pub(crate) fn effective_output(&self) -> EffectiveOutput {
+        provider::effective_output(
+            self.config_draft.output.tier,
+            self.config_draft.output.budgets,
+            self.config_draft.output_guard_enabled,
+            &self.provider_detection,
+        )
     }
 
     pub(crate) fn update_messages(&self) -> &'static UpdateMessages {
@@ -547,6 +587,7 @@ impl App {
             Screen::Config => self.handle_config(key),
             Screen::ConfigCpuEdit => self.handle_cpu_limit_editor(key),
             Screen::ConfigBudgetEdit(item) => self.handle_budget_editor(item, key),
+            Screen::ConfigOutputGuardConfirm => self.handle_output_guard_confirm(key.code),
             Screen::ConfigResetConfirm => self.handle_config_reset_confirm(key.code),
             Screen::Jobs => self.handle_jobs(key.code),
             Screen::JobsKillConfirm => self.handle_jobs_kill_confirm(key.code),
@@ -614,6 +655,8 @@ impl App {
             Effect::SaveConfig => {
                 let mut updated = self.settings.clone();
                 self.config_draft.apply_to(&mut updated);
+                let guard_changed =
+                    updated.output_guard.enabled != self.settings.output_guard.enabled;
                 let extensions_changed =
                     updated.fastshell.enabled != self.settings.fastshell.enabled;
                 let limits_changed = updated.fastshell.job_storage_limit_mib
@@ -636,9 +679,16 @@ impl App {
                     if search_changed {
                         message.push(self.config_messages().cpu_limit_note);
                     }
+                    if guard_changed {
+                        message.push(if self.settings.output_guard.enabled {
+                            self.guard_messages().available_note
+                        } else {
+                            self.guard_messages().disabled_note
+                        });
+                    }
                     self.toast = Some(Toast {
                         message: message.join("\n"),
-                        warning: false,
+                        warning: guard_changed && !self.settings.output_guard.enabled,
                     });
                 })
             }
@@ -668,6 +718,7 @@ impl App {
                 ApplyOptions {
                     tier: self.settings.tier,
                     tool_budgets: self.settings.tool_budgets,
+                    output_guard_enabled: self.settings.output_guard.enabled,
                     fastshell_enabled: self.settings.fastshell.enabled,
                     current_executable: self.current_executable.clone(),
                 },
@@ -962,6 +1013,7 @@ impl App {
             KeyCode::Enter => match self.selected {
                 0 => self.set_screen(Screen::ApplyHome),
                 1 => {
+                    self.provider_detection = provider::detect_path(&self.paths.codex_config);
                     self.config_draft = ConfigDraft::from_settings(&self.settings);
                     self.config_cursor = ConfigCursor::default();
                     self.config_viewport = ConfigViewport::default();
@@ -1110,6 +1162,7 @@ impl App {
     }
 
     fn handle_config(&mut self, key: KeyEvent) {
+        let guarded = self.output_guard_active();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.config_cursor = self.config_cursor.previous(),
             KeyCode::Down | KeyCode::Char('j') => self.config_cursor = self.config_cursor.next(),
@@ -1118,13 +1171,23 @@ impl App {
                 self.config_cursor = self.config_cursor.previous_group()
             }
             KeyCode::Tab => self.config_cursor = self.config_cursor.next_group(),
-            KeyCode::Left | KeyCode::Char('h') => self
-                .config_draft
-                .adjust(self.config_cursor.entry().item, false),
-            KeyCode::Right | KeyCode::Char('l') => self
-                .config_draft
-                .adjust(self.config_cursor.entry().item, true),
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.config_draft
+                    .adjust_with_guard(self.config_cursor.entry().item, false, guarded)
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.config_draft
+                    .adjust_with_guard(self.config_cursor.entry().item, true, guarded)
+            }
             KeyCode::Enter => match self.config_cursor.entry().item {
+                ConfigItemId::OutputGuard if self.config_draft.output_guard_enabled => {
+                    self.selected = 0;
+                    self.screen = Screen::ConfigOutputGuardConfirm;
+                }
+                ConfigItemId::OutputGuard => {
+                    self.config_draft.set_output_guard(true);
+                    self.pending = Some(Effect::SaveConfig);
+                }
                 ConfigItemId::SearchCpuLimit => {
                     self.cpu_limit_editor = CpuLimitEditor {
                         input: self
@@ -1140,7 +1203,9 @@ impl App {
                 | ConfigItemId::GlobBudget
                 | ConfigItemId::RunBudget
                 | ConfigItemId::JobOutputBudget) => {
-                    let ConfigValue::Budget(budget) = self.config_draft.value(item) else {
+                    let ConfigValue::Budget(budget) =
+                        self.config_draft.value_with_guard(item, guarded)
+                    else {
                         return;
                     };
                     self.budget_editor = BudgetEditor {
@@ -1162,6 +1227,25 @@ impl App {
                 _ => self.pending = Some(Effect::SaveConfig),
             },
             KeyCode::Esc => self.back_to_main(),
+            _ => {}
+        }
+    }
+
+    fn handle_output_guard_confirm(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
+                self.selected = 1 - self.selected.min(1);
+            }
+            KeyCode::Enter if self.selected == 1 => {
+                self.config_draft.set_output_guard(false);
+                self.selected = 0;
+                self.screen = Screen::Config;
+                self.pending = Some(Effect::SaveConfig);
+            }
+            KeyCode::Enter | KeyCode::Esc => {
+                self.selected = 0;
+                self.screen = Screen::Config;
+            }
             _ => {}
         }
     }
@@ -1583,7 +1667,7 @@ mod tests {
     };
     use crate::search_parallelism::SearchParallelismInputError;
     use crate::shell::jobs::{JobSourceSummary, JobSummary, JobSummaryStatus};
-    use crate::tui::config::{ConfigCursor, ConfigItemId, ConfigValue};
+    use crate::tui::config::{ConfigCursor, ConfigDraft, ConfigItemId, ConfigValue};
     use crate::tui::jobs::{JobsDetail, JobsState};
     use crate::update::{
         CheckFailure, CheckFailureKind, NpmDiscovery, NpmRegistryProbe, NpmVersionAuthority,
@@ -1947,6 +2031,7 @@ mod tests {
 
         for expected in [
             ConfigItemId::OutputTier,
+            ConfigItemId::OutputGuard,
             ConfigItemId::ReadBudget,
             ConfigItemId::GrepBudget,
             ConfigItemId::GlobBudget,
@@ -2003,11 +2088,85 @@ mod tests {
     }
 
     #[test]
+    fn guarded_provider_locks_only_the_tier_and_disabling_requires_confirmation() {
+        let (_temp, mut app) = fixture();
+        app.settings.language = Some("en".to_string());
+        std::fs::write(
+            &app.paths.codex_config,
+            concat!(
+                "model_provider = 'third-party'\n",
+                "[model_providers.third-party]\n",
+                "name = 'Third Party'\n",
+            ),
+        )
+        .unwrap();
+        app.provider_detection = crate::control::provider::detect_path(&app.paths.codex_config);
+        app.config_draft = ConfigDraft::from_settings(&app.settings);
+        app.screen = Screen::Config;
+        app.config_cursor = ConfigCursor::default();
+
+        assert!(app.output_guard_active());
+        assert_eq!(app.effective_output().host_limit, 10_000);
+        assert_eq!(app.effective_output().fastctx_budget, 9_000);
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.config_draft.output.tier, Tier::Standard);
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
+        app.handle_key(key(KeyCode::Left));
+        assert!(app.config_draft.output_guard_enabled);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::ReadBudget);
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            app.config_draft.output.budgets.read,
+            Some(ToolBudgetLevel::Percent(99))
+        );
+        assert_eq!(
+            app.effective_output().tool_budgets.read,
+            ToolBudgetLevel::Percent(99)
+        );
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::ConfigOutputGuardConfirm);
+        assert!(!app.has_pending_effect());
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Config);
+        assert!(app.config_draft.output_guard_enabled);
+
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Right));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Config);
+        assert!(!app.config_draft.output_guard_enabled);
+        app.execute_pending();
+        assert_eq!(app.screen, Screen::Main);
+        assert!(!app.settings.output_guard.enabled);
+        assert!(app.toast.as_ref().is_some_and(|toast| toast.warning));
+        assert!(
+            !crate::control::settings::load(&app.paths)
+                .unwrap()
+                .output_guard
+                .enabled
+        );
+
+        app.screen = Screen::Config;
+        app.config_cursor = ConfigCursor::default();
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.config_draft.output.tier, Tier::High);
+
+        app.config_cursor = ConfigCursor::default().next();
+        app.handle_key(key(KeyCode::Enter));
+        app.execute_pending();
+        assert!(app.settings.output_guard.enabled);
+    }
+
+    #[test]
     fn fastshell_toggle_saves_on_enter_and_takes_effect_only_on_apply() {
         let (_temp, mut app) = fixture();
         app.settings.language = Some("en".to_string());
         app.screen = Screen::Config;
-        for _ in 0..6 {
+        for _ in 0..7 {
             app.handle_key(key(KeyCode::Down));
         }
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::FastShell);
@@ -2030,7 +2189,7 @@ mod tests {
         let (_temp, mut app) = fixture();
         app.settings.language = Some("en".to_string());
         app.screen = Screen::Config;
-        for _ in 0..7 {
+        for _ in 0..8 {
             app.handle_key(key(KeyCode::Down));
         }
         assert_eq!(
@@ -2708,6 +2867,7 @@ mod tests {
         app.config_cursor = ConfigCursor::default();
         app.handle_key(key(KeyCode::Right));
         app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Left));
         assert_eq!(
             app.config_draft.value(ConfigItemId::OutputTier),
@@ -2731,6 +2891,7 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.screen, Screen::Config);
         app.handle_key(key(KeyCode::Right));
+        app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Left));
         for _ in 0..3 {
@@ -2797,7 +2958,7 @@ mod tests {
         app.screen = Screen::Config;
         app.config_cursor = ConfigCursor::default();
         // Move onto grep, which ships unset so the editor must open showing "auto".
-        for _ in 0..2 {
+        for _ in 0..3 {
             app.handle_key(key(KeyCode::Down));
         }
         app.handle_key(key(KeyCode::Enter));
@@ -2846,7 +3007,7 @@ mod tests {
     /// Reopens the grep share editor from wherever the previous commit left the app.
     fn open_grep_budget_editor(app: &mut App) {
         app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default().next().next();
+        app.config_cursor = ConfigCursor::default().next().next().next();
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::GrepBudget);
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(

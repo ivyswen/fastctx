@@ -8,23 +8,47 @@ const WINDOWS_MISSING_BASH: &str = "Cannot find a usable bash. fastshell runs ev
 const UNIX_MISSING_BASH: &str =
     "Cannot find a usable bash. Install bash or set FASTCTX_BASH to its absolute path.";
 
-/// Caches the validated backend for one fastshell server process.
+/// Caches the validated backend for one MCP connection.
 #[derive(Debug, Default)]
 pub(crate) struct BashLocator {
     cached: OnceLock<Result<PathBuf, String>>,
+    locale: OnceLock<String>,
 }
 
 impl BashLocator {
-    /// Returns the validated bash path, probing at most once per server process.
-    pub(crate) fn resolve(&self) -> Result<PathBuf, String> {
-        self.cached.get_or_init(probe_bash).clone()
+    /// Returns the validated bash path, probing at most once per connection.
+    pub(crate) fn resolve(
+        &self,
+        environment: &crate::session::SessionEnvironment,
+    ) -> Result<PathBuf, String> {
+        self.cached
+            .get_or_init(|| probe_bash_with_environment(environment))
+            .clone()
+    }
+
+    /// Returns a locale probed once for this connection's bash and environment.
+    pub(crate) fn utf8_locale<'a>(
+        &'a self,
+        environment: &crate::session::SessionEnvironment,
+        bash: &Path,
+    ) -> &'a str {
+        self.locale
+            .get_or_init(|| crate::shell::process::detect_utf8_locale(bash, environment))
+            .as_str()
     }
 }
 
 /// Probes bash without caching, used by Apply preflight and doctor.
 pub(crate) fn probe_bash() -> Result<PathBuf, String> {
-    match std::env::var("FASTCTX_BASH") {
-        Ok(value) => return validate_override(&value),
+    let environment = crate::session::SessionEnvironment::capture()?;
+    probe_bash_with_environment(&environment)
+}
+
+fn probe_bash_with_environment(
+    environment: &crate::session::SessionEnvironment,
+) -> Result<PathBuf, String> {
+    match environment.var("FASTCTX_BASH") {
+        Ok(value) => return validate_override_with_environment(&value, environment),
         Err(std::env::VarError::NotUnicode(_)) => {
             return Err("Invalid FASTCTX_BASH value \"<non-UTF-8>\": not a working bash (the path is not valid UTF-8). Fix or unset it.".to_string());
         }
@@ -32,25 +56,34 @@ pub(crate) fn probe_bash() -> Result<PathBuf, String> {
     }
 
     let mut seen = HashSet::new();
-    for candidate in automatic_candidates() {
-        if excluded_candidate(&candidate) || !seen.insert(candidate_key(&candidate)) {
+    for candidate in automatic_candidates(environment) {
+        if excluded_candidate(&candidate, environment) || !seen.insert(candidate_key(&candidate)) {
             continue;
         }
-        if validate_bash(&candidate).is_ok() {
+        if validate_bash(&candidate, environment).is_ok() {
             return Ok(candidate);
         }
     }
     Err(missing_bash_message().to_string())
 }
 
+#[cfg(test)]
 fn validate_override(value: &str) -> Result<PathBuf, String> {
+    let environment = crate::session::SessionEnvironment::capture()?;
+    validate_override_with_environment(value, &environment)
+}
+
+fn validate_override_with_environment(
+    value: &str,
+    environment: &crate::session::SessionEnvironment,
+) -> Result<PathBuf, String> {
     let path = crate::paths::parse_input_path(value);
     let result = if !path.is_absolute() {
         Err("the path is not absolute".to_string())
-    } else if excluded_candidate(&path) {
+    } else if excluded_candidate(&path, environment) {
         Err("the path points to the Windows/WSL launcher or a WindowsApps shim".to_string())
     } else {
-        validate_bash(&path)
+        validate_bash(&path, environment)
     };
     result.map(|_| path).map_err(|reason| {
         format!(
@@ -59,14 +92,19 @@ fn validate_override(value: &str) -> Result<PathBuf, String> {
     })
 }
 
-fn validate_bash(path: &Path) -> Result<(), String> {
+fn validate_bash(
+    path: &Path,
+    environment: &crate::session::SessionEnvironment,
+) -> Result<(), String> {
     if !path.is_absolute() {
         return Err("the path is not absolute".to_string());
     }
     if !path.is_file() {
         return Err("the file does not exist".to_string());
     }
-    let output = crate::process_policy::noninteractive_command(path)
+    let mut command = crate::process_policy::noninteractive_command(path);
+    environment.configure_command(&mut command);
+    let output = command
         .arg("--version")
         .output()
         .map_err(|error| error.to_string())?;
@@ -85,9 +123,9 @@ fn validate_bash(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn automatic_candidates() -> Vec<PathBuf> {
+fn automatic_candidates(environment: &crate::session::SessionEnvironment) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
-    for git in path_candidates("git.exe") {
+    for git in path_candidates(environment, "git.exe") {
         let mut ancestor = git.parent();
         for _ in 0..4 {
             let Some(directory) = ancestor else { break };
@@ -96,26 +134,27 @@ fn automatic_candidates() -> Vec<PathBuf> {
         }
     }
     for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(root) = std::env::var_os(variable) {
+        if let Some(root) = environment.var_os(variable) {
             candidates.push(PathBuf::from(root).join("Git/usr/bin/bash.exe"));
         }
     }
-    if let Some(root) = std::env::var_os("LocalAppData") {
+    if let Some(root) = environment.var_os("LocalAppData") {
         candidates.push(PathBuf::from(root).join("Programs/Git/usr/bin/bash.exe"));
     }
-    candidates.extend(path_candidates("bash.exe"));
+    candidates.extend(path_candidates(environment, "bash.exe"));
     candidates
 }
 
 #[cfg(not(windows))]
-fn automatic_candidates() -> Vec<PathBuf> {
+fn automatic_candidates(environment: &crate::session::SessionEnvironment) -> Vec<PathBuf> {
     let mut candidates = vec![PathBuf::from("/bin/bash"), PathBuf::from("/usr/bin/bash")];
-    candidates.extend(path_candidates("bash"));
+    candidates.extend(path_candidates(environment, "bash"));
     candidates
 }
 
-fn path_candidates(name: &str) -> Vec<PathBuf> {
-    std::env::var_os("PATH")
+fn path_candidates(environment: &crate::session::SessionEnvironment, name: &str) -> Vec<PathBuf> {
+    environment
+        .var_os("PATH")
         .map(|path| {
             std::env::split_paths(&path)
                 .map(|directory| directory.join(name))
@@ -125,9 +164,10 @@ fn path_candidates(name: &str) -> Vec<PathBuf> {
 }
 
 #[cfg(windows)]
-fn excluded_candidate(path: &Path) -> bool {
+fn excluded_candidate(path: &Path, environment: &crate::session::SessionEnvironment) -> bool {
     let canonical = crate::paths::canonical_existing(path).unwrap_or_else(|_| path.to_path_buf());
-    let root = std::env::var_os("SystemRoot")
+    let root = environment
+        .var_os("SystemRoot")
         .map(PathBuf::from)
         .map(|root| crate::paths::canonical_existing(&root).unwrap_or(root));
     excluded_windows_candidate(&canonical, root.as_deref())
@@ -155,7 +195,7 @@ fn excluded_windows_candidate(path: &Path, system_root: Option<&Path>) -> bool {
 }
 
 #[cfg(not(windows))]
-fn excluded_candidate(_path: &Path) -> bool {
+fn excluded_candidate(_path: &Path, _environment: &crate::session::SessionEnvironment) -> bool {
     false
 }
 

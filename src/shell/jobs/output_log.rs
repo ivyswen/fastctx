@@ -64,10 +64,22 @@ pub(crate) struct OutputLogWriter {
     started: bool,
     bytes_since_flush: u64,
     last_flush: Instant,
+    byte_limit: u64,
+    quota_exceeded: bool,
 }
 
 impl OutputLogWriter {
+    #[cfg(test)]
     pub(crate) fn new(directory: &Path) -> Result<Self, String> {
+        Self::with_limit(directory, u64::MAX)
+    }
+
+    pub(crate) fn with_limit(directory: &Path, byte_limit: u64) -> Result<Self, String> {
+        if byte_limit < INDEX_HEADER.len() as u64 + INDEX_ENTRY_BYTES {
+            return Err(format!(
+                "background output limit {byte_limit} bytes is too small for the log index"
+            ));
+        }
         let log_path = directory.join(OUTPUT_LOG_FILE);
         let index_path = directory.join(OUTPUT_INDEX_FILE);
         let log = create_private_file(&log_path, "output log")?;
@@ -97,12 +109,15 @@ impl OutputLogWriter {
             started: false,
             bytes_since_flush: 0,
             last_flush: Instant::now(),
+            byte_limit,
+            quota_exceeded: false,
         })
     }
 
-    /// Appends one normalized stream event and returns the committed line number,
-    /// if this event ended a line.
+    /// Appends one normalized stream event and returns the committed line number when a line ends
+    /// or the quota seals a final readable prefix.
     pub(crate) fn append(&mut self, event: NormalizedEvent) -> Result<Option<u64>, String> {
+        let quota_was_exceeded = self.quota_exceeded;
         let committed = match event {
             NormalizedEvent::Start(encoding) => {
                 if self.started {
@@ -112,26 +127,59 @@ impl OutputLogWriter {
                 }
                 self.started = true;
                 self.stream_encoding = encoding;
-                if let Some(encoding) = encoding {
-                    self.write_log(stream_bom(encoding))?;
+                if let Some(encoding) = encoding
+                    && !self.write_fixed(stream_bom(encoding))?
+                {
+                    self.quota_exceeded = true;
                 }
                 self.current_start = self.position;
                 None
             }
             NormalizedEvent::Bytes(bytes) => {
                 self.require_started()?;
-                if !bytes.is_empty() {
-                    self.write_log(&bytes)?;
-                    self.current_has_content = true;
+                if !bytes.is_empty() && !self.quota_exceeded {
+                    let written = self.write_content(&bytes)?;
+                    if written < bytes.len() {
+                        self.quota_exceeded = true;
+                    }
+                    if written > 0 {
+                        self.current_has_content = true;
+                    }
+                    if self.quota_exceeded && self.current_has_content {
+                        Some(self.commit_line(false)?)
+                    } else {
+                        None
+                    }
+                } else if !bytes.is_empty() {
+                    self.quota_exceeded = true;
+                    None
+                } else {
+                    None
                 }
-                None
             }
             NormalizedEvent::LineEnd { terminated } => {
                 self.require_started()?;
-                Some(self.commit_line(terminated)?)
+                if self.quota_exceeded {
+                    if self.current_has_content {
+                        Some(self.commit_line(false)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    match self.try_commit_line(terminated)? {
+                        Some(line) => Some(line),
+                        None => {
+                            self.quota_exceeded = true;
+                            self.current_has_content
+                                .then(|| self.commit_line(false))
+                                .transpose()?
+                        }
+                    }
+                }
             }
         };
-        if self.bytes_since_flush >= FLUSH_BYTES
+        if (!quota_was_exceeded && self.quota_exceeded)
+            || self.bytes_since_flush >= FLUSH_BYTES
             || self
                 .committed_position
                 .saturating_sub(self.indexed_position)
@@ -162,6 +210,22 @@ impl OutputLogWriter {
         self.total_lines
     }
 
+    pub(crate) const fn quota_exceeded(&self) -> bool {
+        self.quota_exceeded
+    }
+
+    pub(crate) const fn persisted_log_bytes(&self) -> u64 {
+        self.position
+    }
+
+    pub(crate) const fn persisted_index_bytes(&self) -> u64 {
+        INDEX_HEADER.len() as u64 + self.total_lines.saturating_mul(INDEX_ENTRY_BYTES)
+    }
+
+    pub(crate) const fn byte_limit(&self) -> u64 {
+        self.byte_limit
+    }
+
     pub(crate) fn preserved_lines(&self) -> u64 {
         let log_len = self
             .log
@@ -186,10 +250,22 @@ impl OutputLogWriter {
         }
     }
 
+    fn try_commit_line(&mut self, terminated: bool) -> Result<Option<u64>, String> {
+        let required = INDEX_ENTRY_BYTES.saturating_add(if terminated {
+            line_ending(self.stream_encoding).len() as u64
+        } else {
+            0
+        });
+        if self.combined_bytes().saturating_add(required) > self.byte_limit {
+            return Ok(None);
+        }
+        self.commit_line(terminated).map(Some)
+    }
+
     fn commit_line(&mut self, terminated: bool) -> Result<u64, String> {
         let content_end = self.position;
         if terminated {
-            self.write_log(line_ending(self.stream_encoding))?;
+            self.write_fixed(line_ending(self.stream_encoding))?;
         }
         LineIndexEntry {
             start: self.current_start,
@@ -204,7 +280,29 @@ impl OutputLogWriter {
         Ok(self.total_lines)
     }
 
-    fn write_log(&mut self, bytes: &[u8]) -> Result<(), String> {
+    fn write_content(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let reserve =
+            INDEX_ENTRY_BYTES.saturating_add(line_ending(self.stream_encoding).len() as u64);
+        let available = self
+            .byte_limit
+            .saturating_sub(self.combined_bytes())
+            .saturating_sub(reserve);
+        let width = stream_width(self.stream_encoding);
+        let accepted = usize::try_from(available.min(bytes.len() as u64)).unwrap_or(bytes.len());
+        let accepted = accepted - accepted % width;
+        self.write_log_unchecked(&bytes[..accepted])?;
+        Ok(accepted)
+    }
+
+    fn write_fixed(&mut self, bytes: &[u8]) -> Result<bool, String> {
+        if self.combined_bytes().saturating_add(bytes.len() as u64) > self.byte_limit {
+            return Ok(false);
+        }
+        self.write_log_unchecked(bytes)?;
+        Ok(true)
+    }
+
+    fn write_log_unchecked(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.log.write_all(bytes).map_err(|error| {
             format!(
                 "cannot append background output log {}: {error}",
@@ -214,6 +312,12 @@ impl OutputLogWriter {
         self.position = self.position.saturating_add(bytes.len() as u64);
         self.bytes_since_flush = self.bytes_since_flush.saturating_add(bytes.len() as u64);
         Ok(())
+    }
+
+    fn combined_bytes(&self) -> u64 {
+        self.position
+            .saturating_add(INDEX_HEADER.len() as u64)
+            .saturating_add(self.total_lines.saturating_mul(INDEX_ENTRY_BYTES))
     }
 
     fn has_buffered_data(&self) -> bool {
@@ -724,6 +828,14 @@ pub(super) const fn line_ending(encoding: Option<StreamEncoding>) -> &'static [u
     }
 }
 
+const fn stream_width(encoding: Option<StreamEncoding>) -> usize {
+    match encoding {
+        None => 1,
+        Some(StreamEncoding::Utf16Le | StreamEncoding::Utf16Be) => 2,
+        Some(StreamEncoding::Utf32Le | StreamEncoding::Utf32Be) => 4,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -959,5 +1071,81 @@ mod tests {
         let error = reader.read_range(2, 2).unwrap_err();
         assert!(error.contains("index"));
         assert!(error.contains("damaged"));
+    }
+
+    #[test]
+    fn combined_quota_bounds_index_heavy_empty_lines() {
+        const LIMIT: u64 = 1_024;
+        let temp = tempfile::tempdir().unwrap();
+        let mut writer = OutputLogWriter::with_limit(temp.path(), LIMIT).unwrap();
+        writer.append(NormalizedEvent::Start(None)).unwrap();
+        for _ in 0..10_000 {
+            writer
+                .append(NormalizedEvent::LineEnd { terminated: true })
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        assert!(writer.quota_exceeded());
+        let log_len = std::fs::metadata(temp.path().join("output.log"))
+            .unwrap()
+            .len();
+        let index_len = std::fs::metadata(temp.path().join("output.idx"))
+            .unwrap()
+            .len();
+        assert!(log_len + index_len <= LIMIT, "{log_len}+{index_len}");
+        assert_eq!(
+            index_len,
+            INDEX_HEADER.len() as u64 + writer.total_lines() * 24
+        );
+        assert!(writer.total_lines() > 0);
+        assert!(writer.total_lines() < 10_000);
+    }
+
+    #[test]
+    fn combined_quota_keeps_a_readable_prefix_and_stops_all_future_growth() {
+        const LIMIT: u64 = 4_096;
+        let temp = tempfile::tempdir().unwrap();
+        let mut writer = OutputLogWriter::with_limit(temp.path(), LIMIT).unwrap();
+        writer.append(NormalizedEvent::Start(None)).unwrap();
+        writer
+            .append(NormalizedEvent::Bytes(vec![b'x'; 32 * 1024]))
+            .unwrap();
+        assert!(writer.quota_exceeded());
+        assert_eq!(writer.total_lines(), 1);
+        writer
+            .append(NormalizedEvent::LineEnd { terminated: true })
+            .unwrap();
+        writer.finish().unwrap();
+        let before = (
+            std::fs::metadata(temp.path().join("output.log"))
+                .unwrap()
+                .len(),
+            std::fs::metadata(temp.path().join("output.idx"))
+                .unwrap()
+                .len(),
+        );
+        for _ in 0..100 {
+            writer
+                .append(NormalizedEvent::Bytes(vec![b'y'; 4_096]))
+                .unwrap();
+            writer
+                .append(NormalizedEvent::LineEnd { terminated: true })
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let after = (
+            std::fs::metadata(temp.path().join("output.log"))
+                .unwrap()
+                .len(),
+            std::fs::metadata(temp.path().join("output.idx"))
+                .unwrap()
+                .len(),
+        );
+        assert_eq!(after, before);
+        assert!(after.0 + after.1 <= LIMIT);
+        let mut reader = OutputLogReader::open(temp.path(), true).unwrap();
+        let line = reader.read_range(1, 1).unwrap().remove(0);
+        assert!(!line.bytes.is_empty());
+        assert!(line.bytes.iter().all(|byte| *byte == b'x'));
     }
 }

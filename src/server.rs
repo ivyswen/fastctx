@@ -7,7 +7,10 @@ use crate::glob_tool::{GlobRequest, glob_files_cancellable};
 use crate::grep_tool::{GrepRequest, grep_files_cancellable};
 use crate::read_tool::{ReadRequest, read_file};
 use crate::server_manifest::{ToolContract, ToolManifest};
-use crate::server_support::{BudgetRetry, run_blocking, run_blocking_cancellable};
+use crate::server_support::{
+    BudgetRetry, CancellableBlockingRequest, run_blocking, run_blocking_cancellable,
+};
+use crate::session::SessionContext;
 use crate::shell::FastShell;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -22,7 +25,7 @@ const MAX_SHELL_OPERATIONS: usize = 16;
 const MAX_REPLACE_OPERATIONS: usize = 8;
 
 /// Optional tool groups published by the single `fastctx` server.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ServerOptions {
     /// Publish the five shell tools.
     pub enable_shell: bool,
@@ -46,6 +49,43 @@ pub struct FastCtxServer {
     pub(crate) grep_glob_executor: Arc<GrepGlobExecutor>,
     pub(crate) shell_permits: Arc<Semaphore>,
     pub(crate) replace_permits: Arc<Semaphore>,
+    pub(crate) session: Arc<SessionContext>,
+    pub(crate) activity: Arc<crate::runtime::activity::RuntimeActivity>,
+}
+
+/// Expensive executors and process-wide admission gates shared by every control-center session.
+#[derive(Clone, Debug)]
+pub struct SharedRuntime {
+    file_permits: Arc<Semaphore>,
+    grep_glob_executor: Arc<GrepGlobExecutor>,
+    shell_permits: Arc<Semaphore>,
+    replace: ReplaceService,
+    replace_permits: Arc<Semaphore>,
+    activity: Arc<crate::runtime::activity::RuntimeActivity>,
+}
+
+impl SharedRuntime {
+    /// Creates one per-user runtime around the configured search executor.
+    pub(crate) fn new(grep_glob_executor: Arc<GrepGlobExecutor>) -> Arc<Self> {
+        Self::with_activity(
+            grep_glob_executor,
+            crate::runtime::activity::RuntimeActivity::new(),
+        )
+    }
+
+    pub(crate) fn with_activity(
+        grep_glob_executor: Arc<GrepGlobExecutor>,
+        activity: Arc<crate::runtime::activity::RuntimeActivity>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            file_permits: Arc::new(Semaphore::new(MAX_FILE_OPERATIONS)),
+            grep_glob_executor,
+            shell_permits: Arc::new(Semaphore::new(MAX_SHELL_OPERATIONS)),
+            replace: ReplaceService::new(),
+            replace_permits: Arc::new(Semaphore::new(MAX_REPLACE_OPERATIONS)),
+            activity,
+        })
+    }
 }
 
 impl FastCtxServer {
@@ -64,6 +104,19 @@ impl FastCtxServer {
         options: ServerOptions,
         grep_glob_executor: Arc<GrepGlobExecutor>,
     ) -> Self {
+        Self::with_session_and_runtime(
+            options,
+            SessionContext::library_default(),
+            SharedRuntime::new(grep_glob_executor),
+        )
+    }
+
+    /// Creates one isolated MCP connection backed by a shared per-user runtime.
+    pub(crate) fn with_session_and_runtime(
+        options: ServerOptions,
+        session: Arc<SessionContext>,
+        runtime: Arc<SharedRuntime>,
+    ) -> Self {
         let mut tool_router = Self::file_tool_router();
         tool_router.merge(Self::shell_tool_router());
         tool_router.merge(Self::edit_tool_router());
@@ -78,12 +131,14 @@ impl FastCtxServer {
         Self {
             tool_router,
             options,
-            shell: FastShell::new(),
-            replace: ReplaceService::new(),
-            file_permits: Arc::new(Semaphore::new(MAX_FILE_OPERATIONS)),
-            grep_glob_executor,
-            shell_permits: Arc::new(Semaphore::new(MAX_SHELL_OPERATIONS)),
-            replace_permits: Arc::new(Semaphore::new(MAX_REPLACE_OPERATIONS)),
+            shell: FastShell::with_session(Arc::clone(&session)),
+            replace: runtime.replace.clone(),
+            file_permits: Arc::clone(&runtime.file_permits),
+            grep_glob_executor: Arc::clone(&runtime.grep_glob_executor),
+            shell_permits: Arc::clone(&runtime.shell_permits),
+            replace_permits: Arc::clone(&runtime.replace_permits),
+            activity: Arc::clone(&runtime.activity),
+            session,
         }
     }
 
@@ -136,8 +191,10 @@ with the exact parameters a Partial note provides.",
         )
     )]
     async fn read(&self, Parameters(request): Parameters<ReadRequest>) -> CallToolResult {
+        let _activity = self.activity.request();
         let status_shell = self.shell.clone();
         run_blocking(
+            Arc::clone(&self.session),
             Arc::clone(&self.file_permits),
             READ_TOKEN_BUDGET_ENV,
             move || status_shell.background_status(None),
@@ -162,12 +219,16 @@ with the exact parameters a Partial note provides.",
         Parameters(request): Parameters<GrepRequest>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let _activity = self.activity.request();
         run_blocking_cancellable(
-            context.id,
-            context.ct,
-            Arc::clone(&self.file_permits),
-            Arc::clone(&self.grep_glob_executor),
-            GREP_TOKEN_BUDGET_ENV,
+            CancellableBlockingRequest::new(
+                Arc::clone(&self.session),
+                context.id,
+                context.ct,
+                Arc::clone(&self.file_permits),
+                Arc::clone(&self.grep_glob_executor),
+                GREP_TOKEN_BUDGET_ENV,
+            ),
             {
                 let shell = self.shell.clone();
                 move || shell.background_status(None)
@@ -192,12 +253,16 @@ with the exact parameters a Partial note provides.",
         Parameters(request): Parameters<GlobRequest>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let _activity = self.activity.request();
         run_blocking_cancellable(
-            context.id,
-            context.ct,
-            Arc::clone(&self.file_permits),
-            Arc::clone(&self.grep_glob_executor),
-            GLOB_TOKEN_BUDGET_ENV,
+            CancellableBlockingRequest::new(
+                Arc::clone(&self.session),
+                context.id,
+                context.ct,
+                Arc::clone(&self.file_permits),
+                Arc::clone(&self.grep_glob_executor),
+                GLOB_TOKEN_BUDGET_ENV,
+            ),
             {
                 let shell = self.shell.clone();
                 move || shell.background_status(None)
@@ -211,6 +276,7 @@ with the exact parameters a Partial note provides.",
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for FastCtxServer {
     fn get_info(&self) -> ServerInfo {
+        self.activity.touch();
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 env!("CARGO_PKG_NAME"),
@@ -237,7 +303,7 @@ impl ServerHandler for FastCtxServer {
 
 #[cfg(test)]
 mod tests {
-    use super::{FastCtxServer, ServerOptions};
+    use super::{FastCtxServer, ServerOptions, SharedRuntime};
     use crate::file_executor::GrepGlobExecutor;
     use crate::search_parallelism::MAX_SEARCH_PARALLELISM;
     use std::sync::Arc;
@@ -255,5 +321,33 @@ mod tests {
             assert_eq!(server.grep_glob_executor.parallelism(), parallelism);
             assert_eq!(server.grep_glob_executor.extra_capacity(), parallelism - 1);
         }
+    }
+
+    #[test]
+    fn connections_share_runtime_resources_but_keep_distinct_session_contexts() {
+        let executor = Arc::new(GrepGlobExecutor::with_test_parallelism(1));
+        let runtime = SharedRuntime::new(Arc::clone(&executor));
+        let first = FastCtxServer::with_session_and_runtime(
+            ServerOptions::all(),
+            crate::session::SessionContext::library_default(),
+            Arc::clone(&runtime),
+        );
+        let second = FastCtxServer::with_session_and_runtime(
+            ServerOptions::all(),
+            crate::session::SessionContext::library_default(),
+            runtime,
+        );
+
+        assert!(Arc::ptr_eq(&first.grep_glob_executor, &executor));
+        assert!(Arc::ptr_eq(
+            &first.grep_glob_executor,
+            &second.grep_glob_executor
+        ));
+        assert!(Arc::ptr_eq(&first.file_permits, &second.file_permits));
+        assert!(Arc::ptr_eq(&first.shell_permits, &second.shell_permits));
+        assert!(Arc::ptr_eq(&first.replace_permits, &second.replace_permits));
+        assert!(first.replace.shares_locks_with(&second.replace));
+        assert!(Arc::ptr_eq(&first.activity, &second.activity));
+        assert!(!Arc::ptr_eq(&first.session, &second.session));
     }
 }

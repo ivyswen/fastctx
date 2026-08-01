@@ -4,6 +4,7 @@ use crate::control::agents;
 use crate::control::codex_config::{self, ExpectedConfig, TokenLimitConflict};
 use crate::control::paths::ControlPaths;
 use crate::control::processes::{self, InstalledProcess, TerminationOutcome};
+use crate::control::provider;
 use crate::control::settings::{
     self, AppliedRecord, ManagedFileRecord, Tier, ToolBudgetPreferences,
 };
@@ -21,6 +22,8 @@ pub struct ApplyOptions {
     pub tier: Tier,
     /// Five long-output tools' advanced overrides; unset entries follow the tier.
     pub tool_budgets: ToolBudgetPreferences,
+    /// Whether local-compaction providers should use the Guarded effective output policy.
+    pub output_guard_enabled: bool,
     /// Whether the optional shell tool group should be published.
     pub fastshell_enabled: bool,
     /// Currently running binary to self-install.
@@ -282,13 +285,21 @@ pub fn plan_apply(paths: &ControlPaths, options: ApplyOptions) -> Result<ApplyPl
 
     let codex_original = transaction::read_snapshot(&paths.codex_config)?;
     let codex_source = codex_original.as_deref().unwrap_or_default();
+    let provider_detection = provider::detect_bytes(codex_original.as_deref());
+    let effective_output = provider::effective_output(
+        options.tier,
+        options.tool_budgets,
+        options.output_guard_enabled,
+        &provider_detection,
+    );
     let expected = ExpectedConfig {
         command: crate::paths::display_path(&paths.installed_binary),
         tier: options.tier,
-        // Tier defaults are resolved here so everything downstream — what gets written, the
-        // receipt, and drift detection — sees one concrete set of shares rather than a preference
-        // whose meaning would move with a future change of the defaults.
-        tool_budgets: options.tool_budgets.resolve(options.tier),
+        host_limit: effective_output.host_limit,
+        fastctx_budget: effective_output.fastctx_budget,
+        // Resolve the environment-derived mode here so what gets written, the receipt, and drift
+        // detection all see one concrete policy while the persisted tier remains the user's choice.
+        tool_budgets: effective_output.tool_budgets,
         fastshell_enabled: options.fastshell_enabled,
     };
     let codex_edit = codex_config::apply(codex_source, &expected)?;
@@ -358,6 +369,7 @@ pub fn plan_apply(paths: &ControlPaths, options: ApplyOptions) -> Result<ApplyPl
         && record_current
         && current_settings.tier == options.tier
         && current_settings.tool_budgets == options.tool_budgets
+        && current_settings.output_guard.enabled == options.output_guard_enabled
         && current_settings.fastshell.enabled == options.fastshell_enabled;
 
     let settings_bytes = if keep_settings_bytes {
@@ -368,6 +380,7 @@ pub fn plan_apply(paths: &ControlPaths, options: ApplyOptions) -> Result<ApplyPl
     } else {
         current_settings.tier = options.tier;
         current_settings.tool_budgets = options.tool_budgets;
+        current_settings.output_guard.enabled = options.output_guard_enabled;
         current_settings.fastshell.enabled = options.fastshell_enabled;
         current_settings.fastedit.enabled = false;
         let (previous_token_limit_present, previous_token_limit) = previous_applied
@@ -387,11 +400,11 @@ pub fn plan_apply(paths: &ControlPaths, options: ApplyOptions) -> Result<ApplyPl
             version: env!("CARGO_PKG_VERSION").to_string(),
             command: expected.command.clone(),
             tier: options.tier,
-            tool_output_token_limit: options.tier.host_limit(),
+            tool_output_token_limit: expected.host_limit,
             tool_timeout_sec: Some(codex_config::TOOL_TIMEOUT_SECONDS),
             previous_token_limit_present,
             previous_token_limit,
-            fastctx_token_budget: options.tier.fastctx_budget(),
+            fastctx_token_budget: expected.fastctx_budget,
             tool_budgets: expected.tool_budgets,
             fastshell_enabled: options.fastshell_enabled,
             fastedit_enabled: false,
@@ -896,9 +909,9 @@ fn record_matches(record: &AppliedRecord, context: &RecordMatchContext<'_>) -> b
         && record.tool_budgets == expected.tool_budgets
         && record.fastshell_enabled == expected.fastshell_enabled
         && !record.fastedit_enabled
-        && record.tool_output_token_limit == expected.tier.host_limit()
+        && record.tool_output_token_limit == expected.host_limit
         && record.tool_timeout_sec == Some(codex_config::TOOL_TIMEOUT_SECONDS)
-        && record.fastctx_token_budget == expected.tier.fastctx_budget()
+        && record.fastctx_token_budget == expected.fastctx_budget
         && record.codex_dir_created == *codex_dir_created
         && record.codex_config.path == crate::paths::display_path(&paths.codex_config)
         && record.codex_agents.path == crate::paths::display_path(&paths.codex_agents)
@@ -986,7 +999,7 @@ fn short_hash(bytes: &[u8]) -> String {
 }
 
 fn budget_env_details(expected: &ExpectedConfig) -> Vec<String> {
-    let global = expected.tier.fastctx_budget();
+    let global = expected.fastctx_budget;
     let mut details = vec![format!("FASTCTX_TOKEN_BUDGET = {global}")];
     for (variable, level) in [
         ("FASTCTX_READ_TOKEN_BUDGET", expected.tool_budgets.read),
@@ -1039,7 +1052,7 @@ fn preview_apply(
                     ],
                 )
             } else if is_codex_config(change) {
-                let new_limit = expected.tier.host_limit();
+                let new_limit = expected.host_limit;
                 let original = change.original.as_deref().unwrap_or_default();
                 let updated = match &change.action {
                     FileAction::Write(bytes) => bytes.as_slice(),
@@ -1432,6 +1445,7 @@ mod tests {
                 run: Some(ToolBudgetLevel::Inherit),
                 job_output: Some(ToolBudgetLevel::Inherit),
             },
+            output_guard_enabled: true,
             fastshell_enabled: false,
             current_executable: executable,
         }
@@ -1939,6 +1953,73 @@ mod tests {
         assert!(source.contains("[mcp_servers.fastctx]"), "{source}");
         assert!(source.contains("mcp__fastctx"), "{source}");
         assert!(source.contains("FASTCTX_TOKEN_BUDGET = \"54000\""));
+    }
+
+    #[test]
+    fn third_party_apply_uses_guarded_limits_without_overwriting_the_tier_preference() {
+        let (_temp, paths, executable) = fixture();
+        std::fs::write(
+            &paths.codex_config,
+            concat!(
+                "model_provider = 'third-party'\n",
+                "[model_providers.third-party]\n",
+                "name = 'Third Party'\n",
+            ),
+        )
+        .unwrap();
+        let mut guarded = options(executable.clone());
+        guarded.tier = Tier::High;
+        guarded.tool_budgets = ToolBudgetPreferences::default();
+        commit_apply(plan_apply(&paths, guarded).unwrap(), true).unwrap();
+
+        let source = std::fs::read_to_string(&paths.codex_config).unwrap();
+        assert!(
+            source.contains("tool_output_token_limit = 10000"),
+            "{source}"
+        );
+        assert!(
+            source.contains("FASTCTX_TOKEN_BUDGET = \"9000\""),
+            "{source}"
+        );
+        for key in [
+            "FASTCTX_READ_TOKEN_BUDGET",
+            "FASTCTX_GREP_TOKEN_BUDGET",
+            "FASTCTX_GLOB_TOKEN_BUDGET",
+            "FASTCTX_RUN_TOKEN_BUDGET",
+            "FASTCTX_JOB_OUTPUT_TOKEN_BUDGET",
+        ] {
+            assert!(
+                !source.contains(key),
+                "{key} should inherit the Guarded budget: {source}"
+            );
+        }
+        let saved = crate::control::settings::load(&paths).unwrap();
+        assert_eq!(saved.tier, Tier::High);
+        let receipt = saved.applied.unwrap();
+        assert_eq!(receipt.tier, Tier::High);
+        assert_eq!(receipt.tool_output_token_limit, 10_000);
+        assert_eq!(receipt.fastctx_token_budget, 9_000);
+
+        let mut unguarded = options(executable);
+        unguarded.tier = Tier::High;
+        unguarded.tool_budgets = ToolBudgetPreferences::default();
+        unguarded.output_guard_enabled = false;
+        commit_apply(plan_apply(&paths, unguarded).unwrap(), true).unwrap();
+        let source = std::fs::read_to_string(&paths.codex_config).unwrap();
+        assert!(
+            source.contains("tool_output_token_limit = 100000"),
+            "{source}"
+        );
+        assert!(
+            source.contains("FASTCTX_TOKEN_BUDGET = \"90000\""),
+            "{source}"
+        );
+        assert!(
+            !crate::control::settings::load(&paths)
+                .unwrap()
+                .output_guard
+                .enabled
+        );
     }
 
     #[test]

@@ -73,6 +73,11 @@ impl ReplaceService {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn shares_locks_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.path_locks, &other.path_locks)
+    }
+
     /// Applies one regex plan across all candidates after a full blast-radius count.
     pub fn replace(&self, request: ReplaceRequest) -> ToolResponse {
         replace::replace(self, request)

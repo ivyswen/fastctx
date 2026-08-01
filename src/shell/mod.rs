@@ -127,19 +127,26 @@ pub enum JobListStatus {
     All,
 }
 
-/// Stateful shell service shared by all five tools in one MCP server process.
+/// Stateful shell service shared by all five tools in one MCP connection.
 #[derive(Clone, Debug)]
 pub struct FastShell {
     bash: Arc<BashLocator>,
     jobs: JobManager,
+    session: Arc<crate::session::SessionContext>,
 }
 
 impl FastShell {
     /// Creates a shell service whose background-job registry is shared across server restarts.
     pub fn new() -> Self {
+        Self::with_session(crate::session::SessionContext::library_default())
+    }
+
+    /// Creates a shell service bound to one immutable MCP connection.
+    pub(crate) fn with_session(session: Arc<crate::session::SessionContext>) -> Self {
         Self {
             bash: Arc::new(BashLocator::default()),
-            jobs: JobManager::new(),
+            jobs: JobManager::with_session(Arc::clone(&session)),
+            session,
         }
     }
 
@@ -172,21 +179,25 @@ impl FastShell {
             Ok(encoding) => encoding,
             Err(error) => return ToolResponse::error(error),
         };
-        let cwd = match resolve_cwd(request.cwd.as_deref()) {
+        let cwd = match resolve_cwd(request.cwd.as_deref(), self.session.environment.cwd()) {
             Ok(cwd) => cwd,
             Err(error) => return ToolResponse::error(error),
         };
-        let bash = match self.bash.resolve() {
+        let bash = match self.bash.resolve(&self.session.environment) {
             Ok(bash) => bash,
             Err(error) => return ToolResponse::error(error),
         };
         foreground::run(
-            &bash,
-            &request.command,
-            &cwd,
-            timeout_ms,
-            request.login_shell,
-            encoding,
+            foreground::ForegroundCommand {
+                bash: &bash,
+                command: &request.command,
+                cwd: &cwd,
+                timeout_ms,
+                login_shell: request.login_shell,
+                encoding,
+                environment: &self.session.environment,
+                utf8_locale: self.bash.utf8_locale(&self.session.environment, &bash),
+            },
             cancelled,
         )
     }
@@ -205,16 +216,23 @@ impl FastShell {
             Ok(encoding) => encoding,
             Err(error) => return ToolResponse::error(error),
         };
-        let cwd = match resolve_cwd(request.cwd.as_deref()) {
+        let cwd = match resolve_cwd(request.cwd.as_deref(), self.session.environment.cwd()) {
             Ok(cwd) => cwd,
             Err(error) => return ToolResponse::error(error),
         };
-        let bash = match self.bash.resolve() {
+        let bash = match self.bash.resolve(&self.session.environment) {
             Ok(bash) => bash,
             Err(error) => return ToolResponse::error(error),
         };
-        self.jobs
-            .start(&bash, &request.command, &cwd, request.login_shell, encoding)
+        self.jobs.start(jobs::BackgroundLaunch {
+            bash: &bash,
+            command: &request.command,
+            cwd: &cwd,
+            login_shell: request.login_shell,
+            encoding,
+            environment: &self.session.environment,
+            utf8_locale: self.bash.utf8_locale(&self.session.environment, &bash),
+        })
     }
 
     /// Returns output after an explicit sequence anchor or the server-side cursor.
@@ -298,7 +316,7 @@ fn invalid_timeout(timeout_ms: u64) -> ToolResponse {
     ))
 }
 
-fn resolve_cwd(input: Option<&str>) -> Result<PathBuf, String> {
+fn resolve_cwd(input: Option<&str>, session_cwd: &std::path::Path) -> Result<PathBuf, String> {
     let path = match input {
         Some(input) => {
             let path = parse_input_path(input);
@@ -319,8 +337,7 @@ fn resolve_cwd(input: Option<&str>) -> Result<PathBuf, String> {
             }
             path
         }
-        None => std::env::current_dir()
-            .map_err(|error| format!("Cannot determine the session working directory: {error}."))?,
+        None => session_cwd.to_path_buf(),
     };
     Ok(canonical_existing(&path).unwrap_or(path))
 }

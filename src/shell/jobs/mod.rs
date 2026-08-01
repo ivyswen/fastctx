@@ -42,6 +42,16 @@ pub(crate) struct JobManager {
     background: background::BackgroundTracker,
 }
 
+pub(crate) struct BackgroundLaunch<'a> {
+    pub(crate) bash: &'a Path,
+    pub(crate) command: &'a str,
+    pub(crate) cwd: &'a Path,
+    pub(crate) login_shell: bool,
+    pub(crate) encoding: Option<OutputEncoding>,
+    pub(crate) environment: &'a crate::session::SessionEnvironment,
+    pub(crate) utf8_locale: &'a str,
+}
+
 #[derive(Clone, Debug)]
 struct OutputSnapshot {
     status: JobStatus,
@@ -53,6 +63,7 @@ struct OutputSnapshot {
     total_lines: u64,
     legacy_loss: bool,
     capture_error: Option<model::CaptureErrorRecord>,
+    output_truncation: Option<model::OutputTruncationRecord>,
     default_encoding: Option<OutputEncoding>,
     anchor: u64,
     direct_log: Option<PathBuf>,
@@ -146,6 +157,7 @@ enum KillState {
 pub(crate) struct JobTail {
     pub(crate) lines: Vec<String>,
     pub(crate) capture_error: Option<String>,
+    pub(crate) output_truncation: Option<String>,
     cursor: TailCursor,
 }
 
@@ -158,7 +170,11 @@ struct TailCursor {
 
 impl JobManager {
     pub(crate) fn new() -> Self {
-        let paths = ControlPaths::discover();
+        Self::with_session(crate::session::SessionContext::library_default())
+    }
+
+    pub(crate) fn with_session(session: Arc<crate::session::SessionContext>) -> Self {
+        let paths = Ok(session.control_paths.clone());
         let admission_generation = paths
             .as_ref()
             .map_err(Clone::clone)
@@ -173,14 +189,16 @@ impl JobManager {
         }
     }
 
-    pub(crate) fn start(
-        &self,
-        bash: &Path,
-        command: &str,
-        cwd: &Path,
-        login_shell: bool,
-        encoding: Option<OutputEncoding>,
-    ) -> ToolResponse {
+    pub(crate) fn start(&self, launch: BackgroundLaunch<'_>) -> ToolResponse {
+        let BackgroundLaunch {
+            bash,
+            command,
+            cwd,
+            login_shell,
+            encoding,
+            environment,
+            utf8_locale,
+        } = launch;
         let paths = match self.paths() {
             Ok(paths) => paths,
             Err(error) => return ToolResponse::error(error),
@@ -254,7 +272,6 @@ impl JobManager {
             store::remove_reserved_job(&job_dir);
             return ToolResponse::error(budget_too_small_message(budget));
         }
-        let server_cwd = std::env::current_dir().unwrap_or_else(|_| cwd.to_path_buf());
         let spec = LaunchSpec {
             job_id: job_id.clone(),
             job_dir: job_dir.clone(),
@@ -263,7 +280,10 @@ impl JobManager {
             cwd: cwd.to_path_buf(),
             login_shell,
             encoding: encoding.map(|encoding| encoding.label().to_string()),
-            origin: store::origin_snapshot(&server_cwd),
+            environment: environment.clone(),
+            utf8_locale: utf8_locale.to_string(),
+            output_limit_bytes: limits.storage_limit_mib.saturating_mul(1024 * 1024),
+            origin: store::origin_snapshot(environment.cwd()),
         };
         match host::launch_supervisor(executable, &spec) {
             Ok(()) => {
@@ -334,7 +354,15 @@ impl JobManager {
                 Ok(capture_error) => capture_error.is_some(),
                 Err(error) => return ToolResponse::error(error),
             };
-            if !record.status.is_running() || capture_failed || started.elapsed() >= wait {
+            let output_truncated = match store::output_truncation(&record) {
+                Ok(truncation) => truncation.is_some(),
+                Err(error) => return ToolResponse::error(error),
+            };
+            if !record.status.is_running()
+                || capture_failed
+                || output_truncated
+                || started.elapsed() >= wait
+            {
                 break record;
             }
             let remaining = wait.saturating_sub(started.elapsed());
@@ -618,6 +646,7 @@ fn load_output_snapshot(
         total_lines,
         legacy_loss,
         capture_error: log.capture_error.clone(),
+        output_truncation: log.output_truncation.clone(),
         default_encoding,
         anchor,
         direct_log,
@@ -780,6 +809,12 @@ fn render_candidate(
     if let Some(error) = &snapshot.capture_error {
         notes.push(capture_failure_note(error, snapshot.direct_log.as_deref()));
     }
+    if let Some(truncation) = &snapshot.output_truncation {
+        notes.push(output_truncation_note(
+            truncation,
+            snapshot.direct_log.as_deref(),
+        ));
+    }
     if let Some(note) = job_garble_note(decoded.invalid_sequences, snapshot.anchor) {
         notes.push(note);
     }
@@ -895,6 +930,24 @@ fn capture_failure_note(error: &model::CaptureErrorRecord, direct_log: Option<&P
         None => format!(
             "(Note: output capture failed after seq {}: {}. This did not kill the process; its exit status remains available, but this legacy record stops here.)",
             error.after_seq, error.reason
+        ),
+    }
+}
+
+fn output_truncation_note(
+    truncation: &model::OutputTruncationRecord,
+    direct_log: Option<&Path>,
+) -> String {
+    match direct_log {
+        Some(path) => format!(
+            "(Note: this job reached its {}-byte combined output.log + output.idx hard limit after seq {}. The supervisor kept draining output and did not stop the command, but later output was not persisted. The preserved prefix is at {}.)",
+            truncation.limit_bytes,
+            truncation.after_seq,
+            display_path(path)
+        ),
+        None => format!(
+            "(Note: this job reached its {}-byte output hard limit after seq {}. The supervisor kept draining output and did not stop the command, but later output was not persisted.)",
+            truncation.limit_bytes, truncation.after_seq
         ),
     }
 }
@@ -1261,6 +1314,13 @@ pub(crate) fn summaries(paths: &ControlPaths) -> Result<Vec<JobSummary>, JobRegi
         .collect())
 }
 
+/// Runs one admission-serialized history maintenance pass without starting a new job.
+pub(crate) fn reap_history(paths: &ControlPaths) -> Result<u64, String> {
+    let _admission = admission::AdmissionGuard::acquire(paths)?;
+    let limits = store::effective_limits(paths)?;
+    store::reap(paths, limits.storage_limit_mib)
+}
+
 fn source_tag(source_key: &str) -> String {
     let hash = source_key
         .bytes()
@@ -1310,6 +1370,12 @@ pub(crate) fn refresh_tail(
         format!(
             "Output capture failed after seq {}: {}",
             error.after_seq, error.reason
+        )
+    });
+    tail.output_truncation = delta.output_truncation.map(|truncation| {
+        format!(
+            "Output storage reached its {}-byte hard limit after seq {}; later output was drained but not persisted.",
+            truncation.limit_bytes, truncation.after_seq
         )
     });
     Ok(appended)
@@ -1391,8 +1457,8 @@ pub(crate) fn run_watchdog_entry(pid: u32, started: String) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::{
-        JobManager, JobRegistryError, OutputSnapshot, format_job_list, format_job_list_with_budget,
-        format_snapshot, source_tag, summaries, truncate_command,
+        BackgroundLaunch, JobManager, JobRegistryError, OutputSnapshot, format_job_list,
+        format_job_list_with_budget, format_snapshot, source_tag, summaries, truncate_command,
     };
     use crate::budget::TokenBudget;
     use crate::control::paths::ControlPaths;
@@ -1460,6 +1526,7 @@ mod tests {
             ended_at_unix_nanos: ended_order,
             termination: TerminationKind::Exited,
             capture_error: None,
+            output_truncation: None,
         })
     }
 
@@ -1749,13 +1816,18 @@ mod tests {
         admission.advance_generation().unwrap();
         drop(admission);
 
-        let response = manager.start(
-            &temp.path().join("unused-bash"),
-            "printf should-not-run",
-            temp.path(),
-            false,
-            None,
-        );
+        let bash = temp.path().join("unused-bash");
+        let environment =
+            crate::session::SessionEnvironment::new(temp.path().to_path_buf(), Vec::new());
+        let response = manager.start(BackgroundLaunch {
+            bash: &bash,
+            command: "printf should-not-run",
+            cwd: temp.path(),
+            login_shell: false,
+            encoding: None,
+            environment: &environment,
+            utf8_locale: "C.UTF-8",
+        });
         assert!(response.is_error);
         match response.content.into_iter().next().unwrap() {
             ToolContent::Text(text) => assert_eq!(
@@ -1786,6 +1858,7 @@ mod tests {
                 total_lines: 3,
                 legacy_loss: false,
                 capture_error: None,
+                output_truncation: None,
                 default_encoding: None,
                 anchor: 3,
                 direct_log: Some(PathBuf::from("/jobs/j-000001/output.log")),
@@ -1820,6 +1893,7 @@ mod tests {
                     after_seq: 1,
                     reason: "disk unavailable".to_string(),
                 }),
+                output_truncation: None,
                 default_encoding: None,
                 anchor: 0,
                 direct_log: None,
@@ -1863,6 +1937,7 @@ mod tests {
                     after_seq: 1,
                     reason: "disk unavailable".to_string(),
                 }),
+                output_truncation: None,
                 default_encoding: None,
                 anchor: 0,
                 direct_log: Some(PathBuf::from("/jobs/j-000003/output.log")),
@@ -1914,6 +1989,7 @@ mod tests {
             total_lines: 0,
             legacy_loss: false,
             capture_error: None,
+            output_truncation: None,
             default_encoding: None,
             anchor: 0,
             direct_log: Some(PathBuf::from("/jobs/j-000001/output.log")),

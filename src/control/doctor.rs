@@ -3,6 +3,7 @@
 use crate::control::agents;
 use crate::control::codex_config::{self, ExpectedConfig};
 use crate::control::paths::ControlPaths;
+use crate::control::provider::{self, CompactionSupport, EffectiveOutputMode};
 use crate::control::settings;
 use crate::server::{FastCtxServer, ServerOptions};
 use crate::server_manifest::{ToolContract, ToolManifest};
@@ -149,6 +150,12 @@ pub fn run(paths: &ControlPaths) -> DoctorReport {
     let saved_settings = settings.as_ref().ok();
     let all_applied = saved_settings.and_then(|settings| settings.applied.as_ref());
     let profile_applied = all_applied.filter(|record| record.targets_codex_profile(paths));
+    let provider_detection = provider::detect_path(&paths.codex_config);
+    checks.push(check_output_guard(
+        &provider_detection,
+        saved_settings,
+        profile_applied,
+    ));
     checks.push(match settings.as_ref() {
         Ok(settings) => check_drift(
             paths,
@@ -269,7 +276,7 @@ fn check_search_parallelism(paths: &ControlPaths) -> DoctorCheck {
             (Some(configured), Some(effective)) => DoctorCheck::pass(
                 "Search CPU limit",
                 format!(
-                    "Configured search.max_cpu_cores={configured}; engine-visible upper bound {}; effective P={effective}. Newly started server processes use this limit.",
+                    "Configured search.max_cpu_cores={configured}; engine-visible upper bound {}; effective P={effective}. The limit applies after the shared control center restarts.",
                     status.available
                 ),
             ),
@@ -320,6 +327,110 @@ fn check_profile(paths: &ControlPaths) -> DoctorCheck {
     }
 }
 
+fn check_output_guard(
+    detection: &provider::ProviderDetection,
+    settings: Option<&settings::FastCtxSettings>,
+    record: Option<&settings::AppliedRecord>,
+) -> DoctorCheck {
+    let Some(settings) = settings else {
+        return DoctorCheck::info(
+            "Provider output guard",
+            format!(
+                "{} FastCtx settings could not be loaded, so the effective output policy could not be evaluated.",
+                detection.detail
+            ),
+        );
+    };
+    match detection.support {
+        CompactionSupport::Unknown => DoctorCheck::info(
+            "Provider output guard",
+            format!(
+                "{} No Guarded tightening was applied. Repair or verify model_provider, then run fastctx status again.",
+                detection.detail
+            ),
+        ),
+        CompactionSupport::Local if !settings.output_guard.enabled => DoctorCheck::info(
+            "Provider output guard",
+            format!(
+                "{} Guarded protection is explicitly disabled; local compaction can be slower, more expensive, and less reliable with large tool outputs.",
+                detection.detail
+            ),
+        ),
+        CompactionSupport::Local => {
+            let effective =
+                provider::effective_output(settings.tier, settings.tool_budgets, true, detection);
+            match record {
+                Some(record)
+                    if record.tool_output_token_limit == effective.host_limit
+                        && record.fastctx_token_budget == effective.fastctx_budget
+                        && record.tool_budgets == effective.tool_budgets =>
+                {
+                    DoctorCheck::pass(
+                        "Provider output guard",
+                        format!(
+                            "{} Guarded is active: host limit {}, FastCtx budget {}, with independently adjustable per-tool shares.",
+                            detection.detail, effective.host_limit, effective.fastctx_budget
+                        ),
+                    )
+                }
+                Some(record) => DoctorCheck::fail(
+                    "Provider output guard",
+                    format!(
+                        "{} New runtime sessions are constrained to Guarded, but the Apply receipt still records host/global limits {}/{} instead of {}/{}.",
+                        detection.detail,
+                        record.tool_output_token_limit,
+                        record.fastctx_token_budget,
+                        effective.host_limit,
+                        effective.fastctx_budget
+                    ),
+                    "Run fastctx apply to preview and write the Guarded host and server limits into Codex.",
+                ),
+                None => DoctorCheck::info(
+                    "Provider output guard",
+                    format!(
+                        "{} New runtime sessions use Guarded automatically; run fastctx apply to write host limit {} and FastCtx budget {} into Codex.",
+                        detection.detail, effective.host_limit, effective.fastctx_budget
+                    ),
+                ),
+            }
+        }
+        CompactionSupport::Remote => {
+            let effective = provider::effective_output(
+                settings.tier,
+                settings.tool_budgets,
+                settings.output_guard.enabled,
+                detection,
+            );
+            match record {
+                Some(record)
+                    if record.tool_output_token_limit == effective.host_limit
+                        && record.fastctx_token_budget == effective.fastctx_budget
+                        && record.tool_budgets == effective.tool_budgets =>
+                {
+                    DoctorCheck::pass("Provider output guard", detection.detail.clone())
+                }
+                Some(_) => DoctorCheck::info(
+                    "Provider output guard",
+                    format!(
+                        "{} Guarded is no longer required. Run fastctx apply to restore the selected {} tier (host limit {}, FastCtx budget {}).",
+                        detection.detail,
+                        settings.tier.display_name(),
+                        effective.host_limit,
+                        effective.fastctx_budget
+                    ),
+                ),
+                None => DoctorCheck::info(
+                    "Provider output guard",
+                    format!(
+                        "{} FastCtx has not been applied in this profile.",
+                        detection.detail
+                    ),
+                ),
+            }
+        }
+    }
+}
+
 fn check_drift(
     paths: &ControlPaths,
     settings: Option<&settings::FastCtxSettings>,
@@ -354,6 +465,8 @@ fn check_drift(
     let expected = ExpectedConfig {
         command: record.command.clone(),
         tier: record.tier,
+        host_limit: record.tool_output_token_limit,
+        fastctx_budget: record.fastctx_token_budget,
         tool_budgets: record.tool_budgets,
         fastshell_enabled: record.fastshell_enabled,
     };
@@ -377,18 +490,28 @@ fn check_drift(
     }) {
         Ok(items) if items.is_empty() => {
             let mut pending = Vec::new();
-            if record.tool_output_token_limit != record.tier.host_limit()
-                || record.fastctx_token_budget != record.tier.fastctx_budget()
-            {
-                pending.push("the current tier limits");
-            }
             if let Some(settings) = settings {
+                let detection = provider::detect_bytes(Some(config));
+                let effective = provider::effective_output(
+                    settings.tier,
+                    settings.tool_budgets,
+                    settings.output_guard.enabled,
+                    &detection,
+                );
+                if record.tool_output_token_limit != effective.host_limit
+                    || record.fastctx_token_budget != effective.fastctx_budget
+                {
+                    pending.push(match effective.mode {
+                        EffectiveOutputMode::SelectedTier => "the current tier limits",
+                        EffectiveOutputMode::Guarded => "the current provider's Guarded limits",
+                    });
+                }
                 if settings.tier != record.tier {
                     pending.push("the selected tier");
                 }
                 // Compare resolved shares, not stored preferences: an unset entry means "follow
                 // the tier", so it only differs from the receipt once the tier's defaults do.
-                if settings.tool_budgets.resolve(settings.tier) != record.tool_budgets {
+                if effective.tool_budgets != record.tool_budgets {
                     pending.push("the per-tool output budgets");
                 }
             }
@@ -998,13 +1121,96 @@ fn sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DoctorCheckStatus, check_drift, check_extension_state, receipt_drift, run};
+    use super::{
+        DoctorCheckStatus, check_drift, check_extension_state, check_output_guard, receipt_drift,
+        run,
+    };
     use crate::control::codex_config::{self, ExpectedConfig};
     use crate::control::paths::ControlPaths;
     use crate::control::settings::{
         AppliedRecord, FastCtxSettings, ManagedFileRecord, Tier, ToolBudgetLevel,
         ToolBudgetPreferences, ToolBudgets,
     };
+
+    fn provider_record(
+        tier: Tier,
+        host_limit: i64,
+        fastctx_budget: usize,
+        tool_budgets: ToolBudgets,
+    ) -> AppliedRecord {
+        let managed = ManagedFileRecord {
+            path: "managed".to_string(),
+            original_existed: true,
+            applied_sha256: "hash".to_string(),
+        };
+        AppliedRecord {
+            applied_at_utc: "2026-08-01T00:00:00Z".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            command: "fastctx".to_string(),
+            tier,
+            tool_output_token_limit: host_limit,
+            tool_timeout_sec: Some(codex_config::TOOL_TIMEOUT_SECONDS),
+            previous_token_limit_present: false,
+            previous_token_limit: None,
+            fastctx_token_budget: fastctx_budget,
+            tool_budgets,
+            fastshell_enabled: false,
+            fastedit_enabled: false,
+            codex_dir_created: false,
+            codex_config: managed.clone(),
+            codex_agents: managed,
+            codex_agents_inserted_separator: None,
+            binary_sha256: "hash".to_string(),
+        }
+    }
+
+    #[test]
+    fn provider_switch_diagnostics_fail_toward_local_and_inform_toward_remote() {
+        let settings = FastCtxSettings {
+            tier: Tier::Standard,
+            ..FastCtxSettings::default()
+        };
+        let official_record = provider_record(
+            Tier::Standard,
+            Tier::Standard.host_limit(),
+            Tier::Standard.fastctx_budget(),
+            Tier::Standard.default_budgets(),
+        );
+        let local = crate::control::provider::detect_bytes(Some(
+            b"model_provider='custom'\n[model_providers.custom]\nname='Third Party'\n",
+        ));
+        let tightened = check_output_guard(&local, Some(&settings), Some(&official_record));
+        assert_eq!(tightened.status, DoctorCheckStatus::Fail, "{tightened:?}");
+        assert!(
+            tightened
+                .detail
+                .contains("New runtime sessions are constrained")
+        );
+        assert!(
+            tightened
+                .remedy
+                .as_deref()
+                .is_some_and(|remedy| remedy.contains("fastctx apply"))
+        );
+
+        let guarded_record = provider_record(
+            Tier::Standard,
+            crate::control::provider::GUARDED_HOST_LIMIT,
+            crate::control::provider::GUARDED_FASTCTX_BUDGET,
+            ToolBudgets {
+                read: ToolBudgetLevel::Inherit,
+                grep: ToolBudgetLevel::Inherit,
+                glob: ToolBudgetLevel::Inherit,
+                run: ToolBudgetLevel::Inherit,
+                job_output: ToolBudgetLevel::Inherit,
+            },
+        );
+        let remote = crate::control::provider::detect_bytes(None);
+        let relaxed = check_output_guard(&remote, Some(&settings), Some(&guarded_record));
+        assert_eq!(relaxed.status, DoctorCheckStatus::Info, "{relaxed:?}");
+        assert!(relaxed.detail.contains("Guarded is no longer required"));
+        assert!(relaxed.detail.contains("fastctx apply"));
+    }
 
     #[test]
     fn receipt_drift_ignores_unowned_file_bytes_but_detects_paths_and_binary() {
@@ -1076,6 +1282,8 @@ mod tests {
         let expected = ExpectedConfig {
             command: crate::paths::display_path(&paths.installed_binary),
             tier: Tier::Compact,
+            host_limit: Tier::Compact.host_limit(),
+            fastctx_budget: Tier::Compact.fastctx_budget(),
             tool_budgets: Tier::Compact.default_budgets(),
             fastshell_enabled: false,
         };
@@ -1189,6 +1397,8 @@ mod tests {
         let expected = ExpectedConfig {
             command: crate::paths::display_path(&paths.installed_binary),
             tier: Tier::Standard,
+            host_limit: Tier::Standard.host_limit(),
+            fastctx_budget: Tier::Standard.fastctx_budget(),
             tool_budgets: legacy_budgets,
             fastshell_enabled: false,
         };

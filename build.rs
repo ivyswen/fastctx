@@ -23,8 +23,12 @@ struct Artifact {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-env-changed={DISTRIBUTION_ENV}");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_PDF");
+    emit_build_id();
     if env::var_os("CARGO_FEATURE_PDF").is_none() {
         return;
     }
@@ -61,6 +65,61 @@ fn main() {
     let library_path = embedded_dir.join(artifact.filename);
     fs::write(&library_path, library_bytes).expect("failed to write extracted Pdfium library");
     write_generated_module(&out_dir, &library_path, &artifact);
+}
+
+fn emit_build_id() {
+    let mut files = vec![
+        PathBuf::from("Cargo.toml"),
+        PathBuf::from("Cargo.lock"),
+        PathBuf::from("build.rs"),
+    ];
+    collect_source_files(Path::new("src"), &mut files);
+    files.sort();
+    let mut hasher = Sha256::new();
+    for path in files {
+        hasher.update(path.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher.update(fs::read(&path).unwrap_or_else(|error| {
+            panic!("failed to hash {} for build id: {error}", path.display())
+        }));
+        hasher.update([0xff]);
+    }
+    for name in [
+        "CARGO_PKG_VERSION",
+        "TARGET",
+        "PROFILE",
+        "CARGO_FEATURE_PDF",
+        DISTRIBUTION_ENV,
+    ] {
+        hasher.update(name.as_bytes());
+        hasher.update([b'=']);
+        if let Some(value) = env::var_os(name) {
+            hasher.update(value.to_string_lossy().as_bytes());
+        }
+        hasher.update([0]);
+    }
+    let build_id = hex::encode(hasher.finalize());
+    println!("cargo:rustc-env=FASTCTX_BUILD_ID={}", &build_id[..16]);
+}
+
+fn collect_source_files(directory: &Path, output: &mut Vec<PathBuf>) {
+    let mut entries = fs::read_dir(directory)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to enumerate {} for build id: {error}",
+                directory.display()
+            )
+        })
+        .map(|entry| entry.expect("failed to enumerate a source entry").path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            collect_source_files(&path, output);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            output.push(path);
+        }
+    }
 }
 
 fn artifact_for_target(target: &str) -> Option<Artifact> {

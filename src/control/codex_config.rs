@@ -27,6 +27,10 @@ pub struct ExpectedConfig {
     pub command: String,
     /// Host output tier.
     pub tier: Tier,
+    /// Effective host output limit; may be Guarded independently from the selected tier.
+    pub host_limit: i64,
+    /// Effective global FastCtx budget; may be Guarded independently from the selected tier.
+    pub fastctx_budget: usize,
     /// Five long-output tools' relative budgets.
     pub tool_budgets: ToolBudgets,
     /// Whether Apply should publish the optional shell tool group.
@@ -59,7 +63,7 @@ pub struct ApplyEdit {
 pub fn apply(original: &[u8], expected: &ExpectedConfig) -> Result<ApplyEdit, String> {
     let (migrated, legacy) = strip_owned_legacy_servers(original, expected)?;
     let mut document = parse(&migrated)?;
-    let requested_limit = expected.tier.host_limit();
+    let requested_limit = expected.host_limit;
     let existing_limit = document.get("tool_output_token_limit");
     let previous_token_limit_present = existing_limit.is_some();
     let previous_token_limit = existing_limit
@@ -256,8 +260,8 @@ pub fn drift(original: &[u8], expected: &ExpectedConfig) -> Result<Vec<String>, 
     drift_with_limits(
         original,
         expected,
-        expected.tier.host_limit(),
-        expected.tier.fastctx_budget(),
+        expected.host_limit,
+        expected.fastctx_budget,
         Some(TOOL_TIMEOUT_SECONDS),
     )
 }
@@ -479,7 +483,7 @@ fn ensure_child_table<'a>(
 }
 
 fn build_fastctx_table(expected: &ExpectedConfig) -> Table {
-    let global = expected.tier.fastctx_budget();
+    let global = expected.fastctx_budget;
     let mut table = Table::new();
     table.insert("command", value(expected.command.clone()));
     let mut args = Array::new();
@@ -774,6 +778,8 @@ mod tests {
         ExpectedConfig {
             command: "C:/Users/test/.fastctx/bin/fastctx.exe".to_string(),
             tier: Tier::Standard,
+            host_limit: Tier::Standard.host_limit(),
+            fastctx_budget: Tier::Standard.fastctx_budget(),
             tool_budgets: ToolBudgets {
                 read: ToolBudgetLevel::Inherit,
                 grep: ToolBudgetLevel::Percent(50),

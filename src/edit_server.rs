@@ -22,9 +22,11 @@ impl FastCtxServer {
         )
     )]
     async fn replace(&self, Parameters(request): Parameters<ReplaceRequest>) -> CallToolResult {
+        let _activity = self.activity.request();
         let replace = self.replace.clone();
         let status_shell = self.shell.clone();
         run_blocking(
+            Arc::clone(&self.session),
             Arc::clone(&self.replace_permits),
             GLOBAL_TOKEN_BUDGET_ENV,
             move || status_shell.background_status(None),

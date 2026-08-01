@@ -173,7 +173,7 @@ pub fn token_budget() -> Result<usize, String> {
 }
 
 fn configured_token_budget() -> Result<usize, String> {
-    match std::env::var(GLOBAL_TOKEN_BUDGET_ENV) {
+    match crate::session::var(GLOBAL_TOKEN_BUDGET_ENV) {
         Ok(value) => parse_token_budget(GLOBAL_TOKEN_BUDGET_ENV, &value),
         Err(std::env::VarError::NotPresent) => Ok(DEFAULT_TOKEN_BUDGET),
         Err(std::env::VarError::NotUnicode(_)) => Err(
@@ -191,7 +191,7 @@ pub fn tool_token_budget(variable: &'static str) -> Result<TokenBudget, String> 
 
 fn configured_tool_token_budget(variable: &'static str) -> Result<TokenBudget, String> {
     let global = configured_token_budget()?;
-    match std::env::var(variable) {
+    match crate::session::var(variable) {
         Ok(value) => {
             let value = parse_token_budget(variable, &value)?;
             if value > global {
@@ -217,7 +217,7 @@ pub(crate) fn error_budget_hint(variable: &'static str) -> usize {
     let Ok(global) = configured_token_budget() else {
         return DEFAULT_TOKEN_BUDGET;
     };
-    match std::env::var(variable) {
+    match crate::session::var(variable) {
         Ok(value) => parse_token_budget(variable, &value)
             .ok()
             .filter(|value| *value <= global)

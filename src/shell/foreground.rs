@@ -7,17 +7,30 @@ use crate::shell::process::{exit_code, spawn_bash};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+pub(crate) struct ForegroundCommand<'a> {
+    pub(crate) bash: &'a Path,
+    pub(crate) command: &'a str,
+    pub(crate) cwd: &'a Path,
+    pub(crate) timeout_ms: u64,
+    pub(crate) login_shell: bool,
+    pub(crate) encoding: Option<OutputEncoding>,
+    pub(crate) environment: &'a crate::session::SessionEnvironment,
+    pub(crate) utf8_locale: &'a str,
+}
+
 /// Runs one command while reserving enough time for MCP response serialization.
-pub(crate) fn run(
-    bash: &Path,
-    command: &str,
-    cwd: &Path,
-    timeout_ms: u64,
-    login_shell: bool,
-    encoding: Option<OutputEncoding>,
-    cancelled: impl Fn() -> bool,
-) -> ToolResponse {
-    let mut process = match spawn_bash(bash, command, cwd, login_shell) {
+pub(crate) fn run(spec: ForegroundCommand<'_>, cancelled: impl Fn() -> bool) -> ToolResponse {
+    let ForegroundCommand {
+        bash,
+        command,
+        cwd,
+        timeout_ms,
+        login_shell,
+        encoding,
+        environment,
+        utf8_locale,
+    } = spec;
+    let mut process = match spawn_bash(bash, command, cwd, login_shell, environment, utf8_locale) {
         Ok(process) => process,
         Err(error) => return ToolResponse::error(format!("Cannot start the command: {error}.")),
     };

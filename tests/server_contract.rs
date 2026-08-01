@@ -521,8 +521,10 @@ fn non_pdf_stdio_calls_do_not_extract_the_bundled_engine() {
     let file = temp.path().join("plain.txt");
     write(&file, b"plain");
     let cache_root = temp.path().join("cache-root");
+    let build_id = format!("pdf-lazy-{}", std::process::id());
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
     command
+        .env("FASTCTX_TEST_BUILD_ID", build_id)
         .current_dir(temp.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -587,8 +589,10 @@ fn stdio_pdf_call_extracts_one_hashed_engine_and_preserves_image_meta() {
     let pdf = temp.path().join("page.pdf");
     write_pdf(&pdf, &[Some("MCP PDF one"), Some("MCP PDF two")]);
     let cache_root = temp.path().join("cache-root");
+    let build_id = format!("pdf-extract-{}", std::process::id());
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
     command
+        .env("FASTCTX_TEST_BUILD_ID", build_id)
         .current_dir(temp.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -826,7 +830,12 @@ fn stdio_head_limit_zero_still_uses_the_environment_token_budget() {
     let file = temp.path().join("many.txt");
     write(&file, "hit\n".repeat(100));
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
-    command.env("FASTCTX_TOKEN_BUDGET", "30");
+    command
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("FASTCTX_GREP_TOKEN_BUDGET")
+        .env("FASTCTX_TOKEN_BUDGET", "30");
     let response = call_tool(
         command,
         "grep",
@@ -1003,8 +1012,13 @@ fn stdio_pdf_call_repairs_a_corrupted_cached_engine() {
     let pdf = temp.path().join("page.pdf");
     write_pdf(&pdf, &[Some("Cache repair")]);
     let cache_root = temp.path().join("cache-root");
+    let process_id = std::process::id();
 
     let mut first_command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    first_command.env(
+        "FASTCTX_TEST_BUILD_ID",
+        format!("pdf-repair-a-{process_id}"),
+    );
     let engine_dir = configure_isolated_cache(&mut first_command, &cache_root);
     let first = call_tool(
         first_command,
@@ -1030,6 +1044,10 @@ fn stdio_pdf_call_repairs_a_corrupted_cached_engine() {
     std::fs::write(&engine, b"corrupted").unwrap();
 
     let mut second_command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    second_command.env(
+        "FASTCTX_TEST_BUILD_ID",
+        format!("pdf-repair-b-{process_id}"),
+    );
     configure_isolated_cache(&mut second_command, &cache_root);
     let second = call_tool(
         second_command,
@@ -1038,6 +1056,58 @@ fn stdio_pdf_call_repairs_a_corrupted_cached_engine() {
     );
     assert_eq!(second["result"]["isError"], false);
     assert_eq!(std::fs::read(engine).unwrap(), original);
+}
+
+#[test]
+#[cfg(all(feature = "pdf", any(windows, all(unix, not(target_os = "macos")))))]
+fn stdio_pdf_initialization_uses_the_request_session_cache_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    let text = temp.path().join("plain.txt");
+    let pdf = temp.path().join("page.pdf");
+    write(&text, b"plain\n");
+    write_pdf(&pdf, &[Some("Session cache")]);
+    let bootstrap_cache = temp.path().join("bootstrap-cache");
+    let request_cache = temp.path().join("request-cache");
+    let build_id = format!("pdf-session-{}", std::process::id());
+
+    let mut bootstrap = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    bootstrap.env("FASTCTX_TEST_BUILD_ID", &build_id);
+    let bootstrap_engine = configure_isolated_cache(&mut bootstrap, &bootstrap_cache);
+    let first = call_tool(
+        bootstrap,
+        "read",
+        serde_json::json!({"file_path": normalized(&text)}),
+    );
+    assert_eq!(first["result"]["isError"], false);
+
+    let mut request = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    request.env("FASTCTX_TEST_BUILD_ID", &build_id);
+    let request_engine = configure_isolated_cache(&mut request, &request_cache);
+    let second = call_tool(
+        request,
+        "read",
+        serde_json::json!({"file_path": normalized(&pdf)}),
+    );
+    assert_eq!(second["result"]["isError"], false);
+    assert!(
+        std::fs::read_dir(&request_engine)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && !entry.file_name().to_string_lossy().ends_with(".lock")
+            }),
+        "PDF initialization did not release the engine into the request cache"
+    );
+    assert!(
+        !bootstrap_engine.exists()
+            || std::fs::read_dir(&bootstrap_engine)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+                .all(|entry| entry.file_name().to_string_lossy().ends_with(".lock")),
+        "PDF initialization used the control center's bootstrap cache"
+    );
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! Group hierarchy, focus navigation, and draft-value model for the configuration screen.
 
 use crate::control::config_i18n::ConfigMessages;
+use crate::control::guard_i18n::GuardMessages;
 use crate::control::i18n::Messages;
 use crate::control::job_i18n::JobMessages;
 use crate::control::settings::{
@@ -23,6 +24,7 @@ pub(crate) enum ConfigGroupId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConfigItemId {
     OutputTier,
+    OutputGuard,
     ReadBudget,
     GrepBudget,
     GlobBudget,
@@ -88,7 +90,8 @@ impl ConfigGroupSpec {
     }
 }
 
-const OUTPUT_CHILDREN: [ConfigItemId; 5] = [
+const OUTPUT_CHILDREN: [ConfigItemId; 6] = [
+    ConfigItemId::OutputGuard,
     ConfigItemId::ReadBudget,
     ConfigItemId::GrepBudget,
     ConfigItemId::GlobBudget,
@@ -172,11 +175,13 @@ pub(crate) fn item_label(
     item: ConfigItemId,
     messages: &Messages,
     config_messages: &ConfigMessages,
+    guard_messages: &GuardMessages,
     jobs: &JobMessages,
     updates: &UpdateMessages,
 ) -> &'static str {
     match item {
         ConfigItemId::OutputTier => messages.tier_label,
+        ConfigItemId::OutputGuard => guard_messages.label,
         ConfigItemId::ReadBudget => "read",
         ConfigItemId::GrepBudget => "grep",
         ConfigItemId::GlobBudget => "glob",
@@ -433,6 +438,7 @@ pub(crate) struct BudgetValue {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConfigValue {
     Tier(Tier),
+    GuardedTier(Tier),
     Budget(BudgetValue),
     Toggle(bool),
     Number(u64),
@@ -474,7 +480,10 @@ impl OutputConfigDraft {
     }
 
     /// Tier default for one tool.
-    const fn budget_default(self, item: ConfigItemId) -> ToolBudgetLevel {
+    const fn budget_default(self, item: ConfigItemId, guarded: bool) -> ToolBudgetLevel {
+        if guarded {
+            return ToolBudgetLevel::Inherit;
+        }
         let defaults = self.tier.default_budgets();
         match item {
             ConfigItemId::GrepBudget => defaults.grep,
@@ -486,13 +495,18 @@ impl OutputConfigDraft {
     }
 
     /// Share, provenance, and absolute ceiling for one budget item.
-    fn budget_value(self, item: ConfigItemId) -> BudgetValue {
+    fn budget_value(self, item: ConfigItemId, guarded: bool) -> BudgetValue {
         let stored = self.budget_override(item);
-        let level = stored.unwrap_or_else(|| self.budget_default(item));
+        let level = stored.unwrap_or_else(|| self.budget_default(item, guarded));
+        let global = if guarded {
+            crate::control::provider::GUARDED_FASTCTX_BUDGET
+        } else {
+            self.tier.fastctx_budget()
+        };
         BudgetValue {
             level,
             explicit: stored.is_some(),
-            tokens: level.ceiling(self.tier.fastctx_budget()),
+            tokens: level.ceiling(global),
         }
     }
 }
@@ -501,6 +515,7 @@ impl OutputConfigDraft {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ConfigDraft {
     pub(crate) output: OutputConfigDraft,
+    pub(crate) output_guard_enabled: bool,
     pub(crate) fastshell_enabled: bool,
     pub(crate) job_storage_limit_mib: u64,
     pub(crate) max_running_jobs: u64,
@@ -518,6 +533,7 @@ impl ConfigDraft {
                 tier: settings.tier,
                 budgets: settings.tool_budgets,
             },
+            output_guard_enabled: settings.output_guard.enabled,
             fastshell_enabled: settings.fastshell.enabled,
             job_storage_limit_mib: settings.fastshell.job_storage_limit_mib,
             max_running_jobs: settings.fastshell.max_running_jobs,
@@ -532,6 +548,7 @@ impl ConfigDraft {
     pub(crate) fn apply_to(self, settings: &mut FastCtxSettings) {
         settings.tier = self.output.tier;
         settings.tool_budgets = self.output.budgets;
+        settings.output_guard.enabled = self.output_guard_enabled;
         settings.fastshell.enabled = self.fastshell_enabled;
         settings.fastshell.job_storage_limit_mib = self.job_storage_limit_mib;
         settings.fastshell.max_running_jobs = self.max_running_jobs;
@@ -543,14 +560,24 @@ impl ConfigDraft {
     }
 
     /// Returns the typed current value of one item.
+    #[cfg(test)]
     pub(crate) fn value(self, item: ConfigItemId) -> ConfigValue {
+        self.value_with_guard(item, false)
+    }
+
+    /// Returns one value under the environment-derived Guarded mode.
+    pub(crate) fn value_with_guard(self, item: ConfigItemId, guarded: bool) -> ConfigValue {
         match item {
+            ConfigItemId::OutputTier if guarded => ConfigValue::GuardedTier(self.output.tier),
             ConfigItemId::OutputTier => ConfigValue::Tier(self.output.tier),
+            ConfigItemId::OutputGuard => ConfigValue::Toggle(self.output_guard_enabled),
             ConfigItemId::ReadBudget
             | ConfigItemId::GrepBudget
             | ConfigItemId::GlobBudget
             | ConfigItemId::RunBudget
-            | ConfigItemId::JobOutputBudget => ConfigValue::Budget(self.output.budget_value(item)),
+            | ConfigItemId::JobOutputBudget => {
+                ConfigValue::Budget(self.output.budget_value(item, guarded))
+            }
             ConfigItemId::FastShell => ConfigValue::Toggle(self.fastshell_enabled),
             ConfigItemId::JobStorageLimit => ConfigValue::Number(self.job_storage_limit_mib),
             ConfigItemId::MaxRunningJobs => ConfigValue::Number(self.max_running_jobs),
@@ -563,20 +590,27 @@ impl ConfigDraft {
     }
 
     /// Adjusts the focused item cyclically in the left or right direction.
+    #[cfg(test)]
     pub(crate) fn adjust(&mut self, item: ConfigItemId, forward: bool) {
+        self.adjust_with_guard(item, forward, false);
+    }
+
+    /// Adjusts one item while respecting an environment-derived tier lock.
+    pub(crate) fn adjust_with_guard(&mut self, item: ConfigItemId, forward: bool, guarded: bool) {
         match item {
-            ConfigItemId::OutputTier => {
+            ConfigItemId::OutputTier if !guarded => {
                 self.output.tier = if forward {
                     self.output.tier.next()
                 } else {
                     self.output.tier.previous()
                 };
             }
+            ConfigItemId::OutputTier | ConfigItemId::OutputGuard => {}
             ConfigItemId::ReadBudget
             | ConfigItemId::GrepBudget
             | ConfigItemId::GlobBudget
             | ConfigItemId::RunBudget
-            | ConfigItemId::JobOutputBudget => self.step_budget(item, forward),
+            | ConfigItemId::JobOutputBudget => self.step_budget(item, forward, guarded),
             ConfigItemId::FastShell => self.fastshell_enabled = !self.fastshell_enabled,
             ConfigItemId::JobStorageLimit => {
                 cycle_preset(
@@ -613,6 +647,11 @@ impl ConfigDraft {
         self.search_max_cpu_cores = configured;
     }
 
+    /// Sets the provider guard only after the caller has completed any required confirmation.
+    pub(crate) fn set_output_guard(&mut self, enabled: bool) {
+        self.output_guard_enabled = enabled;
+    }
+
     /// Accepts a validated budget editor result; `None` returns the tool to its tier default.
     pub(crate) fn set_tool_budget(&mut self, item: ConfigItemId, level: Option<ToolBudgetLevel>) {
         if let Some(slot) = self.output.budget_slot(item) {
@@ -623,19 +662,21 @@ impl ConfigDraft {
     /// Resolves what a candidate editor entry would become, so the editor can show its effect
     /// before anything is saved. Routed through the real setter so the preview cannot drift from
     /// what submitting actually does.
-    pub(crate) fn preview_tool_budget(
+    /// Resolves an editor entry under the environment-derived Guarded mode.
+    pub(crate) fn preview_tool_budget_with_guard(
         self,
         item: ConfigItemId,
         level: Option<ToolBudgetLevel>,
+        guarded: bool,
     ) -> BudgetValue {
         let mut draft = self;
         draft.set_tool_budget(item, level);
-        draft.output.budget_value(item)
+        draft.output.budget_value(item, guarded)
     }
 
     /// Nudges one budget by a single percentage point, which also makes it an explicit override.
-    fn step_budget(&mut self, item: ConfigItemId, forward: bool) {
-        let stepped = self.output.budget_value(item).level.step(forward);
+    fn step_budget(&mut self, item: ConfigItemId, forward: bool, guarded: bool) {
+        let stepped = self.output.budget_value(item, guarded).level.step(forward);
         self.set_tool_budget(item, Some(stepped));
     }
 }
@@ -696,6 +737,10 @@ mod tests {
         let mut cursor = ConfigCursor::default();
         let expected = [
             (ConfigItemId::OutputTier, ConfigItemRole::Parent),
+            (
+                ConfigItemId::OutputGuard,
+                ConfigItemRole::Child { is_last: false },
+            ),
             (
                 ConfigItemId::ReadBudget,
                 ConfigItemRole::Child { is_last: false },
@@ -781,6 +826,7 @@ mod tests {
             (0, 3),
             (0, 4),
             (0, 5),
+            (0, 6),
             (1, 0),
             (1, 1),
         ];
@@ -871,7 +917,7 @@ mod tests {
     #[test]
     fn viewport_keeps_focus_visible_and_reports_both_hidden_edges() {
         let rows = list_rows();
-        assert_eq!(rows.len(), 19);
+        assert_eq!(rows.len(), 20);
         let mut viewport = ConfigViewport::default();
         let top = viewport.window(ConfigCursor::default(), rows.len(), 5);
         assert_eq!((top.start, top.end), (0, 4));

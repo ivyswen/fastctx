@@ -19,7 +19,7 @@ struct TrackedJob {
     started_sort_key: u64,
 }
 
-/// Jobs explicitly known to one server instance; clones share the same session state.
+/// Jobs explicitly known to one MCP session; clones share that session state.
 #[derive(Clone, Debug, Default)]
 pub(super) struct BackgroundTracker {
     jobs: Arc<Mutex<HashMap<String, TrackedJob>>>,
@@ -204,6 +204,7 @@ mod tests {
             ended_at_unix_nanos: 0,
             termination: TerminationKind::Exited,
             capture_error: None,
+            output_truncation: None,
         })
     }
 

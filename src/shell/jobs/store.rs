@@ -4,7 +4,8 @@ use super::JobRegistryError;
 use super::identity::{identity_is_alive, process_identity};
 use super::model::{
     CAPTURE_ERROR_FILE, CaptureErrorRecord, EXIT_FILE, ExitRecord, JOB_SCHEMA_VERSION, JobMeta,
-    JobRecord, JobStatus, KILL_REQUEST_FILE, META_FILE, OriginSnapshot, SpoolLine, StoredLine,
+    JobRecord, JobStatus, KILL_REQUEST_FILE, META_FILE, OUTPUT_TRUNCATION_FILE, OriginSnapshot,
+    OutputTruncationRecord, SpoolLine, StoredLine,
 };
 use super::output_log::{BoundedLines, OutputLogReader};
 use crate::control::paths::ControlPaths;
@@ -65,6 +66,7 @@ enum LogSource {
 pub(crate) struct LogView {
     source: LogSource,
     pub(crate) capture_error: Option<CaptureErrorRecord>,
+    pub(crate) output_truncation: Option<OutputTruncationRecord>,
 }
 
 #[derive(Debug)]
@@ -186,6 +188,7 @@ pub(super) struct LogDelta {
     pub(super) lines: Vec<StoredLine>,
     pub(super) observed_lines: u64,
     pub(super) capture_error: Option<CaptureErrorRecord>,
+    pub(super) output_truncation: Option<OutputTruncationRecord>,
 }
 
 pub(crate) fn effective_limits(paths: &ControlPaths) -> Result<JobLimits, String> {
@@ -668,14 +671,17 @@ struct LegacySnapshot {
 /// read path. Callers receive capabilities, never format versions.
 pub(crate) fn open_log(record: &JobRecord) -> Result<LogView, String> {
     let capture_error = capture_error(record)?;
+    let output_truncation = output_truncation(record)?;
     if record.meta.schema_version >= 3 {
-        let include_unindexed_tail = !record.status.is_running() || capture_error.is_some();
+        let include_unindexed_tail =
+            !record.status.is_running() || capture_error.is_some() || output_truncation.is_some();
         return Ok(LogView {
             source: LogSource::Direct(OutputLogReader::open(
                 &record.directory,
                 include_unindexed_tail,
             )?),
             capture_error,
+            output_truncation,
         });
     }
     let legacy = read_legacy_spool(record)?;
@@ -687,6 +693,7 @@ pub(crate) fn open_log(record: &JobRecord) -> Result<LogView, String> {
             had_loss: legacy.had_loss,
         },
         capture_error,
+        output_truncation,
     })
 }
 
@@ -780,6 +787,21 @@ pub(crate) fn capture_error(record: &JobRecord) -> Result<Option<CaptureErrorRec
     Ok(capture_error)
 }
 
+pub(crate) fn output_truncation(
+    record: &JobRecord,
+) -> Result<Option<OutputTruncationRecord>, String> {
+    let mut truncation = read_json(
+        &record.directory.join(OUTPUT_TRUNCATION_FILE),
+        "job output-truncation record",
+    )?;
+    if truncation.is_none()
+        && let JobStatus::Exited(exit) = &record.status
+    {
+        truncation.clone_from(&exit.output_truncation);
+    }
+    Ok(truncation)
+}
+
 pub(super) fn read_log_delta(
     record: &JobRecord,
     cursor: &mut super::TailCursor,
@@ -787,7 +809,9 @@ pub(super) fn read_log_delta(
 ) -> Result<LogDelta, String> {
     if record.meta.schema_version >= 3 {
         let capture_error = capture_error(record)?;
-        let include_unindexed_tail = !record.status.is_running() || capture_error.is_some();
+        let output_truncation = output_truncation(record)?;
+        let include_unindexed_tail =
+            !record.status.is_running() || capture_error.is_some() || output_truncation.is_some();
         let mut reader = OutputLogReader::open(&record.directory, include_unindexed_tail)?;
         let total = reader.total_lines();
         let cursor_is_stale =
@@ -826,6 +850,7 @@ pub(super) fn read_log_delta(
             lines,
             observed_lines,
             capture_error,
+            output_truncation,
         });
     }
     read_legacy_spool_delta(record, cursor)
@@ -939,6 +964,7 @@ fn read_legacy_spool_delta(
     delta.lines.dedup_by_key(|line| line.seq);
     delta.observed_lines = next.last_seq.saturating_sub(cursor.last_seq);
     delta.capture_error = capture_error(record)?;
+    delta.output_truncation = output_truncation(record)?;
     *cursor = next;
     Ok(delta)
 }
@@ -1183,6 +1209,7 @@ mod tests {
             ended_at_unix_nanos,
             termination: TerminationKind::Exited,
             capture_error: None,
+            output_truncation: None,
         };
         write_atomic_json(&directory.join(EXIT_FILE), &exit).unwrap();
         std::fs::write(directory.join("payload.bin"), vec![b'x'; payload_bytes]).unwrap();
@@ -1335,6 +1362,7 @@ mod tests {
             ended_at_unix_nanos: 1,
             termination: TerminationKind::Exited,
             capture_error: Some(capture_error.clone()),
+            output_truncation: None,
         };
         write_atomic_json(&directory.join(EXIT_FILE), &exit).unwrap();
         let complete = serde_json::to_string(&SpoolLine {
@@ -1398,6 +1426,7 @@ mod tests {
                 ended_at_unix_nanos: 1,
                 termination: TerminationKind::Exited,
                 capture_error: None,
+                output_truncation: None,
             },
         )
         .unwrap();

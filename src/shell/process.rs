@@ -10,7 +10,6 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use std::process::Command;
 use std::process::{ExitStatus, Stdio};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 #[cfg(windows)]
@@ -19,7 +18,6 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 
 const TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
-static UTF8_LOCALE: OnceLock<String> = OnceLock::new();
 
 /// A spawned bash process whose kill operation covers the whole descendant tree.
 #[derive(Debug)]
@@ -93,10 +91,12 @@ pub(crate) fn spawn_bash(
     command_text: &str,
     cwd: &Path,
     login_shell: bool,
+    environment: &crate::session::SessionEnvironment,
+    utf8_locale: &str,
 ) -> std::io::Result<ManagedProcess> {
     let (reader, writer) = std::io::pipe()?;
     let mut command = crate::process_policy::noninteractive_command(bash);
-    let locale = utf8_locale(bash);
+    environment.configure_command(&mut command);
     if login_shell {
         command.arg("-lc");
     } else {
@@ -108,8 +108,8 @@ pub(crate) fn spawn_bash(
         .stdin(Stdio::null())
         .stdout(writer.try_clone()?)
         .stderr(writer)
-        .env("LANG", locale)
-        .env("LC_ALL", locale)
+        .env("LANG", utf8_locale)
+        .env("LC_ALL", utf8_locale)
         .env("TERM", "dumb")
         .env("NO_COLOR", "1")
         .env("CLICOLOR", "0")
@@ -125,7 +125,7 @@ pub(crate) fn spawn_bash(
 
     #[cfg(windows)]
     if !login_shell {
-        prepend_windows_toolset(&mut command, bash);
+        prepend_windows_toolset(&mut command, bash, environment);
     }
 
     let mut wrapped = CommandWrap::from(command);
@@ -355,7 +355,11 @@ fn terminate_job(job: &OwnedHandle) -> std::io::Result<()> {
 /// the child. A login shell needs none of this — profile sets it up — so it is left
 /// untouched.
 #[cfg(windows)]
-fn prepend_windows_toolset(command: &mut Command, bash: &Path) {
+fn prepend_windows_toolset(
+    command: &mut Command,
+    bash: &Path,
+    environment: &crate::session::SessionEnvironment,
+) {
     let Some(usr_bin) = bash.parent() else { return };
     let mut dirs: Vec<PathBuf> = vec![usr_bin.to_path_buf()];
     // Auto-discovered bash is <GitRoot>\usr\bin\bash.exe; git lives in <GitRoot>\mingw*\bin.
@@ -370,7 +374,7 @@ fn prepend_windows_toolset(command: &mut Command, bash: &Path) {
     let Ok(mut path) = std::env::join_paths(&dirs) else {
         return;
     };
-    if let Some(existing) = std::env::var_os("PATH")
+    if let Some(existing) = environment.var_os("PATH")
         && !existing.is_empty()
     {
         path.push(";");
@@ -379,14 +383,13 @@ fn prepend_windows_toolset(command: &mut Command, bash: &Path) {
     command.env("PATH", path);
 }
 
-fn utf8_locale(bash: &Path) -> &'static str {
-    UTF8_LOCALE
-        .get_or_init(|| detect_utf8_locale(bash))
-        .as_str()
-}
-
-fn detect_utf8_locale(bash: &Path) -> String {
-    let available = crate::process_policy::noninteractive_command(bash)
+pub(crate) fn detect_utf8_locale(
+    bash: &Path,
+    environment: &crate::session::SessionEnvironment,
+) -> String {
+    let mut command = crate::process_policy::noninteractive_command(bash);
+    environment.configure_command(&mut command);
+    let available = command
         .args(["-lc", "locale -a 2>/dev/null || true"])
         .stdin(Stdio::null())
         .output()
@@ -450,8 +453,17 @@ mod tests {
         let command = format!(
             "FASTCTX_TEST_NO_WINDOW_PROBE=1 {quoted_executable} --exact process_policy::tests::noninteractive_child_has_no_console --test-threads=1"
         );
-        let mut process =
-            super::spawn_bash(&bash, &command, &std::env::current_dir().unwrap(), false).unwrap();
+        let environment = crate::session::SessionEnvironment::capture().unwrap();
+        let locale = super::detect_utf8_locale(&bash, &environment);
+        let mut process = super::spawn_bash(
+            &bash,
+            &command,
+            &std::env::current_dir().unwrap(),
+            false,
+            &environment,
+            &locale,
+        )
+        .unwrap();
         let mut output = process.take_output();
         let deadline = Instant::now() + Duration::from_secs(10);
         let status = loop {

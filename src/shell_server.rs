@@ -30,9 +30,11 @@ impl FastCtxServer {
         Parameters(request): Parameters<RunRequest>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let _activity = self.activity.request();
         let shell = self.shell.clone();
         let status_shell = self.shell.clone();
         run_blocking(
+            Arc::clone(&self.session),
             Arc::clone(&self.shell_permits),
             RUN_TOKEN_BUDGET_ENV,
             move || status_shell.background_status(None),
@@ -56,9 +58,11 @@ impl FastCtxServer {
         &self,
         Parameters(request): Parameters<RunBackgroundRequest>,
     ) -> CallToolResult {
+        let _activity = self.activity.request();
         let shell = self.shell.clone();
         let status_shell = self.shell.clone();
         run_blocking(
+            Arc::clone(&self.session),
             Arc::clone(&self.shell_permits),
             GLOBAL_TOKEN_BUDGET_ENV,
             move || status_shell.background_status(None),
@@ -83,10 +87,12 @@ impl FastCtxServer {
         Parameters(request): Parameters<JobOutputRequest>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        let _activity = self.activity.request();
         let shell = self.shell.clone();
         let status_shell = self.shell.clone();
         let excluded_job = request.job_id.clone();
         run_blocking(
+            Arc::clone(&self.session),
             Arc::clone(&self.shell_permits),
             JOB_OUTPUT_TOKEN_BUDGET_ENV,
             move || status_shell.background_status(Some(&excluded_job)),
@@ -107,10 +113,12 @@ impl FastCtxServer {
         )
     )]
     async fn job_kill(&self, Parameters(request): Parameters<JobKillRequest>) -> CallToolResult {
+        let _activity = self.activity.request();
         let shell = self.shell.clone();
         let status_shell = self.shell.clone();
         let excluded_job = request.job_id.clone();
         run_blocking(
+            Arc::clone(&self.session),
             Arc::clone(&self.shell_permits),
             GLOBAL_TOKEN_BUDGET_ENV,
             move || status_shell.background_status(Some(&excluded_job)),
@@ -131,9 +139,11 @@ impl FastCtxServer {
         )
     )]
     async fn job_list(&self, Parameters(request): Parameters<JobListRequest>) -> CallToolResult {
+        let _activity = self.activity.request();
         let shell = self.shell.clone();
         let status_shell = self.shell.clone();
         run_blocking(
+            Arc::clone(&self.session),
             Arc::clone(&self.shell_permits),
             GLOBAL_TOKEN_BUDGET_ENV,
             move || status_shell.background_status(None),

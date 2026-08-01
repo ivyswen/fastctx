@@ -9,6 +9,7 @@ pub(super) const JOB_SCHEMA_VERSION: u32 = 3;
 pub(super) const META_FILE: &str = "meta.json";
 pub(super) const EXIT_FILE: &str = "exit.json";
 pub(super) const CAPTURE_ERROR_FILE: &str = "capture-error.json";
+pub(super) const OUTPUT_TRUNCATION_FILE: &str = "output-truncated.json";
 pub(super) const KILL_REQUEST_FILE: &str = "kill.request";
 pub(super) const OUTPUT_LOG_FILE: &str = "output.log";
 pub(super) const OUTPUT_INDEX_FILE: &str = "output.idx";
@@ -71,6 +72,9 @@ pub(crate) struct ExitRecord {
     /// Fallback copy of a capture failure when its dedicated immutable record could not be published.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) capture_error: Option<CaptureErrorRecord>,
+    /// Frozen per-job quota state, also written while the job is still running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output_truncation: Option<OutputTruncationRecord>,
 }
 
 fn is_natural_exit(kind: &TerminationKind) -> bool {
@@ -82,6 +86,15 @@ fn is_natural_exit(kind: &TerminationKind) -> bool {
 pub(crate) struct CaptureErrorRecord {
     pub(crate) after_seq: u64,
     pub(crate) reason: String,
+}
+
+/// Durable notice that the supervisor kept draining output after its disk quota was exhausted.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct OutputTruncationRecord {
+    pub(crate) limit_bytes: u64,
+    pub(crate) persisted_log_bytes: u64,
+    pub(crate) persisted_index_bytes: u64,
+    pub(crate) after_seq: u64,
 }
 
 /// One normalized display line from a schema-v1/v2 JSONL segment.
@@ -121,6 +134,12 @@ pub(crate) struct LaunchSpec {
     pub(crate) login_shell: bool,
     #[serde(default)]
     pub(crate) encoding: Option<String>,
+    /// Exact native environment captured by the stdio proxy that started this job.
+    pub(crate) environment: crate::session::SessionEnvironment,
+    /// Locale selected for this session's bash before the detached supervisor starts.
+    pub(crate) utf8_locale: String,
+    /// Combined `output.log` + `output.idx` ceiling frozen before detachment.
+    pub(crate) output_limit_bytes: u64,
     pub(crate) origin: OriginSnapshot,
 }
 

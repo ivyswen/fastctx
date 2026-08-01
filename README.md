@@ -8,6 +8,8 @@ FastCtx is a local Rust tool runtime. It provides file reading, content search, 
 
 Repository operations run in a persistent process with stable input schemas and output formats. The model can gather the context it needs in fewer steps and spend more attention on understanding code, planning changes, and verifying results.
 
+Each `fastctx serve` process is a thin stdio proxy. Proxies for the same user and FastCtx build share one private local control center, including its search executor and global admission limits, while every MCP connection keeps its own working directory, native environment, cancellation state, and background-output cursor. The control center exits after ten minutes with no active request and no running background job; leaked idle proxies then exit with it. If the private control center cannot start or accept a session, the proxy reports the problem and falls back to a complete standalone server before consuming MCP input.
+
 ```console
 npm install --global fastctx
 fastctx
@@ -48,7 +50,7 @@ fastctx
 
 The first launch opens the full-screen control terminal. The interface supports 17 languages and provides these main actions:
 
-1. Adjust the output tier;
+1. Adjust the output tier and provider-aware output protection;
 2. Keep grep/glob on automatic CPU parallelism or set an explicit core limit;
 3. Enable **Bash terminal** when needed;
 4. Set current-user background-job storage, concurrency, and AI list page limits;
@@ -60,7 +62,7 @@ Apply copies the current binary to `~/.fastctx/bin/` and points the host configu
 
 On launch, FastCtx checks its launch channel for updates before the main menu opens. A brief checking screen appears and the wait is strictly bounded: if the check cannot finish — offline, timeout, rate limiting — FastCtx enters silently, and the dedicated **Update** screen still offers a manual check at any time. When a newer version is installable, the update screen opens directly and asks whether to **Update & restart** or **Continue** into the current version. Successful results are cached for 24 hours in machine-private storage outside `~/.fastctx`, so most launches skip the network entirely. npm launches query the exact launcher package through a fresh isolated cache with `--prefer-online`; direct GitHub Release executables read the stable tag from GitHub's `releases/latest` web redirect.
 
-If GitHub has published a release but npm has not exposed the matching version yet, FastCtx shows a propagation screen instead of trusting stale metadata. **Retry** always uses another isolated cache; it never clears or mutates the user's normal npm cache. Transient network or rate-limit failures stay quiet and are recorded under **Status**; malformed publication metadata produces one warning. Status also offers a manual check that bypasses the 24-hour TTL. An accepted npm update installs the exact version with lifecycle scripts disabled. A GitHub Release update downloads this repository's platform archive and aggregate `SHA256SUMS`, verifies the archive before safely extracting the binary, probes the downloaded version, replaces the executable atomically, and rolls back when restart health fails. A failed npm update restores the exact previous package version; every failed update reopens the previous TUI with a warning. After a successful restart, an owned `~/.fastctx/bin/` Apply copy is synchronized; externally changed copies are left untouched.
+If GitHub has published a release but npm has not exposed the matching version yet, FastCtx shows a propagation screen instead of trusting stale metadata. **Retry** always uses another isolated cache; it never clears or mutates the user's normal npm cache. Transient network or rate-limit failures stay quiet and are recorded under **Status**; malformed publication metadata produces one warning. Status also offers a manual check that bypasses the 24-hour TTL. An accepted npm update installs the exact version with lifecycle scripts disabled. A GitHub Release update downloads this repository's platform archive and aggregate `SHA256SUMS`, verifies the archive before safely extracting the binary, probes the downloaded version, replaces the executable atomically, and rolls back when restart health fails. A failed npm update restores the exact previous package version; every failed update reopens the previous TUI with a warning. After a successful restart, an owned `~/.fastctx/bin/` Apply copy is synchronized; externally changed copies are left untouched. Restart Codex after an update so existing sessions and their build-isolated control center are replaced by the new build.
 
 `cargo install` builds and the internal `~/.fastctx/bin/` runtime are not self-updated. Set `FASTCTX_DISABLE_UPDATE_CHECK=1` to disable the TUI startup check.
 
@@ -113,7 +115,7 @@ fastctx unapply --yes
 
 ### Search CPU limit and settings reset
 
-grep/glob uses automatic parallelism by default: the operating system's available parallelism, capped at 16. In **Config → Search**, choose a preset with ←/→ or press Enter and type `auto` or any integer in the displayed `1..=maximum` range. The setting is read directly by each newly started MCP server, takes effect after restarting the server, and does not require Apply.
+grep/glob uses automatic parallelism by default: the operating system's available parallelism, capped at 16. In **Config → Search**, choose a preset with ←/→ or press Enter and type `auto` or any integer in the displayed `1..=maximum` range. The setting is loaded when the shared control center starts, takes effect after that control center restarts, and does not require Apply.
 
 The same setting can be written manually in `~/.fastctx/config.toml`:
 
@@ -122,7 +124,7 @@ The same setting can be written manually in `~/.fastctx/config.toml`:
 max_cpu_cores = 4
 ```
 
-Omitting the key keeps the previous automatic behavior. Invalid types, empty values, zero, negative numbers, and values above the engine's displayed ceiling prevent `serve` from starting and produce a diagnostic without rewriting the file. The limit sets the effective search parallelism for one request: its base lane plus shared extra workers is at most N. Concurrent requests retain independent base lanes, so this is not CPU affinity or a strict process-wide/system-wide governor.
+Omitting the key keeps the previous automatic behavior. Invalid types, empty values, zero, negative numbers, and values above the engine's displayed ceiling prevent a session from starting and produce a diagnostic without rewriting the file. The limit sets one request's effective search parallelism to its base lane plus shared extra workers, at most N. Across every session in the per-user control center, concurrent requests retain independent base lanes but share one pool of at most N−1 extra lanes, so the upper bound for R concurrent requests is R+N−1. This is not CPU affinity or a strict system-wide governor.
 
 **Config → Reset → Reset all settings** opens with **No** selected. Confirming restores every user preference, including language, output budgets, Bash/job limits, search CPU limit, and update settings. It preserves the Apply ownership receipt, installed binary, host configuration, and running jobs. Restoring the default 1024 MiB job-history quota may immediately evict the oldest finished records above that quota.
 
@@ -324,15 +326,15 @@ Output uses bounded memory. When output exceeds the response capacity, the final
 
 Each job is owned by a detached supervisor rather than by the MCP server. It keeps running across server exits, ChatGPT / Codex restarts, and session changes until the command exits or `job_kill` stops it. There is no background timeout parameter.
 
-Output and exit status are stored under `~/.fastctx/jobs/`, so another FastCtx server can resume the same job by id. For jobs started by the current format, everything printed is appended to a plain log file there — nothing is rotated away — and its path is returned when the job starts, so `read` and `grep` work on it directly.
+Output and exit status are stored under `~/.fastctx/jobs/`, so another FastCtx session can resume the same job by id. For jobs started by the current format, output is appended to a plain log file whose path is returned when the job starts, so `read` and `grep` work on the retained prefix directly. At supervisor startup, each job freezes a hard ceiling for the combined log and line index from the current `fastshell.job_storage_limit_mib` setting. If output reaches that ceiling, FastCtx keeps draining the child process so the command can finish, stops persisting further bytes, and records an explicit truncation notice without changing the command's exit code.
 
-While one FastCtx server has jobs that it started or queried, every successful text result from that server carries a one-line background readout with each job's current state and elapsed time. The readout refreshes only when another tool is called; it is not a notification and nothing is pushed while the caller is idle. A finished entry remains visible until that server handles it with `job_output` or `job_kill`.
+While one MCP session has jobs that it started or queried, every successful text result from that session carries a one-line background readout with each job's current state and elapsed time. The readout refreshes only when another tool is called; it is not a notification and nothing is pushed while the caller is idle. A finished entry remains visible until that session handles it with `job_output` or `job_kill`.
 
 ### `job_output`
 
 `job_output` queries a background job, including jobs started in earlier sessions, and reports `running`, `exited`, or `interrupted` together with the newest output the caller has not been shown. `wait_ms` (0–240000, default 30000) is how long the query may take: it returns as soon as the job ends and otherwise waits the window out; intermediate lines do not end the wait. Pass `wait_ms=0` for an immediate snapshot, and raise it only when there is nothing else to do because the call blocks. Long current-format output is windowed — the newest lines that fit, plus the start of the log on the first call — and a note names the exact lines that were skipped and the log path to read them from. Line numbers in that log are the same `seq` numbers `after_seq` takes, so moving between the two tools needs no translation. Records written by the preceding segmented format remain readable, including while an older supervisor is still appending, but they do not advertise direct log coordinates and cannot recover bytes that their original rolling window already evicted.
 
-`Complete` appears only after the job ends; a development server or watcher may never reach it. For current-format jobs, the background log keeps every line, so anything a response leaves out is still one `read` or `grep` away; the compatibility limitation above applies only to records created by the preceding format.
+`Complete` appears only after the job ends; a development server or watcher may never reach it. Before the per-job disk ceiling is reached, anything a response leaves out is still one `read` or `grep` away. After the ceiling is reached, `job_output` and the Jobs dashboard identify the last retained sequence and explain that the supervisor continued draining without persistence. The compatibility limitation above applies only to records created by the preceding format.
 
 ### `job_kill`
 
@@ -344,7 +346,7 @@ While one FastCtx server has jobs that it started or queried, every successful t
 
 Finished records have no time-to-live. FastCtx retains them until the current user's `fastshell.job_storage_limit_mib` limit requires eviction of the oldest finished records. The default is 1024 MiB. Running jobs and their records are never evicted; `fastshell.max_running_jobs` limits concurrent jobs across all FastCtx sessions for that user and defaults to 128. `fastshell.job_list_limit` is the default page size (20, valid range 1–100). All three settings take effect immediately when saved and do not require Apply; the TUI presets for page size are 10 / 20 / 50 / 100.
 
-The TUI **Jobs** dashboard scans this same current-user registry but shows only jobs that are currently running, aggregated from every FastCtx server and TUI instance. A finished job disappears with a short notice that its retained output remains available to the agent through `job_output`. Jobs are grouped by an honest source-session tag with workspace, server PID, and parent-process context. Fixed list columns keep relative age and job ids aligned, while long ASCII or CJK commands end with an ellipsis at one shared edge. The detail panel shows the exact UTC start time to the second and a live `HH:MM:SS` elapsed time. Horizontal and vertical output navigation remains available; one width-aware footer row keeps the essential keys visible and adds `←/→ output`, `PgUp/PgDn scroll`, and `F follow` when space permits. ChatGPT / Codex does not expose conversation titles or ids to the MCP server, so FastCtx does not invent one.
+The TUI **Jobs** dashboard scans this same current-user registry but shows only jobs that are currently running, aggregated from every FastCtx session and TUI instance. A finished job disappears with a short notice that its retained output remains available to the agent through `job_output`. Jobs are grouped by a source tag with workspace and runtime-process context. Fixed list columns keep relative age and job ids aligned, while long ASCII or CJK commands end with an ellipsis at one shared edge. The detail panel shows the exact UTC start time to the second and a live `HH:MM:SS` elapsed time. Horizontal and vertical output navigation remains available; one width-aware footer row keeps the essential keys visible and adds `←/→ output`, `PgUp/PgDn scroll`, and `F follow` when space permits. ChatGPT / Codex does not expose conversation titles or ids to the MCP server, so FastCtx does not invent one.
 
 ## Security and privacy
 
@@ -356,9 +358,9 @@ The FastCtx MCP server inherits the local permissions of the host process.
 | `replace` | Enabled | Local file writes with dry-run, CAS, and atomic replacement safeguards |
 | Bash tools | Disabled | Bash command execution after the user enables them |
 | TUI update check | Enabled for npm and GitHub Release launches | Version metadata from `registry.npmjs.org` and GitHub's `releases/latest` web redirect; downloads require explicit confirmation |
-| MCP runtime network requests | None | `serve` and tool calls perform no telemetry or update traffic |
+| MCP runtime network requests | None | `serve`, private local proxy traffic, and tool calls perform no telemetry or update traffic |
 
-The startup check sends the FastCtx version, normal HTTPS request metadata, and npm's standard registry request; it never sends repository paths, job data, or file contents. Background jobs persist their command, working directory, output, and exit status only in the current user's private `~/.fastctx/jobs/` directory; current-format jobs use a complete plain log. FastCtx does not upload this data. Bash commands can access the network according to the command itself. Prebuilt binaries include the PDF engine.
+The startup check sends the FastCtx version, normal HTTPS request metadata, and npm's standard registry request; it never sends repository paths, job data, or file contents. Background jobs persist their command, working directory, retained output prefix, truncation state, and exit status only in the current user's private `~/.fastctx/jobs/` directory. Proxy-to-control-center traffic stays on an owner-private Unix-domain socket or Windows named pipe. FastCtx does not upload this data. Bash commands can access the network according to the command itself. Prebuilt binaries include the PDF engine.
 
 The MCP server runs outside the host filesystem sandbox. Use an approval mode when every write and command execution should be reviewed:
 
@@ -390,6 +392,8 @@ The control terminal provides three output tiers. Each keeps FastCtx's internal 
 - `High`: host limit 100,000; FastCtx budget 90,000.
 
 Higher output tiers allow larger results per call and consume context faster. Choose a tier according to the task.
+
+Provider output protection is enabled by default. FastCtx reads only Codex's visible `config.toml` and follows Codex's own remote-compaction classification: OpenAI and Azure keep the selected tier, while a resolved provider that uses local inline compaction activates **Guarded** limits of 10,000 host tokens and a 9,000-token FastCtx budget. Guarded locks the tier selector without overwriting the saved tier, so switching back to a remote-compaction provider restores the preference automatically; all five per-tool percentages remain adjustable. The control terminal requires a warning confirmation before protection can be disabled. `fastctx status` reports active protection, unknown provider configurations, and provider changes that need another Apply.
 
 Only `read` grows with the tier; the other four long-output tools keep a share sized for what they actually need, so raising the tier buys packing capacity for multi-file reads rather than inflating every result. Each tool's share can be set to any whole percentage in the control terminal, and a share left alone follows the tier.
 

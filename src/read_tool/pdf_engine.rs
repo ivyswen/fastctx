@@ -66,10 +66,16 @@ impl PdfRuntime {
         }
 
         let (sender, receiver) = mpsc::sync_channel(1);
+        let environment = crate::session::active_environment();
         std::thread::Builder::new()
             .name("fastctx-pdf-operation".to_string())
             .spawn(move || {
-                let outcome = catch_unwind(AssertUnwindSafe(operation));
+                let outcome = match environment {
+                    Some(environment) => {
+                        environment.activate(|| catch_unwind(AssertUnwindSafe(operation)))
+                    }
+                    None => catch_unwind(AssertUnwindSafe(operation)),
+                };
                 let _ = sender.send(outcome);
             })
             .map_err(|error| {
@@ -181,25 +187,25 @@ fn verify_embedded_bytes(artifact: EngineArtifact<'_>) -> Result<(), String> {
 fn cache_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        std::env::var_os("LOCALAPPDATA")
+        crate::session::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .map(|path| path.join("fastctx"))
     }
     #[cfg(target_os = "macos")]
     {
-        std::env::var_os("HOME")
+        crate::session::var_os("HOME")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .map(|path| path.join("Library/Caches/fastctx"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        std::env::var_os("XDG_CACHE_HOME")
+        crate::session::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .or_else(|| {
-                std::env::var_os("HOME")
+                crate::session::var_os("HOME")
                     .map(PathBuf::from)
                     .filter(|path| path.is_absolute())
                     .map(|path| path.join(".cache"))
@@ -210,11 +216,11 @@ fn cache_dir() -> Option<PathBuf> {
 
 fn fallback_dir() -> PathBuf {
     let identity = cache_dir()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .or_else(|| crate::session::var_os("HOME").map(PathBuf::from))
+        .or_else(|| crate::session::var_os("USERPROFILE").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("unknown-user"));
     let digest = hex::encode(Sha256::digest(identity.to_string_lossy().as_bytes()));
-    std::env::temp_dir().join(format!("fastctx-{}", &digest[..16]))
+    crate::session::temp_dir().join(format!("fastctx-{}", &digest[..16]))
 }
 
 fn release_with_fallback(

@@ -7,6 +7,7 @@ use crate::model::{ImageDetail, ToolContent, ToolResponse};
 use crate::operation::{OpError, OperationCtx, RequestWorkGuard};
 #[cfg(test)]
 use crate::operation::{TestStage, TestStageHook};
+use crate::session::SessionContext;
 use rmcp::model::RequestId;
 use rmcp::model::{CallToolResult, ContentBlock, ImageContent, Meta};
 use std::sync::Arc;
@@ -20,8 +21,38 @@ pub(crate) enum BudgetRetry {
     Safe,
 }
 
+pub(crate) struct CancellableBlockingRequest {
+    session: Arc<SessionContext>,
+    request_id: RequestId,
+    request_cancel: CancellationToken,
+    permits: Arc<Semaphore>,
+    executor: Arc<GrepGlobExecutor>,
+    budget_variable: &'static str,
+}
+
+impl CancellableBlockingRequest {
+    pub(crate) fn new(
+        session: Arc<SessionContext>,
+        request_id: RequestId,
+        request_cancel: CancellationToken,
+        permits: Arc<Semaphore>,
+        executor: Arc<GrepGlobExecutor>,
+        budget_variable: &'static str,
+    ) -> Self {
+        Self {
+            session,
+            request_id,
+            request_cancel,
+            permits,
+            executor,
+            budget_variable,
+        }
+    }
+}
+
 /// Runs synchronous tool work behind a shared semaphore and converts its response.
 pub(crate) async fn run_blocking(
+    session: Arc<SessionContext>,
     permits: Arc<Semaphore>,
     budget_variable: &'static str,
     status: impl FnOnce() -> Option<BackgroundStatus> + Send + 'static,
@@ -38,14 +69,17 @@ pub(crate) async fn run_blocking(
     };
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let decorator = BackgroundDecorator::new(status(), budget_variable);
-        loop {
-            let response = operation();
-            if retry == BudgetRetry::Safe && decorator.retry_after_budget_starvation(&response) {
-                continue;
+        session.activate(|| {
+            let decorator = BackgroundDecorator::new(status(), budget_variable);
+            loop {
+                let response = operation();
+                if retry == BudgetRetry::Safe && decorator.retry_after_budget_starvation(&response)
+                {
+                    continue;
+                }
+                break decorator.finish(response);
             }
-            break decorator.finish(response);
-        }
+        })
     })
     .await
     {
@@ -58,23 +92,28 @@ pub(crate) async fn run_blocking(
 
 /// Runs grep/glob work with cancel-aware admission and a drop-cancelled blocking sibling.
 pub(crate) async fn run_blocking_cancellable(
-    request_id: RequestId,
-    request_cancel: CancellationToken,
-    permits: Arc<Semaphore>,
-    executor: Arc<GrepGlobExecutor>,
-    budget_variable: &'static str,
+    request: CancellableBlockingRequest,
     status: impl FnOnce() -> Option<BackgroundStatus> + Send + 'static,
     operation: impl FnMut(OperationCtx, Arc<GrepGlobExecutor>) -> Result<ToolResponse, OpError>
     + Send
     + 'static,
 ) -> CallToolResult {
+    let CancellableBlockingRequest {
+        session,
+        request_id,
+        request_cancel,
+        permits,
+        executor,
+        budget_variable,
+    } = request;
     let (guard, operation_context) = RequestWorkGuard::new(request_id, request_cancel);
-    let error_adapter =
-        ErrorBudgetAdapter::new(error_budget_hint(budget_variable), budget_variable);
+    let error_adapter = session
+        .activate(|| ErrorBudgetAdapter::new(error_budget_hint(budget_variable), budget_variable));
     run_blocking_cancellable_with_context(
         guard,
         operation_context,
         CancellableBlockingResources {
+            session,
             permits,
             executor,
             error_adapter,
@@ -98,14 +137,16 @@ async fn run_blocking_cancellable_with_hook(
     + Send
     + 'static,
 ) -> CallToolResult {
+    let session = SessionContext::library_default();
     let (guard, operation_context) =
         RequestWorkGuard::new_with_hook(request_id, request_cancel, stage_hook);
-    let error_adapter =
-        ErrorBudgetAdapter::new(error_budget_hint(budget_variable), budget_variable);
+    let error_adapter = session
+        .activate(|| ErrorBudgetAdapter::new(error_budget_hint(budget_variable), budget_variable));
     run_blocking_cancellable_with_context(
         guard,
         operation_context,
         CancellableBlockingResources {
+            session,
             permits,
             executor,
             error_adapter,
@@ -118,6 +159,7 @@ async fn run_blocking_cancellable_with_hook(
 }
 
 struct CancellableBlockingResources {
+    session: Arc<SessionContext>,
     permits: Arc<Semaphore>,
     executor: Arc<GrepGlobExecutor>,
     error_adapter: ErrorBudgetAdapter<'static>,
@@ -134,6 +176,7 @@ async fn run_blocking_cancellable_with_context(
     + 'static,
 ) -> CallToolResult {
     let CancellableBlockingResources {
+        session,
         permits,
         executor,
         error_adapter,
@@ -169,16 +212,18 @@ async fn run_blocking_cancellable_with_context(
     let completion_context = operation_context.clone();
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let decorator = BackgroundDecorator::new(status(), budget_variable);
-        loop {
-            operation_context.check()?;
-            let response = operation(operation_context.clone(), Arc::clone(&executor))?;
-            operation_context.check()?;
-            if decorator.retry_after_budget_starvation(&response) {
-                continue;
+        session.activate(|| {
+            let decorator = BackgroundDecorator::new(status(), budget_variable);
+            loop {
+                operation_context.check()?;
+                let response = operation(operation_context.clone(), Arc::clone(&executor))?;
+                operation_context.check()?;
+                if decorator.retry_after_budget_starvation(&response) {
+                    continue;
+                }
+                break Ok::<_, OpError>(decorator.finish(response));
             }
-            break Ok::<_, OpError>(decorator.finish(response));
-        }
+        })
     })
     .await;
     let completion_error = completion_context.check().err();
@@ -231,8 +276,8 @@ pub(crate) fn into_mcp_result(response: ToolResponse) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::{
-        BudgetRetry, into_mcp_result, run_blocking, run_blocking_cancellable,
-        run_blocking_cancellable_with_hook,
+        BudgetRetry, CancellableBlockingRequest, into_mcp_result, run_blocking,
+        run_blocking_cancellable, run_blocking_cancellable_with_hook,
     };
     use crate::budget::{GLOBAL_TOKEN_BUDGET_ENV, GREP_TOKEN_BUDGET_ENV};
     use crate::file_executor::GrepGlobExecutor;
@@ -281,6 +326,7 @@ mod tests {
         let first_permits = Arc::clone(&permits);
         let first = tokio::spawn(async move {
             run_blocking(
+                crate::session::SessionContext::library_default(),
                 first_permits,
                 GLOBAL_TOKEN_BUDGET_ENV,
                 || None,
@@ -300,6 +346,7 @@ mod tests {
         let second = tokio::spawn(async move {
             second_waiting_tx.send(()).unwrap();
             run_blocking(
+                crate::session::SessionContext::library_default(),
                 permits,
                 GLOBAL_TOKEN_BUDGET_ENV,
                 || None,
@@ -401,11 +448,14 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (cancelled_tx, cancelled_rx) = mpsc::channel();
         let task = tokio::spawn(run_blocking_cancellable(
-            request_id(12),
-            parent.clone(),
-            Arc::clone(&permits),
-            file_executor(),
-            GREP_TOKEN_BUDGET_ENV,
+            CancellableBlockingRequest::new(
+                crate::session::SessionContext::library_default(),
+                request_id(12),
+                parent.clone(),
+                Arc::clone(&permits),
+                file_executor(),
+                GREP_TOKEN_BUDGET_ENV,
+            ),
             || None,
             move |operation, _| {
                 started_tx.send(()).unwrap();
@@ -436,11 +486,14 @@ mod tests {
     async fn a_panicking_coordinator_returns_the_file_permit() {
         let permits = Arc::new(Semaphore::new(1));
         let result = run_blocking_cancellable(
-            request_id(13),
-            CancellationToken::new(),
-            Arc::clone(&permits),
-            file_executor(),
-            GREP_TOKEN_BUDGET_ENV,
+            CancellableBlockingRequest::new(
+                crate::session::SessionContext::library_default(),
+                request_id(13),
+                CancellationToken::new(),
+                Arc::clone(&permits),
+                file_executor(),
+                GREP_TOKEN_BUDGET_ENV,
+            ),
             || None,
             move |_, _| -> Result<ToolResponse, OpError> { panic!("injected coordinator panic") },
         )

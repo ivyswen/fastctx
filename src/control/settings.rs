@@ -69,7 +69,7 @@ pub struct SearchParallelismStatus {
     pub effective: Option<usize>,
 }
 
-/// Current-user grep/glob CPU settings, read directly by each newly started server.
+/// Current-user grep/glob CPU settings, read when the shared control center starts.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct SearchSettings {
@@ -160,6 +160,26 @@ pub struct UpdateSettings {
     pub auto_check: bool,
     /// npm download-source policy.
     pub source: UpdateSource,
+}
+
+/// Protection applied when the visible Codex provider has no remote compaction.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct OutputGuardSettings {
+    /// Whether third-party providers are constrained to the Guarded output policy.
+    pub enabled: bool,
+}
+
+impl OutputGuardSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl Default for OutputGuardSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 impl Default for UpdateSettings {
@@ -669,11 +689,14 @@ pub struct FastCtxSettings {
     /// Advanced per-tool overrides used by the next Apply; unset entries follow the tier.
     #[serde(skip_serializing_if = "ToolBudgetPreferences::is_default")]
     pub tool_budgets: ToolBudgetPreferences,
+    /// Provider-derived output protection; omission keeps the safe enabled default.
+    #[serde(skip_serializing_if = "OutputGuardSettings::is_default")]
+    pub output_guard: OutputGuardSettings,
     /// Optional fastshell server, disabled by default.
     pub fastshell: FastShellSettings,
     /// Machine-level update preferences, effective immediately when saved.
     pub update: UpdateSettings,
-    /// Current-user grep/glob CPU limit, effective for newly started server processes.
+    /// Current-user grep/glob CPU limit, effective after the shared control center restarts.
     #[serde(skip_serializing_if = "SearchSettings::is_default")]
     pub search: SearchSettings,
     /// Legacy config key accepted but omitted from every newly written settings file.
@@ -702,6 +725,7 @@ impl Default for FastCtxSettings {
             language: None,
             tier: Tier::Standard,
             tool_budgets: ToolBudgetPreferences::default(),
+            output_guard: OutputGuardSettings::default(),
             fastshell: FastShellSettings::default(),
             update: UpdateSettings::default(),
             search: SearchSettings::default(),
@@ -1230,6 +1254,7 @@ mod tests {
         let defaults = FastCtxSettings::default();
         let encoded = String::from_utf8(encode(&defaults).unwrap()).unwrap();
         assert!(!encoded.contains("[tool_budgets]"), "{encoded}");
+        assert!(!encoded.contains("[output_guard]"), "{encoded}");
 
         let mut customized = defaults;
         customized.tool_budgets.grep = Some(ToolBudgetLevel::Percent(75));
@@ -1251,6 +1276,27 @@ mod tests {
             load_from(&path).unwrap().tool_budgets,
             customized.tool_budgets
         );
+    }
+
+    #[test]
+    fn output_guard_is_safe_by_default_and_only_a_disable_choice_is_persisted() {
+        let mut settings = FastCtxSettings::default();
+        assert!(settings.output_guard.enabled);
+        settings.output_guard.enabled = false;
+        let encoded = encode(&settings).unwrap();
+        let source = String::from_utf8(encoded.clone()).unwrap();
+        assert!(
+            source.contains("[output_guard]\nenabled = false\n"),
+            "{source}"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, encoded).unwrap();
+        assert!(!load_from(&path).unwrap().output_guard.enabled);
+
+        std::fs::write(&path, b"schema_version = 1\n").unwrap();
+        assert!(load_from(&path).unwrap().output_guard.enabled);
     }
 
     #[test]
@@ -1794,6 +1840,7 @@ mod tests {
             ..FastCtxSettings::default()
         };
         settings.tool_budgets.grep = Some(ToolBudgetLevel::Percent(25));
+        settings.output_guard.enabled = false;
         settings.fastshell.enabled = true;
         settings.fastshell.job_storage_limit_mib = 4_096;
         settings.update.auto_check = false;
@@ -1801,6 +1848,7 @@ mod tests {
         settings.search.max_cpu_cores = Some(1);
 
         let reset = reset_user_preferences(&settings);
+        assert!(reset.output_guard.enabled);
         assert_eq!(reset.applied, Some(receipt));
         assert_eq!(
             FastCtxSettings {

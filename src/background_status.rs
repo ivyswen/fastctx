@@ -4,7 +4,7 @@ use crate::budget::{ResponseReservation, ResponseReservationOutcome, estimate_to
 use crate::{ToolContent, ToolResponse};
 use std::time::{Duration, SystemTime};
 
-/// Lifecycle displayed for one job known to the current server instance.
+/// Lifecycle displayed for one job known to the current MCP session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BackgroundState {
     Running,

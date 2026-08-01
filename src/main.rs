@@ -2,7 +2,7 @@
 
 use std::process::ExitCode;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match fastctx::cli::run().await {
         Ok(code) => code,

@@ -31,7 +31,7 @@ pub fn canonical_existing(path: &Path) -> io::Result<PathBuf> {
 
 /// Normalized display value of the current session working directory.
 pub fn current_dir_display() -> String {
-    std::env::current_dir()
+    crate::session::current_dir()
         .ok()
         .and_then(|path| canonical_existing(&path).ok().or(Some(path)))
         .map(|path| display_path(&path))
@@ -128,7 +128,7 @@ fn percent_decoded(value: &str) -> String {
 
 /// Builds the read error for missing or relative paths, including a recovery step when possible.
 pub fn missing_file_message(input: &str) -> String {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = crate::session::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let parsed = parse_input_path(input);
     let resolved = if parsed.is_absolute() {
         parsed.clone()
@@ -174,7 +174,7 @@ pub fn missing_read_file_message(input: &str) -> String {
 
 /// Builds the missing-path error shared by grep and glob.
 pub fn missing_search_path_message(input: &str) -> String {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = crate::session::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let parsed = parse_input_path(input);
     let resolved = if parsed.is_absolute() {
         parsed

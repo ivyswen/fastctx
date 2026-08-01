@@ -75,6 +75,7 @@ fn uses_narrow_layout(area: Rect, screen: Screen) -> bool {
         Screen::MigrationNotice
         | Screen::Config
         | Screen::ConfigCpuEdit
+        | Screen::ConfigOutputGuardConfirm
         | Screen::ConfigResetConfirm
         | Screen::Jobs
         | Screen::Update
@@ -176,6 +177,13 @@ fn render_body(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         Screen::Config => render_config(frame, app, area),
         Screen::ConfigCpuEdit => render_cpu_limit_editor(frame, app, area),
         Screen::ConfigBudgetEdit(item) => render_budget_editor(frame, app, area, item),
+        Screen::ConfigOutputGuardConfirm => render_confirmation(
+            frame,
+            app,
+            area,
+            app.guard_messages().disable_confirm,
+            theme::danger(),
+        ),
         Screen::ConfigResetConfirm => {
             let prompt = format!(
                 "{}\n{}",
@@ -960,7 +968,9 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(table, chunks[0]);
 
     let entry = app.config_cursor.entry();
-    let detail = match app.config_draft.value(entry.item) {
+    let guarded = app.output_guard_active();
+    let effective_output = app.effective_output();
+    let detail = match app.config_draft.value_with_guard(entry.item, guarded) {
         ConfigValue::Tier(tier) => vec![
             Line::from(vec![
                 Span::styled(
@@ -994,6 +1004,32 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             Line::raw(""),
             Line::styled(messages.tier_explainer, Style::default().fg(theme::muted())),
         ],
+        ConfigValue::GuardedTier(selected_tier) => vec![
+            Line::from(vec![
+                Span::styled(
+                    "Guarded",
+                    Style::default()
+                        .fg(theme::warning())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ·  {}", selected_tier.display_name()),
+                    Style::default().fg(theme::muted()),
+                ),
+            ]),
+            Line::styled(
+                app.guard_messages().locked_note,
+                Style::default().fg(theme::fg()),
+            ),
+            Line::raw(""),
+            Line::styled(
+                format!(
+                    "tool_output_token_limit {} · FASTCTX_TOKEN_BUDGET {}",
+                    effective_output.host_limit, effective_output.fastctx_budget
+                ),
+                Style::default().fg(theme::muted()),
+            ),
+        ],
         ConfigValue::Budget(budget) => {
             let mut lines = vec![Line::from(vec![
                 Span::styled(
@@ -1001,6 +1037,7 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         config::group_spec(entry.group).parent(),
                         messages,
                         app.config_messages(),
+                        app.guard_messages(),
                         app.job_messages(),
                         app.update_messages(),
                     ),
@@ -1012,6 +1049,7 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         entry.item,
                         messages,
                         app.config_messages(),
+                        app.guard_messages(),
                         app.job_messages(),
                         app.update_messages(),
                     ),
@@ -1022,7 +1060,7 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 Span::styled(
                     format!(
                         "  {}",
-                        budget_summary(budget.level, app.config_draft.output.tier.fastctx_budget())
+                        budget_summary(budget.level, effective_output.fastctx_budget)
                     ),
                     Style::default()
                         .fg(theme::fg())
@@ -1032,6 +1070,8 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             lines.push(Line::styled(
                 if budget.explicit {
                     app.config_messages().budget_explicit_note
+                } else if guarded {
+                    app.guard_messages().budget_follows_guarded_note
                 } else {
                     app.config_messages().budget_follows_tier_note
                 },
@@ -1062,6 +1102,11 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             let note = match entry.item {
                 ConfigItemId::FastShell => messages.fastshell_note,
                 ConfigItemId::UpdateAutoCheck => app.update_messages().auto_check_note,
+                ConfigItemId::OutputGuard if app.output_guard_active() => {
+                    app.guard_messages().active_note
+                }
+                ConfigItemId::OutputGuard if !enabled => app.guard_messages().disabled_note,
+                ConfigItemId::OutputGuard => app.guard_messages().available_note,
                 _ => messages.extensions_note,
             };
             let mut lines = vec![
@@ -1071,6 +1116,7 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                             entry.item,
                             messages,
                             app.config_messages(),
+                            app.guard_messages(),
                             app.job_messages(),
                             app.update_messages(),
                         ),
@@ -1116,6 +1162,7 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                             entry.item,
                             messages,
                             app.config_messages(),
+                            app.guard_messages(),
                             app.job_messages(),
                             app.update_messages(),
                         ),
@@ -1327,6 +1374,7 @@ fn render_budget_editor(frame: &mut Frame<'_>, app: &App, area: Rect, item: Conf
             item,
             app.messages(),
             messages,
+            app.guard_messages(),
             app.job_messages(),
             app.update_messages(),
         ),
@@ -1342,8 +1390,11 @@ fn render_budget_editor(frame: &mut Frame<'_>, app: &App, area: Rect, item: Conf
     let preview = budget_editor::parse_input(&app.budget_editor.input)
         .ok()
         .map(|level| {
-            let value = app.config_draft.preview_tool_budget(item, level);
-            budget_summary(value.level, app.config_draft.output.tier.fastctx_budget())
+            let guarded = app.output_guard_active();
+            let value = app
+                .config_draft
+                .preview_tool_budget_with_guard(item, level, guarded);
+            budget_summary(value.level, app.effective_output().fastctx_budget)
         });
     let color = if error.is_some() {
         theme::danger()
@@ -1782,6 +1833,10 @@ fn render_job_output(
             lines.push(Line::styled(error, Style::default().fg(theme::danger())));
             lines.push(Line::raw(""));
         }
+        if let Some(warning) = &app.jobs_detail.tail.output_truncation {
+            lines.push(Line::styled(warning, Style::default().fg(theme::warning())));
+            lines.push(Line::raw(""));
+        }
         let output = &app.jobs_detail.tail.lines;
         if output.is_empty() {
             lines.push(Line::styled(
@@ -2024,7 +2079,9 @@ fn config_item_row(
         ConfigItemRole::Child { is_last: false } => "    ├─ ",
         ConfigItemRole::Child { is_last: true } => "    └─ ",
     };
-    let value = app.config_draft.value(item);
+    let value = app
+        .config_draft
+        .value_with_guard(item, app.output_guard_active());
     let base = if selected {
         Style::default().bg(theme::bg_raised())
     } else {
@@ -2039,6 +2096,7 @@ fn config_item_row(
                     item,
                     app.messages(),
                     app.config_messages(),
+                    app.guard_messages(),
                     app.job_messages(),
                     app.update_messages(),
                 )
@@ -2057,6 +2115,20 @@ fn config_item_row(
                 format!("Enter · {}", app.config_messages().reset_all_label),
                 Style::default()
                     .fg(theme::danger())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if item == ConfigItemId::OutputGuard {
+            Line::styled(
+                format!("Enter · {}", config_value_label(app, item, value)),
+                Style::default()
+                    .fg(config_value_color(value))
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if matches!(value, ConfigValue::GuardedTier(_)) {
+            Line::styled(
+                "Guarded",
+                Style::default()
+                    .fg(theme::warning())
                     .add_modifier(Modifier::BOLD),
             )
         } else {
@@ -2769,6 +2841,7 @@ fn render_narrow(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             app.budget_editor.input
         ),
         Screen::ConfigResetConfirm => app.config_messages().reset_confirm.to_string(),
+        Screen::ConfigOutputGuardConfirm => app.guard_messages().disable_confirm.to_string(),
         Screen::Jobs => app
             .focused_job()
             .map(|job| {
@@ -2939,12 +3012,23 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Screen::ConfigCpuEdit | Screen::ConfigBudgetEdit(_) => {
             vec![app.config_messages().footer_accept, messages.footer_cancel]
         }
-        Screen::ConfigResetConfirm => vec![
+        Screen::ConfigResetConfirm | Screen::ConfigOutputGuardConfirm => vec![
             messages.footer_move,
             messages.footer_select,
             messages.footer_back,
         ],
         Screen::Config => match app.config_cursor.entry().item {
+            ConfigItemId::OutputGuard => vec![
+                messages.footer_move,
+                messages.footer_switch_group,
+                messages.footer_select,
+                messages.footer_cancel,
+            ],
+            ConfigItemId::OutputTier if app.output_guard_active() => vec![
+                messages.footer_move,
+                messages.footer_switch_group,
+                messages.footer_cancel,
+            ],
             ConfigItemId::SearchCpuLimit
             | ConfigItemId::ReadBudget
             | ConfigItemId::GrepBudget
@@ -3132,6 +3216,7 @@ fn localized_check_name<'a>(app: &'a App, name: &'a str) -> &'a str {
         "Codex profile" => "~/.codex",
         "Codex config" => app.messages().menu_config,
         "Applied state" => app.messages().menu_apply,
+        "Provider output guard" => app.guard_messages().label,
         "Installed binary" => "FastCtx",
         "MCP handshake" => "MCP",
         "AGENTS guidance" => "AGENTS.md",
@@ -3146,7 +3231,12 @@ fn config_narrow_summary(app: &App) -> String {
     let messages = app.messages();
     let entry = app.config_cursor.entry();
     let group = config::group_spec(entry.group);
-    let value = config_value_label(app, entry.item, app.config_draft.value(entry.item));
+    let value = config_value_label(
+        app,
+        entry.item,
+        app.config_draft
+            .value_with_guard(entry.item, app.output_guard_active()),
+    );
     match entry.role {
         ConfigItemRole::Parent => format!(
             "{} › {} · {}",
@@ -3160,6 +3250,7 @@ fn config_narrow_summary(app: &App) -> String {
                 entry.item,
                 messages,
                 app.config_messages(),
+                app.guard_messages(),
                 app.job_messages(),
                 app.update_messages(),
             ),
@@ -3177,6 +3268,7 @@ fn config_narrow_summary(app: &App) -> String {
                 group.parent(),
                 messages,
                 app.config_messages(),
+                app.guard_messages(),
                 app.job_messages(),
                 app.update_messages(),
             ),
@@ -3184,6 +3276,7 @@ fn config_narrow_summary(app: &App) -> String {
                 entry.item,
                 messages,
                 app.config_messages(),
+                app.guard_messages(),
                 app.job_messages(),
                 app.update_messages(),
             ),
@@ -3195,8 +3288,9 @@ fn config_narrow_summary(app: &App) -> String {
 fn config_value_label(app: &App, item: ConfigItemId, value: ConfigValue) -> String {
     match value {
         ConfigValue::Tier(tier) => tier.display_name().to_string(),
+        ConfigValue::GuardedTier(_) => "Guarded".to_string(),
         ConfigValue::Budget(budget) => {
-            budget_summary(budget.level, app.config_draft.output.tier.fastctx_budget())
+            budget_summary(budget.level, app.effective_output().fastctx_budget)
         }
         ConfigValue::Toggle(enabled) => toggle_label(app.messages(), enabled).to_string(),
         ConfigValue::Number(value) if item == ConfigItemId::JobStorageLimit => {
@@ -3217,6 +3311,7 @@ fn config_value_label(app: &App, item: ConfigItemId, value: ConfigValue) -> Stri
 fn config_value_color(value: ConfigValue) -> Color {
     match value {
         ConfigValue::Tier(tier) => tier_color(tier),
+        ConfigValue::GuardedTier(_) => theme::warning(),
         // An explicit share is highlighted so the rows somebody has overridden stand apart from
         // the ones that will keep tracking the tier.
         ConfigValue::Budget(budget) if budget.explicit => theme::accent(),
@@ -3912,7 +4007,7 @@ mod tests {
             ),
         ];
 
-        app.config_cursor = ConfigCursor::default().next();
+        app.config_cursor = ConfigCursor::default().next().next();
         for (item, note) in expected {
             assert_eq!(app.config_cursor.entry().item, item);
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -4466,7 +4561,7 @@ mod tests {
             app.settings.language = Some(language.code().to_string());
             app.language = Language::parse(language.code()).unwrap();
             app.screen = Screen::Config;
-            app.config_cursor = ConfigCursor::default().next();
+            app.config_cursor = ConfigCursor::default().next().next();
 
             for (width, height) in [(100, 30), (52, 18), (40, 10), (39, 8)] {
                 let backend = TestBackend::new(width, height);
@@ -4480,6 +4575,7 @@ mod tests {
                         app.messages().config_title,
                         app.messages().extensions_title,
                         app.messages().tier_label,
+                        app.guard_messages().label,
                         "read",
                         "grep",
                         "glob",
@@ -4665,6 +4761,54 @@ mod tests {
     }
 
     #[test]
+    fn guarded_tier_and_disable_warning_render_in_every_language_and_supported_width() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ControlPaths::for_home(temp.path());
+        let executable = temp.path().join("source");
+        std::fs::write(&executable, b"binary").unwrap();
+        let local = crate::control::provider::detect_bytes(Some(
+            b"model_provider='custom'\n[model_providers.custom]\nname='Third Party'\n",
+        ));
+
+        for language in ALL_LANGUAGES {
+            let mut app = App::for_test(paths.clone(), executable.clone());
+            app.settings.language = Some(language.code().to_string());
+            app.language = language;
+            app.provider_detection = local.clone();
+            app.screen = Screen::Config;
+            app.config_cursor = ConfigCursor::default();
+            let backend = TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            for expected in ["Guarded", "10000", "9000"] {
+                assert!(
+                    contains_visible_text(&text, expected),
+                    "{} missing {expected}\n{text}",
+                    language.code()
+                );
+            }
+
+            app.screen = Screen::ConfigOutputGuardConfirm;
+            app.selected = 0;
+            for (width, height) in [(100, 30), (52, 18), (40, 10)] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                let text = buffer_text(&terminal);
+                for expected in ["Guarded", "✕", "✓"] {
+                    assert!(
+                        contains_visible_text(&text, expected),
+                        "{} missing {expected} at {width}x{height}\n{text}",
+                        language.code()
+                    );
+                }
+                assert_eq!(app.selected, 0);
+            }
+        }
+    }
+
+    #[test]
     fn config_viewport_follows_focus_and_keeps_detail_below_the_list() {
         let temp = tempfile::tempdir().unwrap();
         let paths = ControlPaths::for_home(temp.path());
@@ -4677,7 +4821,7 @@ mod tests {
 
         let backend = TestBackend::new(52, 18);
         let mut terminal = Terminal::new(backend).unwrap();
-        app.config_cursor = ConfigCursor::default().next();
+        app.config_cursor = ConfigCursor::default().next().next();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let top = buffer_text(&terminal);
         assert!(contains_visible_text(&top, "read"));
@@ -4685,13 +4829,9 @@ mod tests {
             &top,
             app.messages().config_more_below
         ));
-        assert!(!contains_visible_text(
-            &top,
-            app.messages().config_more_above
-        ));
 
         app.config_cursor = ConfigCursor::default();
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.config_cursor = app.config_cursor.next();
         }
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::RunBudget);

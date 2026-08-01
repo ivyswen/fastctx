@@ -12,9 +12,9 @@ use lopdf::{
 };
 use serde_json::Value;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 pub fn text(response: ToolResponse) -> String {
@@ -69,11 +69,18 @@ pub struct McpSession {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    stderr: Option<ChildStderr>,
     next_id: i64,
 }
 
 impl McpSession {
     pub fn start(mut command: Command) -> Self {
+        if !command
+            .get_envs()
+            .any(|(name, _)| name == "FASTCTX_TEST_RUNTIME_IDLE_MS")
+        {
+            command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", "5000");
+        }
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -81,10 +88,12 @@ impl McpSession {
         let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stderr = child.stderr.take();
         let mut session = Self {
             child: Some(child),
             stdin: Some(stdin),
             stdout,
+            stderr,
             next_id: 1,
         };
         let initialized = session.request(
@@ -115,6 +124,50 @@ impl McpSession {
             "tools/call",
             serde_json::json!({"name": name, "arguments": arguments}),
         )
+    }
+
+    pub fn begin_call(&mut self, name: &str, arguments: Value) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }));
+        id
+    }
+
+    pub fn await_response(&mut self, id: i64) -> Value {
+        loop {
+            let value = self.read();
+            if value["id"].as_i64() == Some(id) {
+                return value;
+            }
+        }
+    }
+
+    pub fn child_id(&self) -> u32 {
+        self.child.as_ref().unwrap().id()
+    }
+
+    pub fn kill_proxy(mut self) -> ExitStatus {
+        self.stdin.take();
+        let mut child = self.child.take().unwrap();
+        let _ = child.kill();
+        child.wait().unwrap()
+    }
+
+    pub fn kill_proxy_with_stderr(mut self) -> (ExitStatus, String) {
+        self.stdin.take();
+        let mut child = self.child.take().unwrap();
+        let _ = child.kill();
+        let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.stderr.take() {
+            pipe.read_to_string(&mut stderr).unwrap();
+        }
+        (status, stderr)
     }
 
     pub fn close(mut self) -> ExitStatus {
