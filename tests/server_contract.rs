@@ -171,10 +171,6 @@ fn server_instructions_follow_the_optional_shell_group() {
             "{instructions}"
         );
         assert!(instructions.contains("replace"), "{instructions}");
-        assert!(
-            instructions.contains("publishes tools, not MCP resources"),
-            "{instructions}"
-        );
         // Hosts render these instructions as the tool namespace's one-line blurb and may keep
         // only the first line and first 250 characters, so anything past that budget is
         // silently dropped. Behavioural rules live in the guidance file instead (2026-07-24).
@@ -184,10 +180,15 @@ fn server_instructions_follow_the_optional_shell_group() {
             "instructions must fit the host namespace-description budget, got {}: {instructions}",
             instructions.chars().count()
         );
+        // Naming a host resource tool, or resources at all, puts it next to this server's name in
+        // every session. 0.2.2 shipped that pairing and users began reporting the very call it
+        // forbade, so the blurb introduces the toolset and says nothing else (2026-08-01).
         for banned_tool in [
             "list_mcp_resources",
             "list_mcp_resource_templates",
             "read_mcp_resource",
+            "MCP resources",
+            "file://",
         ] {
             assert!(!instructions.contains(banned_tool), "{instructions}");
         }
@@ -659,6 +660,7 @@ fn stdio_pdf_call_extracts_one_hashed_engine_and_preserves_image_meta() {
 
 #[test]
 fn stdio_mcp_is_tool_only_lists_tools_and_never_returns_structured_content() {
+    let temp = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_fastctx"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -692,10 +694,8 @@ fn stdio_mcp_is_tool_only_lists_tools_and_never_returns_structured_content() {
         "{initialized}"
     );
     let instructions = initialized["result"]["instructions"].as_str().unwrap();
-    assert!(
-        instructions.contains("publishes tools, not MCP resources"),
-        "{instructions}"
-    );
+    assert!(instructions.contains("Local-file tools"), "{instructions}");
+    assert!(!instructions.contains("MCP resources"), "{instructions}");
     assert!(instructions.chars().count() <= 250, "{instructions}");
     send(
         &mut stdin,
@@ -722,31 +722,54 @@ fn stdio_mcp_is_tool_only_lists_tools_and_never_returns_structured_content() {
     assert!(called["result"].get("structuredContent").is_none());
     assert_eq!(called["result"]["content"][0]["type"], "text");
 
-    // All three resource methods must answer alike. An empty list from the SDK default would
-    // read as "this server does resources and has none", which is the step upstream hosts turn
-    // into a follow-up read of an invented URI (2026-07-24).
-    for (id, method, params) in [
-        (
-            4,
-            "resources/read",
-            serde_json::json!({"uri":"file:///Z:/definitely/missing.txt"}),
-        ),
-        (5, "resources/list", serde_json::json!({})),
-        (6, "resources/templates/list", serde_json::json!({})),
+    // Both discovery methods keep the rmcp default: an empty list, which answers "this server
+    // has none" without failing. Rejecting them instead (0.2.2) made every misrouted call a
+    // failure, and a failed call makes models retry with a different `server` argument rather
+    // than switch tools, which is the chain of invented server names users hit (2026-08-01).
+    for (id, method, key) in [
+        (4, "resources/list", "resources"),
+        (5, "resources/templates/list", "resourceTemplates"),
     ] {
         send(
             &mut stdin,
-            serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":{}}),
+        );
+        let listed = read_response(&mut stdout);
+        assert_eq!(listed["id"], id, "{method}");
+        assert!(listed.get("error").is_none(), "{method}: {listed}");
+        assert_eq!(
+            listed["result"][key].as_array().map(Vec::len),
+            Some(0),
+            "{method}: {listed}"
+        );
+    }
+
+    // `resources/read` stays method-not-found for every URI shape, including one that names a
+    // real readable file. Serving it would build a second file-reading contract outside the
+    // annotated tool surface, and one whose own `Partial` note would name continuation
+    // parameters `resources/read` has no field to carry.
+    let sentinel_body = "d0f4b2e7-sentinel-never-served";
+    let sentinel = temp.path().join("sentinel.txt");
+    write(&sentinel, format!("{sentinel_body}\n"));
+    for (id, uri) in [
+        (6, format!("file:///{}", normalized(&sentinel))),
+        (7, sentinel.to_string_lossy().into_owned()),
+        (8, "file:///Z:/definitely/missing.txt".to_string()),
+    ] {
+        send(
+            &mut stdin,
+            serde_json::json!({
+                "jsonrpc":"2.0","id":id,"method":"resources/read","params":{"uri":&uri}
+            }),
         );
         let rejected = read_response(&mut stdout);
-        assert_eq!(rejected["id"], id, "{method}");
-        assert_eq!(rejected["error"]["code"], -32601, "{method}");
-        assert_eq!(
-            rejected["error"]["message"],
-            "Use mcp__fastctx__read with an absolute file path (not a file:// URI) to read local files, and mcp__fastctx__glob to list paths. FastCtx publishes tools, not MCP resources.",
-            "{method}"
+        assert_eq!(rejected["id"], id, "{uri}");
+        assert_eq!(rejected["error"]["code"], -32601, "{uri}: {rejected}");
+        assert!(rejected.get("result").is_none(), "{uri}: {rejected}");
+        assert!(
+            !rejected.to_string().contains(sentinel_body),
+            "{uri}: {rejected}"
         );
-        assert!(rejected.get("result").is_none(), "{method}");
     }
 
     drop(stdin);

@@ -30,11 +30,6 @@ const FILE_GUIDANCE: &str = concat!(
     "`Partial` — continue only with the exact parameters a `Partial` note\n",
     "provides.\n",
     "\n",
-    "Never point `read_mcp_resource`, `list_mcp_resources`, or\n",
-    "`list_mcp_resource_templates` at the `fastctx` server: FastCtx publishes\n",
-    "tools, not MCP resources, so those calls always fail. Read a local file\n",
-    "with `mcp__fastctx__read` and an absolute path — never a `file://` URI.\n",
-    "\n",
     "### Batch replacement\n",
     "\n",
     "Use `mcp__fastctx__replace` for mechanical find-and-replace across files.\n",
@@ -104,10 +99,6 @@ pub const AGENTS_SECTION: &str = concat!(
     "Pass absolute paths. The last line of every result says `Complete` or\n",
     "`Partial` — continue only with the exact parameters a `Partial` note\n",
     "provides.\n\n",
-    "Never point `read_mcp_resource`, `list_mcp_resources`, or\n",
-    "`list_mcp_resource_templates` at the `fastctx` server: FastCtx publishes\n",
-    "tools, not MCP resources, so those calls always fail. Read a local file\n",
-    "with `mcp__fastctx__read` and an absolute path — never a `file://` URI.\n\n",
     "### Batch replacement\n\n",
     "Use `mcp__fastctx__replace` for mechanical find-and-replace across files.\n",
     "It preserves each file's encoding and line endings, supports dry-run previews,\n",
@@ -419,10 +410,6 @@ mod tests {
             "Pass absolute paths. The last line of every result says `Complete` or\n",
             "`Partial` — continue only with the exact parameters a `Partial` note\n",
             "provides.\n\n",
-            "Never point `read_mcp_resource`, `list_mcp_resources`, or\n",
-            "`list_mcp_resource_templates` at the `fastctx` server: FastCtx publishes\n",
-            "tools, not MCP resources, so those calls always fail. Read a local file\n",
-            "with `mcp__fastctx__read` and an absolute path — never a `file://` URI.\n\n",
             "### Batch replacement\n\n",
             "Use `mcp__fastctx__replace` for mechanical find-and-replace across files.\n",
             "It preserves each file's encoding and line endings, supports dry-run previews,\n",
@@ -508,25 +495,27 @@ mod tests {
         assert!(!section(false).contains("Never pass `apply_patch`"));
     }
 
+    /// 0.2.2 carried a paragraph telling the model never to point `read_mcp_resource` at the
+    /// `fastctx` server, and users on 0.2.2+ then reported that exact call while 0.2.0/0.2.1
+    /// never produced it. In a sentence like that the prohibition is the weakest part and the
+    /// pairing of a host tool the model can reach with our server name is the strongest, and this
+    /// block is the model's only source for that pairing. Keeping the guidance free of those
+    /// names is what stops it from being reintroduced as a "defensive" fix (2026-08-01).
     #[test]
-    fn file_guidance_bans_resource_routing_in_every_tool_combination() {
-        // Hosts publish their generic resource tools whenever any MCP server is configured, so
-        // unlike the apply_patch ban this one has no optional-group scope: it must hold with and
-        // without the shell tools. It lives here rather than in the MCP instructions because
-        // hosts may keep only the first line and first 250 characters of those (2026-07-24).
+    fn file_guidance_never_names_the_hosts_generic_resource_tools() {
         for fastshell in [false, true] {
-            let guidance = section(fastshell).replace('\n', " ");
-            assert!(
-                guidance.contains(
-                    "Never point `read_mcp_resource`, `list_mcp_resources`, or `list_mcp_resource_templates` at the `fastctx` server"
-                ),
-                "{guidance}"
-            );
-            assert!(
-                guidance.contains("FastCtx publishes tools, not MCP resources"),
-                "{guidance}"
-            );
-            assert!(guidance.contains("never a `file://` URI"), "{guidance}");
+            let guidance = section(fastshell);
+            for helper in [
+                "read_mcp_resource",
+                "list_mcp_resources",
+                "list_mcp_resource_templates",
+                "MCP resources",
+                "file://",
+            ] {
+                assert!(!guidance.contains(helper), "{helper}\n{guidance}");
+            }
+            assert!(guidance.contains("prefer the FastCtx MCP"), "{guidance}");
+            assert!(guidance.contains("`mcp__fastctx__read`"), "{guidance}");
         }
     }
 

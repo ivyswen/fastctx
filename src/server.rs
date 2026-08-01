@@ -11,11 +11,7 @@ use crate::server_support::{BudgetRetry, run_blocking, run_blocking_cancellable}
 use crate::shell::FastShell;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{
-    CallToolResult, ErrorCode, ErrorData, Implementation, ListResourceTemplatesResult,
-    ListResourcesResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
-    ServerCapabilities, ServerInfo,
-};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use std::sync::Arc;
@@ -225,52 +221,18 @@ impl ServerHandler for FastCtxServer {
             // has to introduce the toolset within that budget. Behavioural rules belong in
             // the host guidance file, which has no such limit.
             .with_instructions(if self.options.enable_shell {
-                "Local-file tools: read (one file or a batch), grep (content search), glob (find paths), replace (mechanical find-and-replace), plus POSIX-bash shell tools. Pass absolute paths, never file:// URIs. FastCtx publishes tools, not MCP resources."
+                "Local-file tools: read (one file or a batch), grep (content search), glob (find paths), replace (mechanical find-and-replace), plus POSIX-bash shell tools. Pass absolute paths."
             } else {
-                "Local-file tools: read (one file or a batch), grep (content search), glob (find paths), and replace (mechanical find-and-replace). Pass absolute paths, never file:// URIs. FastCtx publishes tools, not MCP resources."
+                "Local-file tools: read (one file or a batch), grep (content search), glob (find paths), and replace (mechanical find-and-replace). Pass absolute paths."
             })
     }
 
-    async fn list_resources(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        Err(not_a_resource_server())
-    }
-
-    async fn list_resource_templates(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Err(not_a_resource_server())
-    }
-
-    async fn read_resource(
-        &self,
-        _request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
-        Err(not_a_resource_server())
-    }
-}
-
-/// Rejection shared by every `resources/*` method, naming the tool that actually does the job.
-///
-/// 2026-07-24: hosts publish generic resource tools for every configured MCP server without
-/// checking whether the server declared the `resources` capability, so these methods are reachable
-/// even though FastCtx never advertises them. The SDK default would answer the two list methods
-/// with an empty array, which reads as "this server does resources and happens to have none" and
-/// invites a follow-up read of an invented URI; one rejection for all three cuts that off at the
-/// first step. Callers arrive holding a `file://` URL, so the recovery names the parameter shape
-/// as well as the tool.
-fn not_a_resource_server() -> ErrorData {
-    ErrorData::new(
-        ErrorCode::METHOD_NOT_FOUND,
-        "Use mcp__fastctx__read with an absolute file path (not a file:// URI) to read local files, and mcp__fastctx__glob to list paths. FastCtx publishes tools, not MCP resources.",
-        None,
-    )
+    // The three `resources/*` methods stay on the rmcp defaults on purpose: both list methods
+    // answer with an empty list, and `resources/read` answers method-not-found. Overriding them
+    // to reject uniformly (added 0.2.2, reverted 2026-08-01) turned "this server has none" into a
+    // failure, and a failed call makes a model retry with a different `server` argument rather
+    // than switch tools — users reported chains of invented server names that the empty list
+    // never produced. Do not reintroduce an override without evidence from a released build.
 }
 
 #[cfg(test)]
