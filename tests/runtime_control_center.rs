@@ -662,15 +662,15 @@ fn thin_proxy_stays_within_a_measured_memory_and_thread_ceiling_after_real_tools
     );
     assert!(mcp_text(&response).starts_with("complete"));
     std::thread::sleep(Duration::from_millis(100));
-    let (private_or_resident_bytes, threads) = process_metrics(session.child_id());
+    let (private_or_proportional_bytes, threads) = process_metrics(session.child_id());
     eprintln!(
-        "thin proxy metrics: {:.2} MiB private/resident, {threads} threads",
-        private_or_resident_bytes as f64 / (1024.0 * 1024.0)
+        "thin proxy metrics: {:.2} MiB private/proportional, {threads} threads",
+        private_or_proportional_bytes as f64 / (1024.0 * 1024.0)
     );
     assert!(
-        private_or_resident_bytes <= 8 * 1024 * 1024,
+        private_or_proportional_bytes <= 8 * 1024 * 1024,
         "thin proxy used {} MiB",
-        private_or_resident_bytes as f64 / (1024.0 * 1024.0)
+        private_or_proportional_bytes as f64 / (1024.0 * 1024.0)
     );
     assert!(threads <= 8, "thin proxy retained {threads} threads");
 
@@ -960,20 +960,23 @@ fn process_metrics(pid: u32) -> (u64, u32) {
 
 #[cfg(target_os = "linux")]
 fn process_metrics(pid: u32) -> (u64, u32) {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
-    let resident_kib = status
+    // RSS charges every shared executable page to every proxy. PSS is the additive Linux
+    // counterpart to the private-memory metric used on Windows. (2026-08-02)
+    let rollup = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).unwrap();
+    let proportional_kib = rollup
         .lines()
         .find_map(|line| {
-            line.strip_prefix("VmRSS:")?
+            line.strip_prefix("Pss:")?
                 .split_whitespace()
                 .next()?
                 .parse::<u64>()
                 .ok()
         })
-        .unwrap();
+        .expect("Linux smaps_rollup must publish proportional set size");
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
     let threads = status
         .lines()
         .find_map(|line| line.strip_prefix("Threads:")?.trim().parse::<u32>().ok())
         .unwrap();
-    (resident_kib * 1024, threads)
+    (proportional_kib * 1024, threads)
 }
