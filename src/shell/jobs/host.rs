@@ -15,7 +15,8 @@ use crate::shell::normalize::{LogNormalizer, NormalizedEvent};
 use crate::shell::process::{exit_code, spawn_bash};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,6 +28,11 @@ enum OutputEvent {
     Normalized(NormalizedEvent),
     Failed(String),
     Finished,
+}
+
+struct OutputEvents {
+    receiver: mpsc::Receiver<OutputEvent>,
+    discard_output: Arc<AtomicBool>,
 }
 
 /// Launches a detached supervisor and waits only until its process tree and immutable metadata exist.
@@ -347,6 +353,7 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
                 &mut had_loss,
                 &mut capture_error,
             );
+            events.discard_output.store(true, Ordering::Release);
         }
 
         match process.try_wait() {
@@ -479,10 +486,12 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
 
 fn spawn_reader(
     mut output: impl Read + Send + 'static,
-) -> (mpsc::Receiver<OutputEvent>, std::thread::JoinHandle<()>) {
+) -> (OutputEvents, std::thread::JoinHandle<()>) {
     // Backpressure keeps an arbitrarily chatty command bounded by the pipe and
     // disk writer instead of accumulating its full output in supervisor memory.
     let (sender, receiver) = mpsc::sync_channel(OUTPUT_EVENT_QUEUE);
+    let discard_output = Arc::new(AtomicBool::new(false));
+    let reader_discard = Arc::clone(&discard_output);
     let reader = std::thread::spawn(move || {
         let mut normalizer = LogNormalizer::new();
         let mut buffer = [0_u8; 16 * 1024];
@@ -490,10 +499,12 @@ fn spawn_reader(
             let read = match output.read(&mut buffer) {
                 Ok(read) => read,
                 Err(error) => {
-                    let mut events = Vec::new();
-                    normalizer.finish(&mut events);
-                    if !send_normalized_events(&sender, events) {
-                        return;
+                    if !reader_discard.load(Ordering::Acquire) {
+                        let mut events = Vec::new();
+                        normalizer.finish(&mut events);
+                        if !send_normalized_events(&sender, events, &reader_discard) {
+                            return;
+                        }
                     }
                     let _ = sender.send(OutputEvent::Failed(format!(
                         "cannot read the merged command output: {error}"
@@ -504,33 +515,51 @@ fn spawn_reader(
             if read == 0 {
                 break;
             }
+            if reader_discard.load(Ordering::Acquire) {
+                continue;
+            }
             let mut events = Vec::new();
             normalizer.push(&buffer[..read], &mut events);
-            if !send_normalized_events(&sender, events) {
+            if !send_normalized_events(&sender, events, &reader_discard) {
                 return;
             }
         }
-        let mut events = Vec::new();
-        normalizer.finish(&mut events);
-        if !send_normalized_events(&sender, events) {
-            return;
+        if !reader_discard.load(Ordering::Acquire) {
+            let mut events = Vec::new();
+            normalizer.finish(&mut events);
+            if !send_normalized_events(&sender, events, &reader_discard) {
+                return;
+            }
         }
         let _ = sender.send(OutputEvent::Finished);
     });
-    (receiver, reader)
+    (
+        OutputEvents {
+            receiver,
+            discard_output,
+        },
+        reader,
+    )
 }
 
 fn send_normalized_events(
     sender: &mpsc::SyncSender<OutputEvent>,
     events: Vec<NormalizedEvent>,
+    discard_output: &AtomicBool,
 ) -> bool {
-    events
-        .into_iter()
-        .all(|event| sender.send(OutputEvent::Normalized(event)).is_ok())
+    for event in events {
+        if discard_output.load(Ordering::Acquire) {
+            return true;
+        }
+        if sender.send(OutputEvent::Normalized(event)).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 fn drain_output_events(
-    events: &mpsc::Receiver<OutputEvent>,
+    events: &OutputEvents,
     directory: &std::path::Path,
     log: &mut Option<OutputLogWriter>,
     total_lines: &mut u64,
@@ -538,7 +567,7 @@ fn drain_output_events(
     capture_error: &mut Option<CaptureErrorRecord>,
     output_truncation: &mut Option<OutputTruncationRecord>,
 ) {
-    while let Ok(event) = events.try_recv() {
+    while let Ok(event) = events.receiver.try_recv() {
         match event {
             OutputEvent::Normalized(event) => {
                 if let Some(writer) = log.as_mut() {
@@ -554,6 +583,11 @@ fn drain_output_events(
                             capture_error,
                         ),
                     }
+                }
+                if log.is_none() || log.as_ref().is_some_and(OutputLogWriter::quota_exceeded) {
+                    // Keep draining the OS pipe, but stop allocating and sending one event per
+                    // discarded line once the immutable output prefix is sealed.
+                    events.discard_output.store(true, Ordering::Release);
                 }
                 if output_truncation.is_none()
                     && let Some(writer) = log.as_ref().filter(|writer| writer.quota_exceeded())
@@ -581,7 +615,8 @@ fn drain_output_events(
                 }
             }
             OutputEvent::Failed(error) => {
-                capture_failure(directory, log, total_lines, error, had_loss, capture_error)
+                capture_failure(directory, log, total_lines, error, had_loss, capture_error);
+                events.discard_output.store(true, Ordering::Release);
             }
             OutputEvent::Finished => {}
         }

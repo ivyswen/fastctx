@@ -15,6 +15,11 @@ pub(super) fn runtime_component(component: &str) -> PathBuf {
     )
 }
 
+pub(super) fn short_control_center_directory() -> PathBuf {
+    let uid = unsafe { libc::geteuid() };
+    PathBuf::from("/tmp").join(format!("fastctx-engine-{uid}"))
+}
+
 fn resolve_runtime_component(
     component: &str,
     xdg_runtime_dir: Option<OsString>,

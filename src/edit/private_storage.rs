@@ -24,6 +24,11 @@ pub(crate) fn control_center_directory() -> PathBuf {
     runtime_component("engine")
 }
 
+#[cfg(unix)]
+pub(crate) fn short_control_center_directory() -> PathBuf {
+    unix::short_control_center_directory()
+}
+
 #[cfg(windows)]
 pub(crate) use windows::PrivateSecurityDescriptor;
 

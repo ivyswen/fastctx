@@ -31,6 +31,8 @@ const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const SERVICE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(unix)]
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 
 /// Captures the thin proxy's native state without loading settings or any heavy executor.
 pub(crate) fn capture_proxy_environment() -> Result<SessionEnvironment, String> {
@@ -144,19 +146,47 @@ fn endpoint_for(environment: &SessionEnvironment) -> Result<LocalEndpoint, Strin
     let home_hash = short_hash(&crate::session::native_bytes(&home), 12);
     let build_id = effective_build_id(environment);
     let id = format!("fastctx-engine-{home_hash}-{build_id}");
-    let runtime_directory = crate::edit::private_storage::control_center_directory();
+    let preferred_runtime_directory = crate::edit::private_storage::control_center_directory();
     #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let socket_length = runtime_directory.as_os_str().as_bytes().len() + id.len() + 7;
-        if socket_length > 100 {
-            return Err(format!(
-                "The private control-center socket path is too long ({socket_length} bytes): {}",
-                crate::paths::display_path(&runtime_directory.join(format!("{id}.sock")))
-            ));
-        }
-    }
+    let runtime_directory = select_unix_runtime_directory(
+        preferred_runtime_directory,
+        crate::edit::private_storage::short_control_center_directory(),
+        &id,
+    )?;
+    #[cfg(not(unix))]
+    let runtime_directory = preferred_runtime_directory;
     Ok(LocalEndpoint::new(runtime_directory, id))
+}
+
+#[cfg(unix)]
+fn select_unix_runtime_directory(
+    preferred: std::path::PathBuf,
+    fallback: std::path::PathBuf,
+    id: &str,
+) -> Result<std::path::PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let socket_length = |directory: &Path| {
+        directory
+            .join(format!("{id}.sock"))
+            .as_os_str()
+            .as_bytes()
+            .len()
+            .saturating_add(1)
+    };
+    if socket_length(&preferred) <= MAX_UNIX_SOCKET_PATH_BYTES {
+        return Ok(preferred);
+    }
+    // Darwin's per-user temporary directory can already consume most of sockaddr_un::sun_path.
+    // Keep the endpoint and both ownership locks together in an owner-only short directory.
+    let fallback_length = socket_length(&fallback);
+    if fallback_length <= MAX_UNIX_SOCKET_PATH_BYTES {
+        return Ok(fallback);
+    }
+    Err(format!(
+        "The private control-center socket path is too long ({fallback_length} bytes): {}",
+        crate::paths::display_path(&fallback.join(format!("{id}.sock")))
+    ))
 }
 
 fn short_hash(bytes: &[u8], characters: usize) -> String {
@@ -719,5 +749,22 @@ mod tests {
     fn endpoint_hashes_are_stable_and_separate_inputs() {
         assert_eq!(short_hash(b"home-a", 12), short_hash(b"home-a", 12));
         assert_ne!(short_hash(b"home-a", 12), short_hash(b"home-b", 12));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_unix_runtime_paths_fall_back_to_the_short_private_directory() {
+        use super::select_unix_runtime_directory;
+        use std::path::PathBuf;
+
+        let preferred = PathBuf::from("/").join("long".repeat(30));
+        let fallback = PathBuf::from("/tmp/fastctx-engine-1000");
+        let selected = select_unix_runtime_directory(
+            preferred,
+            fallback.clone(),
+            "fastctx-engine-0123456789ab-0123456789abcdef",
+        )
+        .unwrap();
+        assert_eq!(selected, fallback);
     }
 }
