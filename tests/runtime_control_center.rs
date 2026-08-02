@@ -29,13 +29,21 @@ fn unavailable_control_center_falls_back_before_stdin_is_consumed_and_reports_it
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(workspace.join("visible.txt"), "fallback\n").unwrap();
     let event_log = temp.path().join("runtime-events.log");
+    #[cfg(windows)]
     let blocked_runtime = temp.path().join("runtime-is-a-file");
+    #[cfg(unix)]
+    // Keep this below sun_path limits so the test reaches the blocked-runtime failure. (2026-08-02)
+    let blocked_runtime = tempfile::Builder::new()
+        .prefix("fctx-blocked-")
+        .tempfile_in("/tmp")
+        .unwrap();
+    #[cfg(windows)]
     std::fs::write(&blocked_runtime, "blocked").unwrap();
     let mut command = server_command(&home, &workspace, &event_log);
     #[cfg(windows)]
     command.env("LOCALAPPDATA", &blocked_runtime);
     #[cfg(unix)]
-    command.env("XDG_RUNTIME_DIR", &blocked_runtime);
+    command.env("XDG_RUNTIME_DIR", blocked_runtime.path());
 
     let mut session = McpSession::start(command);
     let response = session.call("glob", serde_json::json!({"pattern": "**/*.txt"}));
