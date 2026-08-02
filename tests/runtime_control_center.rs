@@ -1,3 +1,12 @@
+//! Control-center runtime contracts.
+//!
+//! The whole suite rests on the `FASTCTX_TEST_*` runtime hooks — the idle-timeout override, the
+//! build-id override that isolates endpoints, and the host start event log. All three are
+//! `debug_assertions`-only, so in a release build every test here would probe a control center it
+//! can neither isolate nor observe. The contracts are opt-level independent, so they are covered
+//! once, in debug, rather than by promoting the hooks to production environment switches.
+#![cfg(debug_assertions)]
+
 mod common;
 
 use common::{McpSession, mcp_text, normalized};

@@ -9,12 +9,10 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
-/// Spawns the MCP binary with the short control-center idle timeout shared by the test tree.
-/// A host that outlives its suite keeps the test binary open on Windows, so the next `cargo test`
-/// invocation cannot relink it.
+/// Spawns the MCP binary with the control-center idle timeout shared by the test tree.
 fn fastctx_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
-    command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", "5000");
+    command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", common::TEST_HOST_IDLE_MS);
     command
 }
 
@@ -1016,6 +1014,10 @@ fn stdio_pdf_text_mode_uses_the_read_specific_page_budget() {
 
 #[test]
 #[cfg(feature = "pdf")]
+// Repair only happens on a control center that has not already released the engine, so each half
+// of this test needs a private one. `FASTCTX_TEST_BUILD_ID` is the only way to get that, and it is
+// debug-only: in a release build both halves share one host and the second never re-extracts.
+#[cfg(debug_assertions)]
 fn stdio_pdf_call_repairs_a_corrupted_cached_engine() {
     let temp = tempfile::tempdir().unwrap();
     let pdf = temp.path().join("page.pdf");
