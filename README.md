@@ -374,53 +374,6 @@ default_tools_approval_mode = "writes"
 
 `replace` is published with the default file tools. The host's read-only mode covers the host's own tools. MCP writes still run with the server process permissions. Set `writes` or `prompt` when the workflow depends on a read-only boundary.
 
-## Codex configuration
-
-Codex code mode places regular MCP tools inside an execution container. Aggregated results from multiple calls can be truncated in the middle by the host. This setting keeps FastCtx as a direct top-level namespace:
-
-```toml
-[features.code_mode]
-direct_only_tool_namespaces = ["mcp__fastctx"]
-```
-
-Apply maintains this setting automatically and writes a guidance block with explicit markers to `~/.codex/AGENTS.md`. The guidance scopes FastCtx to local-file reading, searching, and finding, tells the model to read only what the task needs, and directs several known files into one `files=[...]` read call.
-
-The control terminal provides three output tiers. Each keeps FastCtx's internal budget at 90% of the host limit so responses close before Codex can truncate their terminal status:
-
-- `Compact`: host limit 20,000; FastCtx budget 18,000;
-- `Standard`: the default, with host limit 60,000 and FastCtx budget 54,000;
-- `High`: host limit 100,000; FastCtx budget 90,000.
-
-Higher output tiers allow larger results per call and consume context faster. Choose a tier according to the task.
-
-Provider output protection is enabled by default. FastCtx reads only Codex's visible `config.toml` and follows Codex's own remote-compaction classification: OpenAI and Azure keep the selected tier, while a resolved provider that uses local inline compaction activates **Guarded** limits of 10,000 host tokens and a 9,000-token FastCtx budget. Guarded locks the tier selector without overwriting the saved tier, so switching back to a remote-compaction provider restores the preference automatically; all five per-tool percentages remain adjustable. The control terminal requires a warning confirmation before protection can be disabled. `fastctx status` reports active protection, unknown provider configurations, and provider changes that need another Apply.
-
-Only `read` grows with the tier; the other four long-output tools keep a share sized for what they actually need, so raising the tier buys packing capacity for multi-file reads rather than inflating every result. Each tool's share can be set to any whole percentage in the control terminal, and a share left alone follows the tier.
-
-<details>
-<summary>Manual MCP registration</summary>
-
-```toml
-[mcp_servers.fastctx]
-command = "C:/absolute/path/to/fastctx.exe"
-args = ["serve"]
-startup_timeout_sec = 120
-tool_timeout_sec = 300
-
-[features.code_mode]
-direct_only_tool_namespaces = ["mcp__fastctx"]
-```
-
-Enable the Bash tools with:
-
-```toml
-args = ["serve", "--enable-shell"]
-```
-
-When the binary is on PATH, `command` can be set to `fastctx`. The compatibility npm package `codex-fastctx` installs the same `fastctx` command.
-
-</details>
-
 ## What FastCtx changes
 
 FastCtx uses or manages these paths and settings:

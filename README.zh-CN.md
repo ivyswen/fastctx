@@ -368,51 +368,6 @@ default_tools_approval_mode = "writes"
 
 `replace` 默认随文件工具发布。宿主的 read-only 模式只覆盖宿主自身工具，MCP 写入仍按 server 权限执行。依赖只读边界时，请同时设置 `writes` 或 `prompt`。
 
-## Codex 配置说明
-
-Codex code mode 会把普通 MCP 工具放入执行容器，多次调用的聚合结果可能被宿主从中间截断。下面的配置让 FastCtx 保持顶层直达：
-
-```toml
-[features.code_mode]
-direct_only_tool_namespaces = ["mcp__fastctx"]
-```
-
-Apply 会自动维护这一项，并在 `~/.codex/AGENTS.md` 中写入带边界标记的引导段。该引导把 FastCtx 的使用范围限定为本地文件读取、搜索和查找，要求只读任务真正需要的内容，并让多个已知文件进入一次 `files=[...]` read 调用。
-
-控制终端提供三个输出档位。每档的 FastCtx 内部预算都保持为宿主上限的 90%，让响应在 Codex 截断终态之前主动收口：
-
-- `Compact`：宿主上限 20000，FastCtx 预算 18000；
-- `Standard`：默认档，宿主上限 60000，FastCtx 预算 54000；
-- `High`：宿主上限 100000，FastCtx 预算 90000。
-
-随档位增长的只有 `read`；其余四个长输出工具各自保持一个够用的比例，因此升档买到的是多文件读取的装箱容量，而不是让每种结果一起膨胀。每个工具的比例都可以在控制终端里设成任意整数百分比，没动过的比例跟随档位。
-
-输出档位越高，单次结果越大，上下文消耗也越快。请按任务实际需要调整。
-
-<details>
-<summary>手动注册 MCP</summary>
-
-```toml
-[mcp_servers.fastctx]
-command = "C:/absolute/path/to/fastctx.exe"
-args = ["serve"]
-startup_timeout_sec = 120
-tool_timeout_sec = 300
-
-[features.code_mode]
-direct_only_tool_namespaces = ["mcp__fastctx"]
-```
-
-启用 Bash 工具时：
-
-```toml
-args = ["serve", "--enable-shell"]
-```
-
-二进制位于 PATH 时，`command` 可以直接填写 `fastctx`。兼容 npm 包 `codex-fastctx` 安装同一个 `fastctx` 命令。
-
-</details>
-
 ## FastCtx 会修改什么
 
 FastCtx 使用或管理以下内容：
