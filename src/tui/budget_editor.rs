@@ -1,9 +1,8 @@
 //! Free-form percentage entry for the five per-tool output budgets.
 //!
-//! Arrow keys nudge a share by one point, which covers correcting a value in view. Reaching an
-//! arbitrary share that way would take dozens of keystrokes, so this editor accepts the number
-//! directly — and accepts `auto` to hand the tool back to its tier default, which is otherwise
-//! unreachable once an explicit share exists.
+//! Arrow keys walk the coarse quarter stops, which covers picking a share by feel; landing on an
+//! arbitrary share needs the number typed directly. Typing is all this editor does — `automatic`
+//! is a stop on the arrow-key cycle, not a word anyone has to know to spell.
 
 use crate::control::settings::ToolBudgetLevel;
 
@@ -21,24 +20,20 @@ pub(crate) struct BudgetEditor {
 pub(crate) enum ToolBudgetInputError {
     /// The field was submitted with nothing in it.
     Empty,
-    /// The text is neither `auto` nor a whole number.
+    /// The text is not a whole number.
     NotInteger,
     /// The number parsed but falls outside `1..=100`.
     OutOfRange,
 }
 
-/// Parses a submitted value.
+/// Parses a submitted share.
 ///
-/// `auto` returns the tool to its tier default; an empty edit is rejected rather than silently
-/// treated as `auto`, because the two mean different things and a stray Enter should not
-/// discard an explicit share.
-pub(crate) fn parse_input(input: &str) -> Result<Option<ToolBudgetLevel>, ToolBudgetInputError> {
+/// An empty edit is rejected rather than silently standing in for some other value: a stray Enter
+/// should not discard an explicit share.
+pub(crate) fn parse_input(input: &str) -> Result<ToolBudgetLevel, ToolBudgetInputError> {
     let input = input.trim();
     if input.is_empty() {
         return Err(ToolBudgetInputError::Empty);
-    }
-    if input.eq_ignore_ascii_case("auto") {
-        return Ok(None);
     }
     let digits = input.strip_suffix('%').unwrap_or(input).trim();
     let percent = digits
@@ -47,7 +42,6 @@ pub(crate) fn parse_input(input: &str) -> Result<Option<ToolBudgetLevel>, ToolBu
     u8::try_from(percent)
         .ok()
         .and_then(ToolBudgetLevel::from_percent)
-        .map(Some)
         .ok_or(ToolBudgetInputError::OutOfRange)
 }
 
@@ -58,25 +52,27 @@ mod tests {
 
     #[test]
     fn accepts_bare_percentages_and_the_ui_spelling() {
-        assert_eq!(parse_input("20"), Ok(Some(ToolBudgetLevel::Percent(20))));
-        assert_eq!(
-            parse_input(" 20 % "),
-            Ok(Some(ToolBudgetLevel::Percent(20)))
-        );
-        assert_eq!(parse_input("1"), Ok(Some(ToolBudgetLevel::Percent(1))));
+        assert_eq!(parse_input("20"), Ok(ToolBudgetLevel::Percent(20)));
+        assert_eq!(parse_input(" 20 % "), Ok(ToolBudgetLevel::Percent(20)));
+        assert_eq!(parse_input("1"), Ok(ToolBudgetLevel::Percent(1)));
     }
 
     #[test]
     fn a_full_share_normalizes_to_inheritance() {
         // 100% and "omit the per-tool variable" are the same configuration; keeping two
         // representations would let the same setting round-trip into different files.
-        assert_eq!(parse_input("100"), Ok(Some(ToolBudgetLevel::Inherit)));
+        assert_eq!(parse_input("100"), Ok(ToolBudgetLevel::Inherit));
     }
 
     #[test]
-    fn auto_clears_the_override_and_empty_does_not() {
-        assert_eq!(parse_input("auto"), Ok(None));
-        assert_eq!(parse_input("AUTO"), Ok(None));
+    fn the_editor_has_no_magic_word_for_automatic() {
+        // Automatic is reachable by arrow key, so the editor treats the word as the typo it is
+        // rather than quietly discarding an explicit share for whoever spelled a number wrong.
+        assert_eq!(parse_input("auto"), Err(ToolBudgetInputError::NotInteger));
+        assert_eq!(
+            parse_input("automatic"),
+            Err(ToolBudgetInputError::NotInteger)
+        );
         assert_eq!(parse_input(""), Err(ToolBudgetInputError::Empty));
         assert_eq!(parse_input("   "), Err(ToolBudgetInputError::Empty));
     }

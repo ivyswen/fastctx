@@ -14,10 +14,12 @@ use crate::tui::update::UpdateMessages;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ConfigGroupId {
     Output,
+    Guard,
     Extensions,
     Search,
     Update,
     Reset,
+    Save,
 }
 
 /// Stable identifier for an adjustable item within a configuration group.
@@ -38,6 +40,7 @@ pub(crate) enum ConfigItemId {
     UpdateAutoCheck,
     UpdateSource,
     ResetAll,
+    SaveAll,
 }
 
 /// Parent or child role of a configuration item within its group.
@@ -54,6 +57,8 @@ pub(crate) struct ConfigGroupSpec {
     parent: ConfigItemId,
     children: &'static [ConfigItemId],
     standalone_items: bool,
+    /// Whether this group sits outside the scrolling list, rendered in its own fixed area.
+    pinned: bool,
 }
 
 impl ConfigGroupSpec {
@@ -77,6 +82,11 @@ impl ConfigGroupSpec {
         self.standalone_items
     }
 
+    /// Whether this group renders outside the scrolling list rather than within it.
+    pub(crate) const fn pinned(self) -> bool {
+        self.pinned
+    }
+
     const fn item_count(self) -> usize {
         1 + self.children.len()
     }
@@ -90,8 +100,7 @@ impl ConfigGroupSpec {
     }
 }
 
-const OUTPUT_CHILDREN: [ConfigItemId; 6] = [
-    ConfigItemId::OutputGuard,
+const OUTPUT_CHILDREN: [ConfigItemId; 5] = [
     ConfigItemId::ReadBudget,
     ConfigItemId::GrepBudget,
     ConfigItemId::GlobBudget,
@@ -107,36 +116,59 @@ const EXTENSION_CHILDREN: [ConfigItemId; 3] = [
 
 const UPDATE_CHILDREN: [ConfigItemId; 1] = [ConfigItemId::UpdateSource];
 
-const CONFIG_GROUPS: [ConfigGroupSpec; 5] = [
+const CONFIG_GROUPS: [ConfigGroupSpec; 7] = [
     ConfigGroupSpec {
         id: ConfigGroupId::Output,
         parent: ConfigItemId::OutputTier,
         children: &OUTPUT_CHILDREN,
         standalone_items: false,
+        pinned: false,
+    },
+    // The provider guard is its own section rather than an output child: it is not another
+    // budget knob but a compatibility protection that overrides the whole output group.
+    ConfigGroupSpec {
+        id: ConfigGroupId::Guard,
+        parent: ConfigItemId::OutputGuard,
+        children: &[],
+        standalone_items: true,
+        pinned: false,
     },
     ConfigGroupSpec {
         id: ConfigGroupId::Extensions,
         parent: ConfigItemId::FastShell,
         children: &EXTENSION_CHILDREN,
         standalone_items: true,
+        pinned: false,
     },
     ConfigGroupSpec {
         id: ConfigGroupId::Search,
         parent: ConfigItemId::SearchCpuLimit,
         children: &[],
         standalone_items: true,
+        pinned: false,
     },
     ConfigGroupSpec {
         id: ConfigGroupId::Update,
         parent: ConfigItemId::UpdateAutoCheck,
         children: &UPDATE_CHILDREN,
         standalone_items: true,
+        pinned: false,
     },
     ConfigGroupSpec {
         id: ConfigGroupId::Reset,
         parent: ConfigItemId::ResetAll,
         children: &[],
         standalone_items: true,
+        pinned: false,
+    },
+    // Save is pinned below the list rather than scrolling with it: the one action that ends the
+    // editing session must never be somewhere the reader has to scroll to find.
+    ConfigGroupSpec {
+        id: ConfigGroupId::Save,
+        parent: ConfigItemId::SaveAll,
+        children: &[],
+        standalone_items: true,
+        pinned: true,
     },
 ];
 
@@ -154,20 +186,24 @@ pub(crate) fn group_spec(group: ConfigGroupId) -> ConfigGroupSpec {
         .expect("every config entry belongs to a declared group")
 }
 
-/// Configuration-group title.
+/// Configuration-group title, or `None` for a group that renders without a heading.
 pub(crate) fn group_title(
     group: ConfigGroupId,
     messages: &Messages,
     config_messages: &ConfigMessages,
+    guard_messages: &GuardMessages,
     updates: &UpdateMessages,
-) -> &'static str {
-    match group {
+) -> Option<&'static str> {
+    Some(match group {
         ConfigGroupId::Output => messages.config_title,
+        ConfigGroupId::Guard => guard_messages.section_title,
         ConfigGroupId::Extensions => messages.extensions_title,
         ConfigGroupId::Search => config_messages.search_group_title,
         ConfigGroupId::Update => updates.page_title,
         ConfigGroupId::Reset => config_messages.reset_group_title,
-    }
+        // The save button already says what it is; a heading above it would only repeat it.
+        ConfigGroupId::Save => return None,
+    })
 }
 
 /// Configuration-item label; tool identifiers remain English by contract.
@@ -195,6 +231,7 @@ pub(crate) fn item_label(
         ConfigItemId::UpdateAutoCheck => updates.auto_check_label,
         ConfigItemId::UpdateSource => updates.source_label,
         ConfigItemId::ResetAll => config_messages.reset_all_label,
+        ConfigItemId::SaveAll => config_messages.save_all_label,
     }
 }
 
@@ -307,9 +344,12 @@ pub(crate) enum ConfigListRow {
 }
 
 /// Expands group titles and items in UI order for a shared viewport/rendering row model.
+///
+/// Pinned groups are absent: they render in their own area, so putting them here would draw them
+/// twice and let the viewport scroll something that is supposed to stay put.
 pub(crate) fn list_rows() -> Vec<ConfigListRow> {
     let mut rows = Vec::new();
-    for group in groups() {
+    for group in groups().iter().filter(|group| !group.pinned()) {
         rows.push(ConfigListRow::Group(group.id()));
         rows.push(ConfigListRow::Item(ConfigEntry {
             group: group.id(),
@@ -333,13 +373,36 @@ pub(crate) fn list_rows() -> Vec<ConfigListRow> {
     rows
 }
 
-/// Row index of the current focus in the flattened list.
-pub(crate) fn focused_row(cursor: ConfigCursor) -> usize {
+/// Every focusable item in UI order, pinned groups included.
+pub(crate) fn all_items() -> impl Iterator<Item = ConfigItemId> {
+    groups()
+        .iter()
+        .flat_map(|group| std::iter::once(group.parent()).chain(group.children().iter().copied()))
+}
+
+/// Cursor pointing at one item by identity.
+///
+/// Anything that needs to reach a specific setting goes through here rather than walking to it by
+/// position. A relative path breaks every time an unrelated item is added elsewhere in the list,
+/// which turns an ordinary addition into a wall of red that says nothing about it.
+#[cfg(test)]
+pub(crate) fn cursor_for(item: ConfigItemId) -> ConfigCursor {
+    let mut cursor = ConfigCursor::default();
+    for _ in 0..all_items().count() {
+        if cursor.entry().item == item {
+            return cursor;
+        }
+        cursor = cursor.next();
+    }
+    panic!("{item:?} is not reachable from the default cursor");
+}
+
+/// Row index of the current focus in the flattened list, or `None` while a pinned item has focus.
+pub(crate) fn focused_row(cursor: ConfigCursor) -> Option<usize> {
     let focused = cursor.entry();
     list_rows()
         .iter()
         .position(|row| matches!(row, ConfigListRow::Item(entry) if *entry == focused))
-        .expect("the config cursor always points at a declared item")
 }
 
 /// Bounded configuration viewport whose offset names the first real row, excluding more-markers.
@@ -369,7 +432,11 @@ impl ConfigViewport {
             self.offset = 0;
             return ConfigViewportWindow::default();
         }
-        let focused = focused_row(cursor).min(total_rows - 1);
+        // Focus on a pinned item anchors the list at its end: the reader walked off the bottom to
+        // get there, so the rows they just left are the ones that should stay on screen.
+        let focused = focused_row(cursor)
+            .unwrap_or(total_rows - 1)
+            .min(total_rows - 1);
         let mut best: Option<(usize, usize, usize, ConfigViewportWindow)> = None;
 
         for start in 0..=focused {
@@ -585,7 +652,23 @@ impl ConfigDraft {
             ConfigItemId::SearchCpuLimit => ConfigValue::CpuLimit(self.search_max_cpu_cores),
             ConfigItemId::UpdateAutoCheck => ConfigValue::Toggle(self.update_auto_check),
             ConfigItemId::UpdateSource => ConfigValue::Source(self.update_source),
-            ConfigItemId::ResetAll => ConfigValue::Action,
+            ConfigItemId::ResetAll | ConfigItemId::SaveAll => ConfigValue::Action,
+        }
+    }
+
+    /// Whether this item alone carries an edit the saved settings do not have yet.
+    pub(crate) fn item_changed(self, saved: Self, item: ConfigItemId, guarded: bool) -> bool {
+        match item {
+            // A share that follows the tier is not itself edited when the tier moves, even though
+            // the numbers it resolves to move with it. Compare what a save would write.
+            ConfigItemId::ReadBudget
+            | ConfigItemId::GrepBudget
+            | ConfigItemId::GlobBudget
+            | ConfigItemId::RunBudget
+            | ConfigItemId::JobOutputBudget => {
+                self.output.budget_override(item) != saved.output.budget_override(item)
+            }
+            _ => self.value_with_guard(item, guarded) != saved.value_with_guard(item, guarded),
         }
     }
 
@@ -610,7 +693,7 @@ impl ConfigDraft {
             | ConfigItemId::GrepBudget
             | ConfigItemId::GlobBudget
             | ConfigItemId::RunBudget
-            | ConfigItemId::JobOutputBudget => self.step_budget(item, forward, guarded),
+            | ConfigItemId::JobOutputBudget => self.cycle_budget(item, forward),
             ConfigItemId::FastShell => self.fastshell_enabled = !self.fastshell_enabled,
             ConfigItemId::JobStorageLimit => {
                 cycle_preset(
@@ -638,7 +721,7 @@ impl ConfigDraft {
                     self.update_source.previous()
                 };
             }
-            ConfigItemId::ResetAll => {}
+            ConfigItemId::ResetAll | ConfigItemId::SaveAll => {}
         }
     }
 
@@ -674,10 +757,45 @@ impl ConfigDraft {
         draft.output.budget_value(item, guarded)
     }
 
-    /// Nudges one budget by a single percentage point, which also makes it an explicit override.
-    fn step_budget(&mut self, item: ConfigItemId, forward: bool, guarded: bool) {
-        let stepped = self.output.budget_value(item, guarded).level.step(forward);
-        self.set_tool_budget(item, Some(stepped));
+    /// Moves one budget to the next coarse stop on the arrow-key cycle.
+    fn cycle_budget(&mut self, item: ConfigItemId, forward: bool) {
+        let stepped = cycle_budget_stop(self.output.budget_override(item), forward);
+        self.set_tool_budget(item, stepped);
+    }
+}
+
+/// Coarse stops the arrow keys walk. Single-point precision belongs in the editor: reaching an
+/// arbitrary share by arrow key took dozens of presses, and the four quarters are what anyone
+/// picking a share by feel actually wants.
+const BUDGET_STOPS: [u8; 4] = [25, 50, 75, 100];
+
+/// Advances a stored override to its neighbouring stop, where `None` is `auto`.
+///
+/// An off-grid share entered in the editor snaps to the stop it is heading towards rather than
+/// jumping to a fixed end, so an arrow key never undoes more of a deliberate value than the one
+/// press implies. `auto` sits past the full share, which is also where running off either end of
+/// the grid lands — that is what closes the cycle.
+fn cycle_budget_stop(current: Option<ToolBudgetLevel>, forward: bool) -> Option<ToolBudgetLevel> {
+    let stop = |percent: u8| {
+        ToolBudgetLevel::from_percent(percent).expect("every budget stop is a legal share")
+    };
+    let Some(level) = current else {
+        return Some(stop(if forward { BUDGET_STOPS[0] } else { 100 }));
+    };
+    let percent = level.percent();
+    if forward {
+        BUDGET_STOPS
+            .iter()
+            .copied()
+            .find(|candidate| *candidate > percent)
+            .map(stop)
+    } else {
+        BUDGET_STOPS
+            .iter()
+            .copied()
+            .rev()
+            .find(|candidate| *candidate < percent)
+            .map(stop)
     }
 }
 
@@ -727,20 +845,92 @@ fn cycle_cpu_limit(value: &mut Option<i64>, maximum: usize, forward: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigCursor, ConfigDraft, ConfigGroupId, ConfigGroupSpec, ConfigItemId, ConfigItemRole,
-        ConfigViewport, OUTPUT_CHILDREN, list_rows,
+        ConfigCursor, ConfigDraft, ConfigEntry, ConfigGroupId, ConfigGroupSpec, ConfigItemId,
+        ConfigItemRole, ConfigListRow, ConfigViewport, OUTPUT_CHILDREN, list_rows,
     };
-    use crate::control::settings::FastCtxSettings;
+    use crate::control::settings::{FastCtxSettings, ToolBudgetLevel};
+
+    /// The arrow keys are the coarse control: four quarters plus automatic, the one stop that
+    /// hands a share back to the tier now that no keyword does.
+    #[test]
+    fn budget_arrows_walk_quarter_stops_and_close_the_cycle_through_automatic() {
+        let settings = FastCtxSettings::default();
+        let mut draft = ConfigDraft::from_settings(&settings);
+        let item = ConfigItemId::GrepBudget;
+        assert_eq!(draft.output.budget_override(item), None);
+        for expected in [
+            Some(ToolBudgetLevel::Percent(25)),
+            Some(ToolBudgetLevel::Percent(50)),
+            Some(ToolBudgetLevel::Percent(75)),
+            Some(ToolBudgetLevel::Inherit),
+            None,
+        ] {
+            draft.adjust(item, true);
+            assert_eq!(draft.output.budget_override(item), expected);
+        }
+        for expected in [
+            Some(ToolBudgetLevel::Inherit),
+            Some(ToolBudgetLevel::Percent(75)),
+            Some(ToolBudgetLevel::Percent(50)),
+            Some(ToolBudgetLevel::Percent(25)),
+            None,
+        ] {
+            draft.adjust(item, false);
+            assert_eq!(draft.output.budget_override(item), expected);
+        }
+        // A share typed in the editor sits between stops. One press moves to the neighbour it is
+        // heading towards, so an arrow never discards more of a deliberate number than its own
+        // direction implies.
+        for (typed, forward, expected) in [
+            (37, true, Some(ToolBudgetLevel::Percent(50))),
+            (37, false, Some(ToolBudgetLevel::Percent(25))),
+            (99, true, Some(ToolBudgetLevel::Inherit)),
+            (10, false, None),
+        ] {
+            draft.set_tool_budget(item, ToolBudgetLevel::from_percent(typed));
+            draft.adjust(item, forward);
+            assert_eq!(
+                draft.output.budget_override(item),
+                expected,
+                "{typed}% moving {}",
+                if forward { "up" } else { "down" }
+            );
+        }
+    }
+
+    /// The save button has to be reachable without a key of its own, yet never scroll away with
+    /// the content it commits.
+    #[test]
+    fn the_pinned_save_button_stays_off_the_list_but_on_the_cursor_cycle() {
+        let rows = list_rows();
+        assert!(
+            !rows.iter().any(|row| matches!(
+                row,
+                ConfigListRow::Group(ConfigGroupId::Save)
+                    | ConfigListRow::Item(ConfigEntry {
+                        item: ConfigItemId::SaveAll,
+                        ..
+                    })
+            )),
+            "a pinned group must not also occupy a scrolling row"
+        );
+        let cursor = ConfigCursor::default().previous();
+        assert_eq!(cursor.entry().item, ConfigItemId::SaveAll);
+        assert_eq!(super::focused_row(cursor), None);
+        // Focus outside the list anchors the viewport at the end instead of resetting it, so
+        // stepping onto the button leaves the rows it was just below on screen.
+        let mut viewport = ConfigViewport::default();
+        let window = viewport.window(cursor, rows.len(), 5);
+        assert_eq!(window.end, rows.len());
+        assert!(window.show_above);
+        assert!(!window.show_below);
+    }
 
     #[test]
     fn cursor_preserves_group_parent_child_order_and_wraps() {
         let mut cursor = ConfigCursor::default();
         let expected = [
             (ConfigItemId::OutputTier, ConfigItemRole::Parent),
-            (
-                ConfigItemId::OutputGuard,
-                ConfigItemRole::Child { is_last: false },
-            ),
             (
                 ConfigItemId::ReadBudget,
                 ConfigItemRole::Child { is_last: false },
@@ -761,6 +951,7 @@ mod tests {
                 ConfigItemId::JobOutputBudget,
                 ConfigItemRole::Child { is_last: true },
             ),
+            (ConfigItemId::OutputGuard, ConfigItemRole::Parent),
             (ConfigItemId::FastShell, ConfigItemRole::Parent),
             (ConfigItemId::JobStorageLimit, ConfigItemRole::Parent),
             (ConfigItemId::MaxRunningJobs, ConfigItemRole::Parent),
@@ -769,6 +960,9 @@ mod tests {
             (ConfigItemId::UpdateAutoCheck, ConfigItemRole::Parent),
             (ConfigItemId::UpdateSource, ConfigItemRole::Parent),
             (ConfigItemId::ResetAll, ConfigItemRole::Parent),
+            // The pinned save button renders outside the list but stays on the cursor's cycle,
+            // which is what makes it reachable without a key of its own.
+            (ConfigItemId::SaveAll, ConfigItemRole::Parent),
         ];
 
         for (item, role) in expected {
@@ -781,6 +975,8 @@ mod tests {
                     | ConfigItemId::JobListLimit
             ) {
                 ConfigGroupId::Extensions
+            } else if item == ConfigItemId::OutputGuard {
+                ConfigGroupId::Guard
             } else if item == ConfigItemId::SearchCpuLimit {
                 ConfigGroupId::Search
             } else if matches!(
@@ -790,6 +986,8 @@ mod tests {
                 ConfigGroupId::Update
             } else if item == ConfigItemId::ResetAll {
                 ConfigGroupId::Reset
+            } else if item == ConfigItemId::SaveAll {
+                ConfigGroupId::Save
             } else {
                 ConfigGroupId::Output
             };
@@ -798,7 +996,7 @@ mod tests {
             cursor = cursor.next();
         }
         assert_eq!(cursor, ConfigCursor::default());
-        assert_eq!(cursor.previous().entry().item, ConfigItemId::ResetAll);
+        assert_eq!(cursor.previous().entry().item, ConfigItemId::SaveAll);
     }
 
     #[test]
@@ -810,12 +1008,14 @@ mod tests {
                 parent: ConfigItemId::OutputTier,
                 children: &OUTPUT_CHILDREN,
                 standalone_items: false,
+                pinned: false,
             },
             ConfigGroupSpec {
                 id: ConfigGroupId::Extensions,
                 parent: ConfigItemId::GrepBudget,
                 children: &SECOND_CHILDREN,
                 standalone_items: false,
+                pinned: false,
             },
         ];
         // Forward order: parent to children, then the next group's parent, wrapping from the final item to the first parent.
@@ -826,7 +1026,6 @@ mod tests {
             (0, 3),
             (0, 4),
             (0, 5),
-            (0, 6),
             (1, 0),
             (1, 1),
         ];
@@ -848,20 +1047,49 @@ mod tests {
     #[test]
     fn tab_navigation_always_lands_on_a_group_parent() {
         let output = ConfigCursor::default();
-        let extensions = output.next_group();
+        let guard = output.next_group();
+        let extensions = guard.next_group();
         let search = extensions.next_group();
         let update = search.next_group();
         let reset = update.next_group();
+        let save = reset.next_group();
+        assert_eq!(guard.entry().item, ConfigItemId::OutputGuard);
         assert_eq!(extensions.entry().item, ConfigItemId::FastShell);
         assert_eq!(search.entry().item, ConfigItemId::SearchCpuLimit);
         assert_eq!(update.entry().item, ConfigItemId::UpdateAutoCheck);
         assert_eq!(reset.entry().item, ConfigItemId::ResetAll);
-        assert_eq!(reset.next_group(), output);
-        assert_eq!(output.previous_group(), reset);
-        assert_eq!(extensions.previous_group(), output);
+        // Pinned or not, the save button is a group like any other as far as Tab is concerned.
+        assert_eq!(save.entry().item, ConfigItemId::SaveAll);
+        assert_eq!(save.next_group(), output);
+        assert_eq!(output.previous_group(), save);
+        assert_eq!(guard.previous_group(), output);
+        assert_eq!(extensions.previous_group(), guard);
         assert_eq!(search.previous_group(), extensions);
         assert_eq!(update.previous_group(), search);
         assert_eq!(reset.previous_group(), update);
+        assert_eq!(save.previous_group(), reset);
+    }
+
+    /// The unsaved marker has to point at the setting that was edited. Moving the tier changes
+    /// every inheriting share's resolved numbers, and marking all six rows would bury the one
+    /// row the user actually touched.
+    #[test]
+    fn only_the_edited_item_is_marked_when_the_tier_moves_its_inheriting_shares() {
+        let saved = ConfigDraft::from_settings(&FastCtxSettings::default());
+        let mut draft = saved;
+        draft.adjust(ConfigItemId::OutputTier, true);
+
+        assert!(draft.item_changed(saved, ConfigItemId::OutputTier, false));
+        for child in OUTPUT_CHILDREN {
+            assert!(
+                !draft.item_changed(saved, child, false),
+                "{child:?} follows the tier and was not edited"
+            );
+        }
+
+        draft.adjust(ConfigItemId::GrepBudget, true);
+        assert!(draft.item_changed(saved, ConfigItemId::GrepBudget, false));
+        assert!(!draft.item_changed(saved, ConfigItemId::ReadBudget, false));
     }
 
     #[test]
@@ -917,7 +1145,7 @@ mod tests {
     #[test]
     fn viewport_keeps_focus_visible_and_reports_both_hidden_edges() {
         let rows = list_rows();
-        assert_eq!(rows.len(), 20);
+        assert_eq!(rows.len(), 21);
         let mut viewport = ConfigViewport::default();
         let top = viewport.window(ConfigCursor::default(), rows.len(), 5);
         assert_eq!((top.start, top.end), (0, 4));
@@ -929,7 +1157,7 @@ mod tests {
             cursor = cursor.next();
         }
         let middle = viewport.window(cursor, rows.len(), 5);
-        let focused = super::focused_row(cursor);
+        let focused = super::focused_row(cursor).expect("this cursor is inside the list");
         assert!(middle.start <= focused && focused < middle.end);
         assert!(middle.show_above);
         assert!(middle.show_below);
@@ -938,7 +1166,7 @@ mod tests {
             cursor = cursor.next();
         }
         let bottom = viewport.window(cursor, rows.len(), 5);
-        let focused = super::focused_row(cursor);
+        let focused = super::focused_row(cursor).expect("this cursor is inside the list");
         assert!(bottom.start <= focused && focused < bottom.end);
         assert!(bottom.show_above);
         assert!(!bottom.show_below);

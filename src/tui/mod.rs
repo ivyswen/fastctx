@@ -202,6 +202,7 @@ fn run_loop(
         }
         if app.has_pending_effect() {
             app.execute_pending();
+            drain_pending_input()?;
             continue;
         }
         if !event::poll(Duration::from_millis(100))
@@ -215,6 +216,20 @@ fn run_loop(
             _ => {}
         }
     }
+}
+
+/// Discards input typed while a blocking effect held this thread.
+///
+/// Effects run synchronously, so anything pressed during one queues up in the terminal and then
+/// replays against a screen that has since changed. The first replayed key also clears the toast
+/// the effect just raised, which is how a save that worked could look like nothing had happened.
+fn drain_pending_input() -> Result<(), String> {
+    while event::poll(Duration::ZERO)
+        .map_err(|error| format!("Cannot poll terminal events: {error}"))?
+    {
+        event::read().map_err(|error| format!("Cannot read a terminal event: {error}"))?;
+    }
+    Ok(())
 }
 
 fn draw_then_poll_update<B: Backend>(

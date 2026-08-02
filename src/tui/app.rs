@@ -1,7 +1,7 @@
 //! Pure TUI state transitions and controlled I/O effects.
 
 use super::budget_editor::{self, BudgetEditor};
-use super::config::{ConfigCursor, ConfigDraft, ConfigItemId, ConfigValue, ConfigViewport};
+use super::config::{self, ConfigCursor, ConfigDraft, ConfigItemId, ConfigValue, ConfigViewport};
 use super::jobs::{JobsDetail, JobsState, JobsViewport, visible_job_count, visible_jobs};
 use super::migration::{self as migration_copy, MigrationMessages};
 use super::update::{self as update_copy, UpdateMessages};
@@ -52,8 +52,10 @@ pub(crate) enum Screen {
     ConfigCpuEdit,
     ConfigBudgetEdit(ConfigItemId),
     ConfigOutputGuardConfirm,
+    ConfigDiscardConfirm,
     ConfigResetConfirm,
     ConfigResetting,
+    ConfigSaving,
     Jobs,
     JobsKillConfirm,
     JobsKilling,
@@ -588,6 +590,7 @@ impl App {
             Screen::ConfigCpuEdit => self.handle_cpu_limit_editor(key),
             Screen::ConfigBudgetEdit(item) => self.handle_budget_editor(item, key),
             Screen::ConfigOutputGuardConfirm => self.handle_output_guard_confirm(key.code),
+            Screen::ConfigDiscardConfirm => self.handle_config_discard_confirm(key.code),
             Screen::ConfigResetConfirm => self.handle_config_reset_confirm(key.code),
             Screen::Jobs => self.handle_jobs(key.code),
             Screen::JobsKillConfirm => self.handle_jobs_kill_confirm(key.code),
@@ -602,6 +605,7 @@ impl App {
             | Screen::UnapplyLoading
             | Screen::UnapplyRunning
             | Screen::ConfigResetting
+            | Screen::ConfigSaving
             | Screen::JobsKilling => {}
         }
     }
@@ -668,7 +672,10 @@ impl App {
                     updated.search.max_cpu_cores != self.settings.search.max_cpu_cores;
                 self.save_settings(&updated).map(|_| {
                     self.settings = updated;
-                    self.back_to_main();
+                    // Saving is a step inside the settings page, not a way out of it: the draft
+                    // is rebuilt from what actually landed on disk and the cursor stays put.
+                    self.config_draft = self.saved_config_draft();
+                    self.screen = Screen::Config;
                     let mut message = vec![self.messages().settings_saved];
                     if extensions_changed {
                         message.push(self.messages().extensions_note);
@@ -1179,21 +1186,24 @@ impl App {
                 self.config_draft
                     .adjust_with_guard(self.config_cursor.entry().item, true, guarded)
             }
+            // Enter activates the focused item and nothing else: it opens an editor, raises a
+            // confirmation, or advances the value. Writing the draft to disk is the separate,
+            // explicit save below, so a single keystroke never commits settings the user only
+            // meant to look at.
             KeyCode::Enter => match self.config_cursor.entry().item {
                 ConfigItemId::OutputGuard if self.config_draft.output_guard_enabled => {
                     self.selected = 0;
                     self.screen = Screen::ConfigOutputGuardConfirm;
                 }
-                ConfigItemId::OutputGuard => {
-                    self.config_draft.set_output_guard(true);
-                    self.pending = Some(Effect::SaveConfig);
-                }
+                ConfigItemId::OutputGuard => self.config_draft.set_output_guard(true),
                 ConfigItemId::SearchCpuLimit => {
                     self.cpu_limit_editor = CpuLimitEditor {
-                        input: self
-                            .config_draft
-                            .search_max_cpu_cores
-                            .map_or_else(|| "auto".to_string(), |value| value.to_string()),
+                        // An automatic limit opens on the count it currently resolves to, which
+                        // is the number somebody adjusting it would otherwise have to look up.
+                        input: self.config_draft.search_max_cpu_cores.map_or_else(
+                            || search_parallelism::detected_available().to_string(),
+                            |value| value.to_string(),
+                        ),
                         error: None,
                     };
                     self.screen = Screen::ConfigCpuEdit;
@@ -1209,13 +1219,9 @@ impl App {
                         return;
                     };
                     self.budget_editor = BudgetEditor {
-                        // A share that is only following the tier opens as "auto" so the editor
-                        // shows the state it is in, not a number nobody chose.
-                        input: if budget.explicit {
-                            budget.level.percent().to_string()
-                        } else {
-                            "auto".to_string()
-                        },
+                        // A share following the tier opens on the percentage it currently
+                        // resolves to, so the field always starts from the value on screen.
+                        input: budget.level.percent().to_string(),
                         error: None,
                     };
                     self.screen = Screen::ConfigBudgetEdit(item);
@@ -1224,9 +1230,72 @@ impl App {
                     self.selected = 0;
                     self.screen = Screen::ConfigResetConfirm;
                 }
-                _ => self.pending = Some(Effect::SaveConfig),
+                ConfigItemId::SaveAll if self.config_is_dirty() => self.begin_config_save(),
+                // Pressing save with nothing pending says so rather than running a write that
+                // would look identical to one that had something to do.
+                ConfigItemId::SaveAll => {
+                    self.toast = Some(Toast {
+                        message: self.config_messages().save_button_clean.to_string(),
+                        warning: false,
+                    });
+                }
+                item => self.config_draft.adjust_with_guard(item, true, guarded),
             },
+            KeyCode::Char('s') | KeyCode::Char('S') if self.config_is_dirty() => {
+                self.begin_config_save();
+            }
+            KeyCode::Esc if self.config_is_dirty() => {
+                self.selected = 0;
+                self.screen = Screen::ConfigDiscardConfirm;
+            }
             KeyCode::Esc => self.back_to_main(),
+            _ => {}
+        }
+    }
+
+    /// Puts the blocking save frame on screen before the write starts.
+    ///
+    /// `settings::save` runs synchronously on this thread and its trailing job reap can wait on a
+    /// cross-process lock, so without a frame of its own the terminal would sit on an unchanged
+    /// settings page for the whole duration with nothing to say the keystroke had registered.
+    fn begin_config_save(&mut self) {
+        self.screen = Screen::ConfigSaving;
+        self.pending = Some(Effect::SaveConfig);
+    }
+
+    /// Whether the draft still holds edits that the saved settings do not have yet.
+    pub(crate) fn config_is_dirty(&self) -> bool {
+        self.config_draft != self.saved_config_draft()
+    }
+
+    /// How many individual items carry an edit that has not reached disk yet.
+    pub(crate) fn config_unsaved_count(&self) -> usize {
+        let saved = self.saved_config_draft();
+        let guarded = self.output_guard_active();
+        config::all_items()
+            .filter(|item| self.config_draft.item_changed(saved, *item, guarded))
+            .count()
+    }
+
+    /// The draft as it would look with no unsaved edits, for comparison against the live one.
+    pub(crate) fn saved_config_draft(&self) -> ConfigDraft {
+        ConfigDraft::from_settings(&self.settings)
+    }
+
+    fn handle_config_discard_confirm(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
+                self.selected = 1 - self.selected.min(1);
+            }
+            KeyCode::Enter if self.selected == 1 => {
+                self.config_draft = self.saved_config_draft();
+                self.selected = 0;
+                self.back_to_main();
+            }
+            KeyCode::Enter | KeyCode::Esc => {
+                self.selected = 0;
+                self.screen = Screen::Config;
+            }
             _ => {}
         }
     }
@@ -1240,7 +1309,6 @@ impl App {
                 self.config_draft.set_output_guard(false);
                 self.selected = 0;
                 self.screen = Screen::Config;
-                self.pending = Some(Effect::SaveConfig);
             }
             KeyCode::Enter | KeyCode::Esc => {
                 self.selected = 0;
@@ -1260,10 +1328,9 @@ impl App {
                 let maximum = search_parallelism::detected_available();
                 match search_parallelism::parse_input(&self.cpu_limit_editor.input, maximum) {
                     Ok(configured) => {
-                        self.config_draft.set_search_cpu_limit(configured);
+                        self.config_draft.set_search_cpu_limit(Some(configured));
                         self.cpu_limit_editor.error = None;
                         self.screen = Screen::Config;
-                        self.pending = Some(Effect::SaveConfig);
                     }
                     Err(error) => self.cpu_limit_editor.error = Some(error),
                 }
@@ -1280,10 +1347,12 @@ impl App {
                 self.cpu_limit_editor.input.clear();
                 self.cpu_limit_editor.error = None;
             }
+            // Digits only; see the budget editor for why a letter is refused as it is typed.
             KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                if character.is_ascii_digit()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     && self.cpu_limit_editor.input.chars().count() < 32 =>
             {
                 self.cpu_limit_editor.input.push(character);
@@ -1301,10 +1370,9 @@ impl App {
             }
             KeyCode::Enter => match budget_editor::parse_input(&self.budget_editor.input) {
                 Ok(level) => {
-                    self.config_draft.set_tool_budget(item, level);
+                    self.config_draft.set_tool_budget(item, Some(level));
                     self.budget_editor.error = None;
                     self.screen = Screen::Config;
-                    self.pending = Some(Effect::SaveConfig);
                 }
                 Err(error) => self.budget_editor.error = Some(error),
             },
@@ -1320,10 +1388,14 @@ impl App {
                 self.budget_editor.input.clear();
                 self.budget_editor.error = None;
             }
+            // Only digits reach the field. The editor exists solely to land on a share the coarse
+            // arrow-key stops skip over, so a letter here is always a mistake, and refusing it as
+            // it is typed beats accepting it and reporting a validation failure on Enter.
             KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                if character.is_ascii_digit()
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     && self.budget_editor.input.chars().count() < 32 =>
             {
                 self.budget_editor.input.push(character);
@@ -1659,7 +1731,7 @@ fn language_index(language: Language) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Effect, Screen};
+    use super::{App, Effect, Screen, config};
     use crate::control::i18n::Language;
     use crate::control::paths::ControlPaths;
     use crate::control::settings::{
@@ -2031,12 +2103,12 @@ mod tests {
 
         for expected in [
             ConfigItemId::OutputTier,
-            ConfigItemId::OutputGuard,
             ConfigItemId::ReadBudget,
             ConfigItemId::GrepBudget,
             ConfigItemId::GlobBudget,
             ConfigItemId::RunBudget,
             ConfigItemId::JobOutputBudget,
+            ConfigItemId::OutputGuard,
             ConfigItemId::FastShell,
             ConfigItemId::JobStorageLimit,
             ConfigItemId::MaxRunningJobs,
@@ -2045,13 +2117,14 @@ mod tests {
             ConfigItemId::UpdateAutoCheck,
             ConfigItemId::UpdateSource,
             ConfigItemId::ResetAll,
+            ConfigItemId::SaveAll,
         ] {
             assert_eq!(app.config_cursor.entry().item, expected);
             app.handle_key(key(KeyCode::Down));
         }
         assert_eq!(app.config_cursor, ConfigCursor::default());
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::ResetAll);
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::SaveAll);
     }
 
     #[test]
@@ -2062,6 +2135,8 @@ mod tests {
         app.config_cursor = ConfigCursor::default().next().next();
 
         app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
+        app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::FastShell);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::SearchCpuLimit);
@@ -2072,9 +2147,13 @@ mod tests {
         );
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::ResetAll);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::SaveAll);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputTier);
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::SaveAll);
+        app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::ResetAll);
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(
@@ -2085,6 +2164,8 @@ mod tests {
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::SearchCpuLimit);
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::FastShell);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
     }
 
     #[test]
@@ -2112,21 +2193,23 @@ mod tests {
         assert_eq!(app.config_draft.output.tier, Tier::Standard);
 
         app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
-        app.handle_key(key(KeyCode::Left));
-        assert!(app.config_draft.output_guard_enabled);
-        app.handle_key(key(KeyCode::Down));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::ReadBudget);
+        // Guarded locks the tier, not the per-tool shares. Two presses leave automatic behind and
+        // land on a stop the guarded budget still resolves against.
+        app.handle_key(key(KeyCode::Left));
         app.handle_key(key(KeyCode::Left));
         assert_eq!(
             app.config_draft.output.budgets.read,
-            Some(ToolBudgetLevel::Percent(99))
+            Some(ToolBudgetLevel::Percent(75))
         );
         assert_eq!(
             app.effective_output().tool_budgets.read,
-            ToolBudgetLevel::Percent(99)
+            ToolBudgetLevel::Percent(75)
         );
-        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
+        app.handle_key(key(KeyCode::Left));
+        assert!(app.config_draft.output_guard_enabled);
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.screen, Screen::ConfigOutputGuardConfirm);
         assert!(!app.has_pending_effect());
@@ -2139,8 +2222,11 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.screen, Screen::Config);
         assert!(!app.config_draft.output_guard_enabled);
+        // Confirming the warning only decides the draft; the guard is still on disk until saved.
+        assert!(app.settings.output_guard.enabled);
+        app.handle_key(key(KeyCode::Char('s')));
         app.execute_pending();
-        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.screen, Screen::Config);
         assert!(!app.settings.output_guard.enabled);
         assert!(app.toast.as_ref().is_some_and(|toast| toast.warning));
         assert!(
@@ -2155,14 +2241,19 @@ mod tests {
         app.handle_key(key(KeyCode::Right));
         assert_eq!(app.config_draft.output.tier, Tier::High);
 
-        app.config_cursor = ConfigCursor::default().next();
+        app.config_cursor = ConfigCursor::default().next_group();
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
         app.handle_key(key(KeyCode::Enter));
+        // Turning protection back on needs no confirmation, but it still needs a save.
+        assert!(app.config_draft.output_guard_enabled);
+        assert!(!app.settings.output_guard.enabled);
+        app.handle_key(key(KeyCode::Char('s')));
         app.execute_pending();
         assert!(app.settings.output_guard.enabled);
     }
 
     #[test]
-    fn fastshell_toggle_saves_on_enter_and_takes_effect_only_on_apply() {
+    fn fastshell_toggle_persists_on_the_save_key_and_takes_effect_only_on_apply() {
         let (_temp, mut app) = fixture();
         app.settings.language = Some("en".to_string());
         app.screen = Screen::Config;
@@ -2173,9 +2264,10 @@ mod tests {
         app.handle_key(key(KeyCode::Right));
         assert!(!app.settings.fastshell.enabled);
 
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('s')));
         app.execute_pending();
 
+        assert_eq!(app.screen, Screen::Config);
         assert!(app.settings.fastshell.enabled);
         assert!(!app.settings.fastedit.enabled);
         assert!(app.settings.applied.is_none());
@@ -2203,10 +2295,10 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::JobListLimit);
         app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('s')));
         app.execute_pending();
 
-        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.screen, Screen::Config);
         assert_eq!(app.settings.fastshell.job_storage_limit_mib, 2_048);
         assert_eq!(app.settings.fastshell.max_running_jobs, 256);
         assert_eq!(app.settings.fastshell.job_list_limit, 50);
@@ -2231,6 +2323,7 @@ mod tests {
         app.config_cursor = ConfigCursor::default()
             .next_group()
             .next_group()
+            .next_group()
             .next_group();
         assert_eq!(
             app.config_cursor.entry().item,
@@ -2241,10 +2334,10 @@ mod tests {
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::UpdateSource);
         app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('s')));
         app.execute_pending();
 
-        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.screen, Screen::Config);
         assert!(!app.settings.update.auto_check);
         assert_eq!(app.settings.update.source, UpdateSource::NpmConfig);
         assert!(app.settings.applied.is_none());
@@ -2255,35 +2348,36 @@ mod tests {
     }
 
     #[test]
-    fn search_cpu_editor_rejects_every_invalid_shape_and_persists_auto_and_boundaries() {
+    fn search_cpu_editor_takes_only_digits_and_leaves_automatic_to_the_arrows() {
         let (_temp, mut app) = fixture();
         app.settings.language = Some("en".to_string());
         app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default().next_group().next_group();
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::SearchCpuLimit);
+        app.config_cursor = config::cursor_for(ConfigItemId::SearchCpuLimit);
+        let maximum = crate::search_parallelism::detected_available();
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.screen, Screen::ConfigCpuEdit);
-        assert_eq!(app.cpu_limit_editor.input, "auto");
+        // An automatic limit opens on the count it currently resolves to, not on a keyword.
+        assert_eq!(app.cpu_limit_editor.input, maximum.to_string());
 
         type_text(&mut app, "");
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(
             app.cpu_limit_editor.error,
-            Some(SearchParallelismInputError::Empty {
-                maximum: crate::search_parallelism::detected_available()
-            })
+            Some(SearchParallelismInputError::Empty { maximum })
         );
-        for value in ["four", "1.5", "true"] {
+        // Non-digits never reach the field, so there is nothing left for Enter to reject. This is
+        // what stops `auto` from being a word anyone has to know in order to use the editor.
+        for value in ["four", "auto", "-1", "1.5"] {
             type_text(&mut app, value);
-            app.handle_key(key(KeyCode::Enter));
-            assert!(matches!(
-                app.cpu_limit_editor.error,
-                Some(SearchParallelismInputError::NotInteger { .. })
-            ));
-            assert_eq!(app.cpu_limit_editor.input, value);
+            assert!(
+                app.cpu_limit_editor
+                    .input
+                    .chars()
+                    .all(|character| character.is_ascii_digit()),
+                "{value:?} leaked a non-digit into the field"
+            );
         }
-        let maximum = crate::search_parallelism::detected_available();
-        for value in ["-1".to_string(), "0".to_string(), (maximum + 1).to_string()] {
+        for value in ["0".to_string(), (maximum + 1).to_string()] {
             type_text(&mut app, &value);
             app.handle_key(key(KeyCode::Enter));
             assert!(matches!(
@@ -2296,9 +2390,15 @@ mod tests {
         type_text(&mut app, &maximum.to_string());
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.screen, Screen::Config);
+        // Accepting an entry is not a save: the value reaches the draft and the settings file
+        // stays untouched until the explicit save key.
+        assert!(!app.has_pending_effect());
+        assert_eq!(app.settings.search.max_cpu_cores, None);
+        assert!(!app.paths.fastctx_config.exists());
+        app.handle_key(key(KeyCode::Char('s')));
         assert!(app.has_pending_effect());
         app.execute_pending();
-        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.screen, Screen::Config);
         assert_eq!(app.settings.search.max_cpu_cores, Some(maximum as i64));
         assert!(
             app.toast.as_ref().is_some_and(|toast| {
@@ -2313,11 +2413,16 @@ mod tests {
             Some(maximum as i64)
         );
 
-        app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default().next_group().next_group();
-        app.handle_key(key(KeyCode::Enter));
-        type_text(&mut app, "auto");
-        app.handle_key(key(KeyCode::Enter));
+        // Automatic is an arrow-key stop rather than a keyword, and it still round-trips to disk
+        // as the absent limit.
+        for _ in 0..8 {
+            if app.config_draft.search_max_cpu_cores.is_none() {
+                break;
+            }
+            app.handle_key(key(KeyCode::Right));
+        }
+        assert_eq!(app.config_draft.search_max_cpu_cores, None);
+        app.handle_key(key(KeyCode::Char('s')));
         app.execute_pending();
         assert_eq!(app.settings.search.max_cpu_cores, None);
         assert_eq!(
@@ -2355,7 +2460,7 @@ mod tests {
         std::fs::write(&job_sentinel, b"running job state").unwrap();
 
         app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default().previous();
+        app.config_cursor = config::cursor_for(ConfigItemId::ResetAll);
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::ResetAll);
         let before_cancel = file_tree(&app.paths.fastctx_dir);
         app.handle_key(key(KeyCode::Enter));
@@ -2406,7 +2511,7 @@ mod tests {
         let reset_success = crate::control::config_i18n::messages(Language::En).reset_success;
         std::fs::write(&app.paths.fastctx_dir, b"blocks directory creation").unwrap();
         app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default().previous();
+        app.config_cursor = config::cursor_for(ConfigItemId::ResetAll);
         app.handle_key(key(KeyCode::Enter));
         app.handle_key(key(KeyCode::Right));
         app.handle_key(key(KeyCode::Enter));
@@ -2442,7 +2547,7 @@ mod tests {
         std::fs::write(&app.paths.jobs_dir, b"not a registry directory").unwrap();
 
         app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default().previous();
+        app.config_cursor = config::cursor_for(ConfigItemId::ResetAll);
         app.handle_key(key(KeyCode::Enter));
         app.handle_key(key(KeyCode::Right));
         app.handle_key(key(KeyCode::Enter));
@@ -2849,7 +2954,7 @@ mod tests {
     }
 
     #[test]
-    fn config_nested_adjustments_save_on_enter_and_discard_on_escape() {
+    fn config_nested_adjustments_wait_for_the_save_key_and_escape_can_discard_them() {
         let (_temp, mut app) = fixture();
         app.settings.language = Some("en".to_string());
         // Pin the starting levels instead of inheriting the shipped defaults: this test owns the
@@ -2860,13 +2965,12 @@ mod tests {
             grep: None,
             glob: None,
             run: Some(ToolBudgetLevel::Percent(75)),
-            job_output: Some(ToolBudgetLevel::Percent(50)),
+            job_output: Some(ToolBudgetLevel::Percent(25)),
         };
         app.config_draft = crate::tui::config::ConfigDraft::from_settings(&app.settings);
         app.screen = Screen::Config;
         app.config_cursor = ConfigCursor::default();
         app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Left));
         assert_eq!(
@@ -2875,7 +2979,7 @@ mod tests {
         );
         assert_eq!(
             budget_level(&app, ConfigItemId::ReadBudget),
-            ToolBudgetLevel::Percent(99)
+            ToolBudgetLevel::Percent(75)
         );
         assert_eq!(app.settings.tier, Tier::Standard);
         assert_eq!(
@@ -2883,6 +2987,9 @@ mod tests {
             Some(ToolBudgetLevel::Inherit)
         );
         app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::ConfigDiscardConfirm);
+        app.handle_key(key(KeyCode::Right));
+        app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.screen, Screen::Main);
         assert_eq!(app.settings.tier, Tier::Standard);
         assert!(!app.paths.fastctx_config.exists());
@@ -2892,7 +2999,6 @@ mod tests {
         assert_eq!(app.screen, Screen::Config);
         app.handle_key(key(KeyCode::Right));
         app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Left));
         for _ in 0..3 {
             app.handle_key(key(KeyCode::Down));
@@ -2900,26 +3006,25 @@ mod tests {
         app.handle_key(key(KeyCode::Right));
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Right));
-        // Enter on a budget row opens its share editor, the same way it does on the CPU limit row,
-        // so step back to a plain row to exercise save-on-Enter.
-        app.config_cursor = ConfigCursor::default();
-        app.handle_key(key(KeyCode::Enter));
+        // The save key belongs to the page rather than to a row, so it commits every group at
+        // once from wherever the cursor happens to be.
+        app.handle_key(key(KeyCode::Char('s')));
         app.execute_pending();
-        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.screen, Screen::Config);
         assert_eq!(app.settings.tier, Tier::High);
-        // Three children moved one point each from three distinct starting shares, so a cursor
-        // that collapsed onto a single item cannot satisfy all three.
+        // Three children moved one stop each from three distinct starting shares, in two
+        // directions, so a cursor that collapsed onto a single item cannot satisfy all three.
         assert_eq!(
             app.settings.tool_budgets.read,
-            Some(ToolBudgetLevel::Percent(99))
+            Some(ToolBudgetLevel::Percent(75))
         );
         assert_eq!(
             app.settings.tool_budgets.run,
-            Some(ToolBudgetLevel::Percent(76))
+            Some(ToolBudgetLevel::Inherit)
         );
         assert_eq!(
             app.settings.tool_budgets.job_output,
-            Some(ToolBudgetLevel::Percent(51))
+            Some(ToolBudgetLevel::Percent(50))
         );
         // The two untouched tools stay unset, so they keep tracking the tier the user just raised
         // rather than being frozen at whatever Standard happened to recommend.
@@ -2929,17 +3034,62 @@ mod tests {
         assert_eq!(persisted.tier, Tier::High);
         assert_eq!(
             persisted.tool_budgets.read,
-            Some(ToolBudgetLevel::Percent(99))
+            Some(ToolBudgetLevel::Percent(75))
         );
-        assert_eq!(
-            persisted.tool_budgets.run,
-            Some(ToolBudgetLevel::Percent(76))
-        );
+        assert_eq!(persisted.tool_budgets.run, Some(ToolBudgetLevel::Inherit));
         assert_eq!(
             persisted.tool_budgets.job_output,
-            Some(ToolBudgetLevel::Percent(51))
+            Some(ToolBudgetLevel::Percent(50))
         );
         assert_eq!(persisted.tool_budgets.grep, None);
+    }
+
+    /// Leaving the settings page is the one moment a draft can be lost, so it has to offer a way
+    /// back rather than discarding on a single keystroke.
+    #[test]
+    fn escaping_unsaved_settings_offers_a_way_back_before_discarding_them() {
+        let (_temp, mut app) = fixture();
+        app.settings.language = Some("en".to_string());
+        app.screen = Screen::Config;
+        app.config_cursor = ConfigCursor::default();
+        app.handle_key(key(KeyCode::Right));
+        let drafted = app.config_draft;
+        assert!(app.config_is_dirty());
+
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::ConfigDiscardConfirm);
+        assert_eq!(app.selected, 0);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Config);
+        assert_eq!(app.config_draft, drafted);
+
+        app.handle_key(key(KeyCode::Char('s')));
+        app.execute_pending();
+        assert!(!app.config_is_dirty());
+        // With nothing unsaved there is nothing to warn about, so leaving is immediate again.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Main);
+    }
+
+    /// Enter used to save every group and leave the page, which made typing a number in an editor
+    /// look like it had committed unrelated settings.
+    #[test]
+    fn enter_activates_the_focused_item_instead_of_writing_settings() {
+        let (_temp, mut app) = fixture();
+        app.settings.language = Some("en".to_string());
+        app.screen = Screen::Config;
+        app.config_cursor = ConfigCursor::default();
+        let tier = app.settings.tier;
+
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            app.config_draft.value(ConfigItemId::OutputTier),
+            ConfigValue::Tier(tier.next())
+        );
+        assert!(!app.has_pending_effect());
+        assert_eq!(app.settings.tier, tier);
+        assert!(!app.paths.fastctx_config.exists());
     }
 
     fn budget_level(app: &App, item: ConfigItemId) -> ToolBudgetLevel {
@@ -2950,42 +3100,59 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_editor_accepts_a_share_and_hands_it_back_to_the_tier() {
+    fn the_budget_editor_types_an_off_grid_share_and_the_arrows_hand_it_back() {
         let (_temp, mut app) = fixture();
         app.settings.language = Some("en".to_string());
         app.settings.tier = Tier::Standard;
         app.config_draft = crate::tui::config::ConfigDraft::from_settings(&app.settings);
         app.screen = Screen::Config;
         app.config_cursor = ConfigCursor::default();
-        // Move onto grep, which ships unset so the editor must open showing "auto".
-        for _ in 0..3 {
+        // Move onto grep, which ships unset and therefore follows the tier.
+        for _ in 0..2 {
             app.handle_key(key(KeyCode::Down));
         }
+        let resolved = budget_level(&app, ConfigItemId::GrepBudget).percent();
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(
             app.screen,
             Screen::ConfigBudgetEdit(ConfigItemId::GrepBudget)
         );
-        assert_eq!(app.budget_editor.input, "auto");
+        // The field opens on the share in effect, so editing always starts from what is on screen.
+        assert_eq!(app.budget_editor.input, resolved.to_string());
+        // Letters never reach it, which is what lets the prompt promise digits and nothing else.
+        type_text(&mut app, "auto");
+        assert_eq!(app.budget_editor.input, "");
 
         type_text(&mut app, "37");
         app.handle_key(key(KeyCode::Enter));
-        // Committing the editor commits the whole draft and leaves the config screen, the same way
-        // the CPU limit editor does.
+        // Accepting an entry returns to the list with the value in the draft, the same way the
+        // CPU limit editor does. Nothing is written until the save key.
         assert_eq!(app.screen, Screen::Config);
+        assert!(!app.has_pending_effect());
+        assert_eq!(app.settings.tool_budgets.grep, None);
+        app.handle_key(key(KeyCode::Char('s')));
         app.execute_pending();
-        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.screen, Screen::Config);
         assert_eq!(
             app.settings.tool_budgets.grep,
             Some(ToolBudgetLevel::Percent(37))
         );
 
-        // `auto` is the only way back to tier tracking once a share is explicit; without it an
-        // edit would be one-way and the tier default unreachable.
         open_grep_budget_editor(&mut app);
         assert_eq!(app.budget_editor.input, "37");
-        type_text(&mut app, "auto");
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Esc));
+
+        // Getting back to tier tracking is the arrows' job now. An off-grid share snaps down to
+        // the stop below it and one more press leaves the grid for automatic, so the round trip
+        // stays possible without the editor knowing a keyword.
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(
+            app.config_draft.output.budgets.grep,
+            Some(ToolBudgetLevel::Percent(25))
+        );
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.config_draft.output.budgets.grep, None);
+        app.handle_key(key(KeyCode::Char('s')));
         app.execute_pending();
         assert_eq!(app.settings.tool_budgets.grep, None);
 
@@ -3007,13 +3174,63 @@ mod tests {
     /// Reopens the grep share editor from wherever the previous commit left the app.
     fn open_grep_budget_editor(app: &mut App) {
         app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default().next().next().next();
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::GrepBudget);
+        app.config_cursor = config::cursor_for(ConfigItemId::GrepBudget);
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(
             app.screen,
             Screen::ConfigBudgetEdit(ConfigItemId::GrepBudget)
         );
+    }
+
+    /// The button is the visible half of the explicit-save rule: it reports what pressing it would
+    /// do, it commits from wherever the cursor is, and pressing it with nothing pending says so
+    /// rather than running a write indistinguishable from a real one.
+    #[test]
+    fn the_save_button_reports_what_is_pending_and_both_paths_frame_the_write() {
+        let (_temp, mut app) = fixture();
+        app.settings.language = Some("en".to_string());
+        app.screen = Screen::Config;
+        app.config_cursor = config::cursor_for(ConfigItemId::SaveAll);
+
+        assert_eq!(app.config_unsaved_count(), 0);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Config);
+        assert!(!app.has_pending_effect());
+        assert!(!app.paths.fastctx_config.exists());
+        let clean = app.config_messages().save_button_clean;
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|toast| toast.message == clean),
+            "{:?}",
+            app.toast
+        );
+
+        // Two edits in two groups, counted per item rather than collapsed into one dirty flag.
+        app.config_cursor = ConfigCursor::default();
+        app.handle_key(key(KeyCode::Right));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.config_unsaved_count(), 2);
+
+        // `settings::save` runs synchronously on this thread, so the frame announcing it has to
+        // reach the terminal before the write starts — from the page key and the button alike.
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.screen, Screen::ConfigSaving);
+        assert!(app.has_pending_effect());
+        app.execute_pending();
+        assert_eq!(app.screen, Screen::Config);
+        assert_eq!(app.config_unsaved_count(), 0);
+        assert!(app.paths.fastctx_config.exists());
+
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.config_unsaved_count(), 1);
+        app.config_cursor = config::cursor_for(ConfigItemId::SaveAll);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::ConfigSaving);
+        app.execute_pending();
+        assert_eq!(app.screen, Screen::Config);
+        assert_eq!(app.config_unsaved_count(), 0);
     }
 
     #[test]
@@ -3025,7 +3242,7 @@ mod tests {
         app.handle_key(key(KeyCode::Right));
         std::fs::write(&app.paths.fastctx_dir, b"blocks directory creation").unwrap();
 
-        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('s')));
         app.execute_pending();
         assert_eq!(app.screen, Screen::OperationFailed);
         assert!(app.error.is_some());
@@ -3039,8 +3256,9 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.screen, Screen::Config);
         app.execute_pending();
-        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.screen, Screen::Config);
         assert_eq!(app.settings.tier, Tier::High);
+        assert!(!app.config_is_dirty());
     }
 
     fn file_tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {

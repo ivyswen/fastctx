@@ -66,23 +66,20 @@ pub(crate) fn resolve(
     resolve_with_available(configured, detected_available())
 }
 
-/// Parses a TUI value. `auto` clears the explicit limit; an empty edit is rejected.
-pub(crate) fn parse_input(
-    input: &str,
-    maximum: usize,
-) -> Result<Option<i64>, SearchParallelismInputError> {
+/// Parses a TUI value; an empty edit is rejected.
+///
+/// Only a number is accepted. Clearing the explicit limit is a stop on the arrow-key cycle, not a
+/// keyword, so the editor never has to teach a word in order to be usable.
+pub(crate) fn parse_input(input: &str, maximum: usize) -> Result<i64, SearchParallelismInputError> {
     let input = input.trim();
     if input.is_empty() {
         return Err(SearchParallelismInputError::Empty { maximum });
-    }
-    if input.eq_ignore_ascii_case("auto") {
-        return Ok(None);
     }
     let configured = input
         .parse::<i64>()
         .map_err(|_| SearchParallelismInputError::NotInteger { maximum })?;
     validate(configured, maximum)
-        .map(|value| Some(value as i64))
+        .map(|value| value as i64)
         .map_err(|_| SearchParallelismInputError::OutOfRange { maximum })
 }
 
@@ -145,11 +142,15 @@ mod tests {
     }
 
     #[test]
-    fn editable_input_has_distinct_auto_empty_format_and_range_states() {
-        assert_eq!(parse_input("auto", 8), Ok(None));
-        assert_eq!(parse_input("AUTO", 8), Ok(None));
-        assert_eq!(parse_input("1", 8), Ok(Some(1)));
-        assert_eq!(parse_input("8", 8), Ok(Some(8)));
+    fn editable_input_has_distinct_empty_format_and_range_states() {
+        assert_eq!(parse_input("1", 8), Ok(1));
+        assert_eq!(parse_input("8", 8), Ok(8));
+        // Clearing the limit is an arrow-key stop, so the editor treats the old keyword as the
+        // typo it now is instead of silently discarding an explicit core count.
+        assert_eq!(
+            parse_input("auto", 8),
+            Err(SearchParallelismInputError::NotInteger { maximum: 8 })
+        );
         assert_eq!(
             parse_input("   ", 8),
             Err(SearchParallelismInputError::Empty { maximum: 8 })

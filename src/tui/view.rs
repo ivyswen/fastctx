@@ -76,6 +76,7 @@ fn uses_narrow_layout(area: Rect, screen: Screen) -> bool {
         | Screen::Config
         | Screen::ConfigCpuEdit
         | Screen::ConfigOutputGuardConfirm
+        | Screen::ConfigDiscardConfirm
         | Screen::ConfigResetConfirm
         | Screen::Jobs
         | Screen::Update
@@ -184,6 +185,13 @@ fn render_body(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             app.guard_messages().disable_confirm,
             theme::danger(),
         ),
+        Screen::ConfigDiscardConfirm => render_confirmation(
+            frame,
+            app,
+            area,
+            app.config_messages().discard_confirm,
+            theme::danger(),
+        ),
         Screen::ConfigResetConfirm => {
             let prompt = format!(
                 "{}\n{}",
@@ -194,6 +202,9 @@ fn render_body(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         }
         Screen::ConfigResetting => {
             render_loading(frame, app, area, app.config_messages().reset_all_label)
+        }
+        Screen::ConfigSaving => {
+            render_loading(frame, app, area, app.config_messages().saving_notice)
         }
         Screen::Jobs => render_jobs(frame, app, area),
         Screen::JobsKillConfirm => render_job_kill_confirmation(frame, app, area),
@@ -910,14 +921,29 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     } else {
         inner(area, 2, 1)
     };
+    const DETAIL_ROWS_MAX: u16 = 9;
     let detail_height = if compact {
         2
     } else {
-        content_area.height.saturating_sub(6).clamp(4, 9)
+        content_area
+            .height
+            .saturating_sub(6)
+            .clamp(4, DETAIL_ROWS_MAX)
     };
+    // The save button holds a row of its own between the list and the detail pane, but only once
+    // the detail pane has all it can use. Below that every row belongs to the settings themselves
+    // and the footer still names the save key, so the action stays reachable unbuttoned.
+    //
+    // Riding the panel's bottom border would have cost no row at all, except that a centred border
+    // title truncates wide characters, and a button nobody can read in Japanese is not a button.
+    let button_height = u16::from(!compact && detail_height == DETAIL_ROWS_MAX);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(detail_height)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(button_height),
+            Constraint::Length(detail_height),
+        ])
         .split(content_area);
     let visible_rows = usize::from(if compact {
         chunks[0].height
@@ -934,14 +960,19 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
     for row in &list_rows[window.start..window.end] {
         match *row {
+            // Only pinned groups render without a heading and those never enter this list, so the
+            // empty fallback is unreachable; it stays a blank row rather than a skipped one so a
+            // future headless group could never desynchronise the viewport's row arithmetic.
             ConfigListRow::Group(group) => table_rows.push(Row::new(vec![
                 Cell::from(Line::styled(
                     config::group_title(
                         group,
                         messages,
                         app.config_messages(),
+                        app.guard_messages(),
                         app.update_messages(),
                     )
+                    .unwrap_or_default()
                     .to_string(),
                     Style::default()
                         .fg(theme::fg())
@@ -962,10 +993,25 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         [Constraint::Percentage(42), Constraint::Percentage(58)],
     );
     table = table.column_spacing(if compact { 1 } else { 2 });
+    let title = if app.config_is_dirty() {
+        format!(
+            "{} · {}",
+            messages.menu_config,
+            app.config_messages().unsaved_changes
+        )
+    } else {
+        messages.menu_config.to_string()
+    };
     if !compact {
-        table = table.block(panel(messages.menu_config));
+        table = table.block(panel(&title));
     }
     frame.render_widget(table, chunks[0]);
+    if chunks[1].height > 0 {
+        frame.render_widget(
+            Paragraph::new(config_save_button_line(app)).alignment(Alignment::Center),
+            chunks[1],
+        );
+    }
 
     let entry = app.config_cursor.entry();
     let guarded = app.output_guard_active();
@@ -1249,6 +1295,22 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             }
             lines
         }
+        ConfigValue::Action if entry.item == ConfigItemId::SaveAll => {
+            let pending = app.config_unsaved_count();
+            vec![
+                Line::styled(
+                    save_button_face(app, pending),
+                    Style::default()
+                        .fg(save_button_color(pending))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(""),
+                Line::styled(
+                    app.config_messages().save_all_note,
+                    Style::default().fg(theme::fg()),
+                ),
+            ]
+        }
         ConfigValue::Action => vec![
             Line::styled(
                 app.config_messages().reset_all_label,
@@ -1265,14 +1327,72 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let mut detail = Paragraph::new(detail).wrap(Wrap { trim: false });
     if !compact {
-        detail = detail.block(panel(config::group_title(
+        // A pinned group carries no heading of its own, so the focused item names its own detail.
+        let title = config::group_title(
             entry.group,
             messages,
             app.config_messages(),
+            app.guard_messages(),
             app.update_messages(),
-        )));
+        )
+        .unwrap_or_else(|| {
+            config::item_label(
+                entry.item,
+                messages,
+                app.config_messages(),
+                app.guard_messages(),
+                app.job_messages(),
+                app.update_messages(),
+            )
+        });
+        detail = detail.block(panel(title));
     }
-    frame.render_widget(detail, chunks[1]);
+    frame.render_widget(detail, chunks[2]);
+}
+
+/// What the save button says it would do, which is also how the detail pane announces it.
+fn save_button_face(app: &App, pending: usize) -> String {
+    let messages = app.config_messages();
+    if pending == 0 {
+        return messages.save_button_clean.to_string();
+    }
+    messages
+        .save_button_dirty
+        .replace("{count}", &pending.to_string())
+}
+
+fn save_button_color(pending: usize) -> Color {
+    if pending == 0 {
+        theme::muted()
+    } else {
+        theme::success()
+    }
+}
+
+/// Pinned save button, the one control that ends an editing session.
+///
+/// It never scrolls, so it is always one keypress away from wherever the cursor is. Its face
+/// reports what pressing it would do, which also answers "did anything register?" without the
+/// reader scanning back up the list for unsaved markers.
+fn config_save_button_line(app: &App) -> Line<'static> {
+    let pending = app.config_unsaved_count();
+    let focused = app.config_cursor.entry().item == ConfigItemId::SaveAll;
+    let mut style = Style::default()
+        .fg(save_button_color(pending))
+        .add_modifier(Modifier::BOLD);
+    if focused {
+        style = style.bg(theme::bg_raised());
+    }
+    Line::from(vec![
+        // The caret, not the highlight, is what survives a monochrome terminal.
+        Span::styled(
+            if focused { "❯ " } else { "  " },
+            Style::default().fg(theme::accent()),
+        ),
+        // Brackets rather than a drawn box: a bracketed face reads as pressable in every terminal
+        // without spending two more rows on a border.
+        Span::styled(format!("[  {}  ]", save_button_face(app, pending)), style),
+    ])
 }
 
 fn budget_tool_note(messages: &crate::control::i18n::Messages, item: ConfigItemId) -> &'static str {
@@ -1393,7 +1513,7 @@ fn render_budget_editor(frame: &mut Frame<'_>, app: &App, area: Rect, item: Conf
             let guarded = app.output_guard_active();
             let value = app
                 .config_draft
-                .preview_tool_budget_with_guard(item, level, guarded);
+                .preview_tool_budget_with_guard(item, Some(level), guarded);
             budget_summary(value.level, app.effective_output().fastctx_budget)
         });
     let color = if error.is_some() {
@@ -2079,9 +2199,7 @@ fn config_item_row(
         ConfigItemRole::Child { is_last: false } => "    ├─ ",
         ConfigItemRole::Child { is_last: true } => "    └─ ",
     };
-    let value = app
-        .config_draft
-        .value_with_guard(item, app.output_guard_active());
+    let value_line = config_value_line(app, item, selected);
     let base = if selected {
         Style::default().bg(theme::bg_raised())
     } else {
@@ -2110,55 +2228,73 @@ fn config_item_row(
                 },
             ),
         ])),
-        Cell::from(if value == ConfigValue::Action {
-            Line::styled(
-                format!("Enter · {}", app.config_messages().reset_all_label),
-                Style::default()
-                    .fg(theme::danger())
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else if item == ConfigItemId::OutputGuard {
-            Line::styled(
-                format!("Enter · {}", config_value_label(app, item, value)),
+        Cell::from(value_line),
+    ])
+    .style(base)
+}
+
+/// The value column for one row, followed by the unsaved marker when the drafted value has not
+/// reached disk yet. The marker is a glyph rather than a colour so it survives monochrome
+/// terminals, where colour alone would erase the distinction.
+fn config_value_line(app: &App, item: ConfigItemId, selected: bool) -> Line<'static> {
+    let value = app
+        .config_draft
+        .value_with_guard(item, app.output_guard_active());
+    let mut line = if value == ConfigValue::Action {
+        Line::styled(
+            format!("Enter · {}", app.config_messages().reset_all_label),
+            Style::default()
+                .fg(theme::danger())
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if item == ConfigItemId::OutputGuard {
+        Line::styled(
+            format!("Enter · {}", config_value_label(app, item, value)),
+            Style::default()
+                .fg(config_value_color(value))
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if matches!(value, ConfigValue::GuardedTier(_)) {
+        Line::styled(
+            "Guarded",
+            Style::default()
+                .fg(theme::warning())
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "‹ ",
+                Style::default().fg(if selected {
+                    theme::accent()
+                } else {
+                    theme::border()
+                }),
+            ),
+            Span::styled(
+                config_value_label(app, item, value),
                 Style::default()
                     .fg(config_value_color(value))
                     .add_modifier(Modifier::BOLD),
-            )
-        } else if matches!(value, ConfigValue::GuardedTier(_)) {
-            Line::styled(
-                "Guarded",
-                Style::default()
-                    .fg(theme::warning())
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Line::from(vec![
-                Span::styled(
-                    "‹ ",
-                    Style::default().fg(if selected {
-                        theme::accent()
-                    } else {
-                        theme::border()
-                    }),
-                ),
-                Span::styled(
-                    config_value_label(app, item, value),
-                    Style::default()
-                        .fg(config_value_color(value))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " ›",
-                    Style::default().fg(if selected {
-                        theme::accent()
-                    } else {
-                        theme::border()
-                    }),
-                ),
-            ])
-        }),
-    ])
-    .style(base)
+            ),
+            Span::styled(
+                " ›",
+                Style::default().fg(if selected {
+                    theme::accent()
+                } else {
+                    theme::border()
+                }),
+            ),
+        ])
+    };
+    if app
+        .config_draft
+        .item_changed(app.saved_config_draft(), item, app.output_guard_active())
+    {
+        line.spans
+            .push(Span::styled(" ●", Style::default().fg(theme::warning())));
+    }
+    line
 }
 
 fn render_status(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -2351,20 +2487,28 @@ fn render_confirmation(frame: &mut Frame<'_>, app: &App, area: Rect, prompt: &st
     }
     let popup = centered_rect(66, 38, area);
     frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(vec![
+    // A Line cannot hold a newline, so the prompt has to be split by hand or its paragraphs run
+    // together. The panel title already carries the first line, so the body starts after it
+    // unless the prompt is that one line.
+    let mut body = prompt
+        .lines()
+        .skip(usize::from(prompt.lines().nth(1).is_some()))
+        .map(|line| {
             Line::styled(
-                prompt,
+                line.to_string(),
                 Style::default()
                     .fg(theme::fg())
                     .add_modifier(Modifier::BOLD),
-            ),
-            Line::raw(""),
-            actions,
-        ])
-        .alignment(Alignment::Center)
-        .block(panel(panel_title).border_style(Style::default().fg(color)))
-        .wrap(Wrap { trim: false }),
+            )
+        })
+        .collect::<Vec<_>>();
+    body.push(Line::raw(""));
+    body.push(actions);
+    frame.render_widget(
+        Paragraph::new(body)
+            .alignment(Alignment::Center)
+            .block(panel(panel_title).border_style(Style::default().fg(color)))
+            .wrap(Wrap { trim: false }),
         popup,
     );
 }
@@ -2841,6 +2985,7 @@ fn render_narrow(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             app.budget_editor.input
         ),
         Screen::ConfigResetConfirm => app.config_messages().reset_confirm.to_string(),
+        Screen::ConfigDiscardConfirm => app.config_messages().discard_confirm.to_string(),
         Screen::ConfigOutputGuardConfirm => app.guard_messages().disable_confirm.to_string(),
         Screen::Jobs => app
             .focused_job()
@@ -2861,6 +3006,7 @@ fn render_narrow(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         | Screen::UnapplyLoading
         | Screen::UnapplyRunning
         | Screen::ConfigResetting
+        | Screen::ConfigSaving
         | Screen::JobsKilling => messages.loading.to_string(),
         Screen::ApplyPreview
         | Screen::UnapplyPreview
@@ -2927,6 +3073,7 @@ fn render_narrow(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             | Screen::ApplyConfirm
             | Screen::UnapplyConfirm
             | Screen::ConfigResetConfirm
+            | Screen::ConfigDiscardConfirm
             | Screen::JobsKillConfirm
     ) {
         lines.push(Line::from(vec![
@@ -3009,52 +3156,46 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ],
         Screen::JobsKilling => vec![messages.loading],
         Screen::ConfigResetting => vec![messages.loading],
+        // No key is offered: the write blocks this thread, so the only honest footer is the one
+        // that names what is happening rather than an action nobody could take.
+        Screen::ConfigSaving => vec![app.config_messages().saving_notice],
         Screen::ConfigCpuEdit | Screen::ConfigBudgetEdit(_) => {
             vec![app.config_messages().footer_accept, messages.footer_cancel]
         }
-        Screen::ConfigResetConfirm | Screen::ConfigOutputGuardConfirm => vec![
+        Screen::ConfigResetConfirm
+        | Screen::ConfigOutputGuardConfirm
+        | Screen::ConfigDiscardConfirm => vec![
             messages.footer_move,
             messages.footer_select,
             messages.footer_back,
         ],
-        Screen::Config => match app.config_cursor.entry().item {
-            ConfigItemId::OutputGuard => vec![
-                messages.footer_move,
-                messages.footer_switch_group,
-                messages.footer_select,
-                messages.footer_cancel,
-            ],
-            ConfigItemId::OutputTier if app.output_guard_active() => vec![
-                messages.footer_move,
-                messages.footer_switch_group,
-                messages.footer_cancel,
-            ],
-            ConfigItemId::SearchCpuLimit
-            | ConfigItemId::ReadBudget
-            | ConfigItemId::GrepBudget
-            | ConfigItemId::GlobBudget
-            | ConfigItemId::RunBudget
-            | ConfigItemId::JobOutputBudget => vec![
-                messages.footer_move,
-                messages.footer_switch_group,
-                messages.footer_adjust,
-                app.config_messages().footer_edit,
-                messages.footer_cancel,
-            ],
-            ConfigItemId::ResetAll => vec![
-                messages.footer_move,
-                messages.footer_switch_group,
-                messages.footer_select,
-                messages.footer_cancel,
-            ],
-            _ => vec![
-                messages.footer_move,
-                messages.footer_switch_group,
-                messages.footer_adjust,
-                messages.footer_save,
-                messages.footer_cancel,
-            ],
-        },
+        Screen::Config => {
+            let mut hints = vec![messages.footer_move, messages.footer_switch_group];
+            match app.config_cursor.entry().item {
+                ConfigItemId::OutputGuard | ConfigItemId::ResetAll | ConfigItemId::SaveAll => {
+                    hints.push(messages.footer_select);
+                }
+                // A guarded tier is read-only, so neither adjusting nor editing applies.
+                ConfigItemId::OutputTier if app.output_guard_active() => {}
+                ConfigItemId::SearchCpuLimit
+                | ConfigItemId::ReadBudget
+                | ConfigItemId::GrepBudget
+                | ConfigItemId::GlobBudget
+                | ConfigItemId::RunBudget
+                | ConfigItemId::JobOutputBudget => {
+                    hints.push(messages.footer_adjust);
+                    hints.push(app.config_messages().footer_edit);
+                }
+                _ => hints.push(messages.footer_adjust),
+            }
+            // The save hint only appears while something is unsaved, so its presence is itself
+            // the answer to "did my edit register?".
+            if app.config_is_dirty() {
+                hints.push(messages.footer_save);
+            }
+            hints.push(messages.footer_back);
+            hints
+        }
         _ => vec![
             messages.footer_move,
             messages.footer_select,
@@ -3237,33 +3378,28 @@ fn config_narrow_summary(app: &App) -> String {
         app.config_draft
             .value_with_guard(entry.item, app.output_guard_active()),
     );
+    let item = config::item_label(
+        entry.item,
+        messages,
+        app.config_messages(),
+        app.guard_messages(),
+        app.job_messages(),
+        app.update_messages(),
+    );
+    // A pinned group carries no heading, so its trail starts at the item itself.
+    let Some(group_title) = config::group_title(
+        entry.group,
+        messages,
+        app.config_messages(),
+        app.guard_messages(),
+        app.update_messages(),
+    ) else {
+        return format!("{item} · {value}");
+    };
     match entry.role {
-        ConfigItemRole::Parent => format!(
-            "{} › {} · {}",
-            config::group_title(
-                entry.group,
-                messages,
-                app.config_messages(),
-                app.update_messages(),
-            ),
-            config::item_label(
-                entry.item,
-                messages,
-                app.config_messages(),
-                app.guard_messages(),
-                app.job_messages(),
-                app.update_messages(),
-            ),
-            value
-        ),
+        ConfigItemRole::Parent => format!("{group_title} › {item} · {value}"),
         ConfigItemRole::Child { .. } => format!(
-            "{} › {} › {} · {}",
-            config::group_title(
-                entry.group,
-                messages,
-                app.config_messages(),
-                app.update_messages(),
-            ),
+            "{group_title} › {} › {item} · {value}",
             config::item_label(
                 group.parent(),
                 messages,
@@ -3272,15 +3408,6 @@ fn config_narrow_summary(app: &App) -> String {
                 app.job_messages(),
                 app.update_messages(),
             ),
-            config::item_label(
-                entry.item,
-                messages,
-                app.config_messages(),
-                app.guard_messages(),
-                app.job_messages(),
-                app.update_messages(),
-            ),
-            value
         ),
     }
 }
@@ -3289,9 +3416,11 @@ fn config_value_label(app: &App, item: ConfigItemId, value: ConfigValue) -> Stri
     match value {
         ConfigValue::Tier(tier) => tier.display_name().to_string(),
         ConfigValue::GuardedTier(_) => "Guarded".to_string(),
-        ConfigValue::Budget(budget) => {
-            budget_summary(budget.level, app.effective_output().fastctx_budget)
-        }
+        ConfigValue::Budget(budget) if budget.explicit => budget.level.label(),
+        // A share that follows the tier says so instead of showing the number it happens to
+        // resolve to: the two rendered identically, so nothing on the row distinguished the
+        // budgets that move with the tier from the ones pinned against it.
+        ConfigValue::Budget(_) => app.config_messages().automatic_label.to_string(),
         ConfigValue::Toggle(enabled) => toggle_label(app.messages(), enabled).to_string(),
         ConfigValue::Number(value) if item == ConfigItemId::JobStorageLimit => {
             if value >= 1_024 && value % 1_024 == 0 {
@@ -3301,9 +3430,12 @@ fn config_value_label(app: &App, item: ConfigItemId, value: ConfigValue) -> Stri
             }
         }
         ConfigValue::Number(value) => value.to_string(),
-        ConfigValue::CpuLimit(None) => app.config_messages().cpu_automatic.to_string(),
+        ConfigValue::CpuLimit(None) => app.config_messages().automatic_label.to_string(),
         ConfigValue::CpuLimit(Some(value)) => value.to_string(),
         ConfigValue::Source(source) => source.as_str().to_string(),
+        ConfigValue::Action if item == ConfigItemId::SaveAll => {
+            save_button_face(app, app.config_unsaved_count())
+        }
         ConfigValue::Action => app.config_messages().reset_all_label.to_string(),
     }
 }
@@ -3315,7 +3447,9 @@ fn config_value_color(value: ConfigValue) -> Color {
         // An explicit share is highlighted so the rows somebody has overridden stand apart from
         // the ones that will keep tracking the tier.
         ConfigValue::Budget(budget) if budget.explicit => theme::accent(),
-        ConfigValue::Budget(_) => theme::fg(),
+        // Automatic is the resting state for every budget, so it recedes exactly like the CPU
+        // limit's own automatic reading rather than competing with the shares somebody chose.
+        ConfigValue::Budget(_) => theme::muted(),
         ConfigValue::Toggle(true) => theme::success(),
         ConfigValue::Toggle(false) => theme::muted(),
         ConfigValue::Number(_) => theme::fg(),
@@ -3340,10 +3474,11 @@ fn toggle_label(messages: &crate::control::i18n::Messages, enabled: bool) -> &'s
     }
 }
 
-/// Share plus the token ceiling it resolves to.
+/// Share plus the token ceiling it resolves to, for the detail pane and the editor preview.
 ///
-/// The ceiling is never omitted: a bare percentage means a different amount of output at every
-/// tier, and the token count is what the reader is actually deciding about.
+/// The list row shows the bare share instead. A percentage alone would say nothing about how much
+/// output it buys, but the detail pane always carries the ceiling for whichever row has focus, so
+/// the column stays narrow without withholding the number the reader is deciding about.
 fn budget_summary(level: ToolBudgetLevel, global: usize) -> String {
     format!("{} · {}", level.label(), level.ceiling(global))
 }
@@ -3361,7 +3496,7 @@ mod tests {
     use crate::search_parallelism::SearchParallelismInputError;
     use crate::shell::jobs::{JobSourceSummary, JobSummary, JobSummaryStatus};
     use crate::tui::app::{App, CpuLimitEditor, Screen};
-    use crate::tui::config::{ConfigCursor, ConfigItemId};
+    use crate::tui::config::{ConfigCursor, ConfigItemId, cursor_for};
     use crate::tui::jobs::{JobsDetail, JobsState};
     use crate::tui::theme::{self, ColorMode, Theme};
     use crate::update::{
@@ -3384,13 +3519,18 @@ mod tests {
         (0..area.height)
             .map(|y| {
                 let mut text = String::new();
-                let mut hidden_columns = 0;
+                let mut hidden_columns = 0usize;
                 for x in 0..area.width {
-                    let cell = &buffer[(x, y)];
-                    if hidden_columns == 0 {
-                        text.push_str(cell.symbol());
+                    if hidden_columns > 0 {
+                        hidden_columns -= 1;
+                        continue;
                     }
-                    hidden_columns = hidden_columns.max(cell.cell_width()).saturating_sub(1);
+                    let cell = &buffer[(x, y)];
+                    text.push_str(cell.symbol());
+                    // A wide glyph owns the cells that trail it. Folding their reported width back
+                    // in would skip the next real glyph too, which silently ate every second
+                    // character out of any CJK assertion.
+                    hidden_columns = usize::from(cell.cell_width()).saturating_sub(1);
                 }
                 text
             })
@@ -4007,7 +4147,7 @@ mod tests {
             ),
         ];
 
-        app.config_cursor = ConfigCursor::default().next().next();
+        app.config_cursor = ConfigCursor::default().next();
         for (item, note) in expected {
             assert_eq!(app.config_cursor.entry().item, item);
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -4561,9 +4701,11 @@ mod tests {
             app.settings.language = Some(language.code().to_string());
             app.language = Language::parse(language.code()).unwrap();
             app.screen = Screen::Config;
-            app.config_cursor = ConfigCursor::default().next().next();
+            app.config_cursor = ConfigCursor::default().next();
 
-            for (width, height) in [(100, 30), (52, 18), (40, 10), (39, 8)] {
+            // The tall case needs one row more than it used to: at this size the save button has
+            // earned its own row between the list and the detail pane.
+            for (width, height) in [(100, 31), (52, 18), (40, 10), (39, 8)] {
                 let backend = TestBackend::new(width, height);
                 let mut terminal = Terminal::new(backend).unwrap();
                 terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -4606,6 +4748,31 @@ mod tests {
                     assert!(text.contains("40×9"), "{}\n{text}", language.code());
                 }
             }
+
+            // The save button is the only surface reporting how much is pending, and its face is
+            // built by substitution, so a translation that mangles the placeholder shows up here.
+            let backend = TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            assert!(
+                contains_visible_text(
+                    &buffer_text(&terminal),
+                    app.config_messages().save_button_clean
+                ),
+                "{} resting save button",
+                language.code()
+            );
+            app.handle_key(key(KeyCode::Right));
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let pending = app
+                .config_messages()
+                .save_button_dirty
+                .replace("{count}", "1");
+            assert!(
+                contains_visible_text(&buffer_text(&terminal), &pending),
+                "{} pending save button",
+                language.code()
+            );
         }
     }
 
@@ -4623,13 +4790,13 @@ mod tests {
             app.screen = Screen::Config;
             for (cursor, expected_group, expected_item, expected_value) in [
                 (
-                    ConfigCursor::default().next_group().next_group(),
+                    cursor_for(ConfigItemId::SearchCpuLimit),
                     app.config_messages().search_group_title,
                     app.config_messages().cpu_limit_label,
-                    Some(app.config_messages().cpu_automatic),
+                    Some(app.config_messages().automatic_label),
                 ),
                 (
-                    ConfigCursor::default().previous(),
+                    cursor_for(ConfigItemId::ResetAll),
                     app.config_messages().reset_group_title,
                     app.config_messages().reset_all_label,
                     None,
@@ -4760,6 +4927,78 @@ mod tests {
         }
     }
 
+    /// The discard prompt is the last gate before edits are thrown away, so both choices have to
+    /// stay reachable at every supported width and in every language.
+    #[test]
+    fn discard_confirmation_keeps_both_choices_visible_in_all_languages() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ControlPaths::for_home(temp.path());
+        let executable = temp.path().join("source");
+        std::fs::write(&executable, b"binary").unwrap();
+
+        for language in ALL_LANGUAGES {
+            let mut app = App::for_test(paths.clone(), executable.clone());
+            app.settings.language = Some(language.code().to_string());
+            app.language = language;
+            app.screen = Screen::ConfigDiscardConfirm;
+            app.selected = 0;
+            for (width, height) in [(100, 30), (52, 18), (40, 10)] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                let text = buffer_text(&terminal);
+                for expected in ["✕", "✓"] {
+                    assert!(
+                        contains_visible_text(&text, expected),
+                        "{} missing {expected} at {width}x{height}\n{text}",
+                        language.code()
+                    );
+                }
+                assert_eq!(app.selected, 0);
+            }
+        }
+    }
+
+    /// Unsaved edits are only obvious if the page says so; a colour-only hint would vanish in
+    /// monochrome terminals and the save key would look like it does nothing.
+    #[test]
+    fn unsaved_edits_are_announced_on_the_row_the_title_and_the_footer() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ControlPaths::for_home(temp.path());
+        let executable = temp.path().join("source");
+        std::fs::write(&executable, b"binary").unwrap();
+        let mut app = App::for_test(paths, executable);
+        app.settings.language = Some("en".to_string());
+        app.language = Language::En;
+        app.screen = Screen::Config;
+        app.config_cursor = ConfigCursor::default();
+        let unsaved = app.config_messages().unsaved_changes;
+        let save_hint = app.messages().footer_save;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let clean = buffer_text(&terminal);
+        for absent in [unsaved, save_hint, "●"] {
+            assert!(
+                !contains_visible_text(&clean, absent),
+                "a saved page must not advertise {absent}\n{clean}"
+            );
+        }
+
+        app.config_draft.adjust(ConfigItemId::OutputTier, true);
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let dirty = buffer_text(&terminal);
+        for expected in [unsaved, save_hint, "●"] {
+            assert!(
+                contains_visible_text(&dirty, expected),
+                "an edited page must show {expected}\n{dirty}"
+            );
+        }
+    }
+
     #[test]
     fn guarded_tier_and_disable_warning_render_in_every_language_and_supported_width() {
         let temp = tempfile::tempdir().unwrap();
@@ -4831,7 +5070,7 @@ mod tests {
         ));
 
         app.config_cursor = ConfigCursor::default().next();
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::ReadBudget);
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let first_child = buffer_text(&terminal);
         assert!(!contains_visible_text(
@@ -4849,7 +5088,7 @@ mod tests {
         ));
 
         app.config_cursor = ConfigCursor::default();
-        for _ in 0..5 {
+        for _ in 0..4 {
             app.config_cursor = app.config_cursor.next();
         }
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::RunBudget);

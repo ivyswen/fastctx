@@ -44,7 +44,10 @@ impl Theme {
                 success: Color::Rgb(0x6e, 0x9e, 0x86),
                 warning: Color::Rgb(0xc4, 0x9a, 0x5b),
                 danger: Color::Rgb(0xcb, 0x5d, 0x56),
-                muted: Color::Rgb(0x73, 0x74, 0x75),
+                // Muted carries real values, not just decoration: a disabled toggle reads as
+                // muted while its enabled twin reads as success. Anything darker than this drops
+                // under 4.5:1 against `bg_raised` and the value disappears on the focused row.
+                muted: Color::Rgb(0x8a, 0x8c, 0x8e),
                 border: Color::Rgb(0x30, 0x32, 0x36),
             },
             ColorMode::Ansi256 => Self {
@@ -55,7 +58,7 @@ impl Theme {
                 success: Color::Indexed(108),
                 warning: Color::Indexed(179),
                 danger: Color::Indexed(167),
-                muted: Color::Indexed(243),
+                muted: Color::Indexed(246),
                 border: Color::Indexed(236),
             },
             ColorMode::Ansi16 => Self {
@@ -66,7 +69,10 @@ impl Theme {
                 success: Color::Green,
                 warning: Color::Yellow,
                 danger: Color::Red,
-                muted: Color::DarkGray,
+                // Sixteen colors hold no third grey, and `bg_raised` already spends the dark one.
+                // Muted therefore collapses onto `fg`: a flattened hierarchy still reads, whereas
+                // grey-on-grey erases the value outright.
+                muted: Color::Gray,
                 border: Color::DarkGray,
             },
             ColorMode::Monochrome => Self {
@@ -220,6 +226,35 @@ mod tests {
             Color::Indexed(_)
         ));
         assert_eq!(Theme::from_mode(ColorMode::Ansi16).accent, Color::White);
+    }
+
+    #[test]
+    fn no_value_colour_collapses_into_either_background() {
+        // A palette entry that equals the background does not merely look dim, it deletes the
+        // text: `muted` once matched `bg_raised` in sixteen colours, so a disabled toggle turned
+        // invisible on exactly the row the user had focused. Border is excluded because it draws
+        // rules and hierarchy glyphs rather than values.
+        for mode in [ColorMode::TrueColor, ColorMode::Ansi256, ColorMode::Ansi16] {
+            let theme = Theme::from_mode(mode);
+            for (role, colour) in [
+                ("fg", theme.fg),
+                ("accent", theme.accent),
+                ("success", theme.success),
+                ("warning", theme.warning),
+                ("danger", theme.danger),
+                ("muted", theme.muted),
+            ] {
+                assert_ne!(colour, theme.bg, "{role} matches bg in {mode:?}");
+                assert_ne!(
+                    colour, theme.bg_raised,
+                    "{role} matches bg_raised in {mode:?}"
+                );
+            }
+        }
+        // Monochrome is exempt by construction: every role is `Color::Reset` and the screens carry
+        // their meaning in glyphs and words instead.
+        let monochrome = Theme::from_mode(ColorMode::Monochrome);
+        assert_eq!(monochrome.muted, monochrome.bg_raised);
     }
 
     #[test]

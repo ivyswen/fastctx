@@ -358,22 +358,6 @@ impl ToolBudgetLevel {
         format!("{}%", self.percent())
     }
 
-    /// Adjusts the share by one percentage point, saturating at the ends of the range.
-    pub const fn step(self, forward: bool) -> Self {
-        let percent = self.percent();
-        let adjusted = if forward {
-            if percent >= 100 { 100 } else { percent + 1 }
-        } else if percent <= 1 {
-            1
-        } else {
-            percent - 1
-        };
-        match Self::from_percent(adjusted) {
-            Some(level) => level,
-            None => self,
-        }
-    }
-
     /// Parses a configuration-file spelling.
     ///
     /// The four fixed names are what releases before arbitrary percentages wrote, so they stay
