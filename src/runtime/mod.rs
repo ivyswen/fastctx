@@ -534,12 +534,15 @@ async fn monitor_idle(
     let interval = idle_timeout
         .div_f64(4.0)
         .clamp(Duration::from_millis(50), Duration::from_secs(30));
+    // First instant of the current unbroken run of registry-scan failures, if any.
+    let mut scan_failing_since: Option<Instant> = None;
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
             () = tokio::time::sleep(interval) => {}
         }
         if !state.activity.is_shutdown_eligible(idle_timeout) {
+            scan_failing_since = None;
             continue;
         }
         let Some(paths) = state.control_paths.get().cloned() else {
@@ -551,9 +554,11 @@ async fn monitor_idle(
         let running = tokio::task::spawn_blocking(move || {
             crate::shell::jobs::running_summaries(&paths).map(|jobs| !jobs.is_empty())
         })
-        .await;
+        .await
+        .unwrap_or_else(|error| Err(format!("the inspection task failed: {error}")));
         match running {
-            Ok(Ok(false)) => {
+            Ok(false) => {
+                scan_failing_since = None;
                 // A request may have arrived while the registry scan ran off-thread.
                 if !state.activity.is_shutdown_eligible(idle_timeout) {
                     continue;
@@ -562,12 +567,24 @@ async fn monitor_idle(
                     return;
                 }
             }
-            Ok(Ok(true)) => {}
-            Ok(Err(error)) => eprintln!(
-                "fastctx control center: cannot inspect running jobs for idle shutdown: {error}"
-            ),
+            Ok(true) => scan_failing_since = None,
             Err(error) => {
-                eprintln!("fastctx control center: running-job inspection task failed: {error}")
+                eprintln!(
+                    "fastctx control center: cannot inspect running jobs for idle shutdown: {error}"
+                );
+                // Fail open once scans have failed for a full idle window: one damaged registry
+                // record fails every scan, and a host that insists on a clean scan before exiting
+                // would never exit. Exiting is safe — job supervisors are detached processes and
+                // the next connection bootstraps a fresh host that reads the same on-disk registry.
+                let failing_since = *scan_failing_since.get_or_insert_with(Instant::now);
+                if failing_since.elapsed() >= idle_timeout {
+                    eprintln!(
+                        "fastctx control center: registry scans kept failing for a full idle window; shutting down anyway."
+                    );
+                    if candidate.send(()).await.is_err() {
+                        return;
+                    }
+                }
             }
         }
     }

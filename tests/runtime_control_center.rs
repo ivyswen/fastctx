@@ -558,6 +558,37 @@ fn running_job_delays_zero_connection_idle_exit() {
 }
 
 #[test]
+fn a_damaged_job_record_does_not_pin_the_control_center_open() {
+    let _serial = runtime_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let damaged = home.join(".fastctx/jobs/j-abc123");
+    std::fs::create_dir_all(&damaged).unwrap();
+    std::fs::write(damaged.join("meta.json"), "not json {").unwrap();
+    let event_log = temp.path().join("runtime-events.log");
+    let mut command = server_command(&home, &workspace, &event_log);
+    command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", "300");
+    let mut session = McpSession::start(command);
+    let response = session.call(
+        "run",
+        serde_json::json!({"command": "printf ready", "login_shell": false}),
+    );
+    assert!(mcp_text(&response).starts_with("ready"), "{response}");
+    let host = wait_for_host_starts(&event_log, 1, PROCESS_DEADLINE)[0];
+    assert!(session.close().success());
+
+    // Guards the fail-open exit: the damaged record fails every registry scan, so a host that
+    // insisted on a clean scan before exiting would sit here forever as a zero-connection zombie.
+    wait_for_process_exit(host, PROCESS_DEADLINE);
+    assert!(
+        damaged.join("meta.json").is_file(),
+        "idle shutdown must not silently repair or remove the damaged record"
+    );
+}
+
+#[test]
 fn multiple_idle_connections_resume_together_through_the_same_host() {
     let _serial = runtime_guard();
     let temp = tempfile::tempdir().unwrap();
