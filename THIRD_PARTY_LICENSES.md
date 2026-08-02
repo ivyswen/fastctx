@@ -10,5 +10,5 @@ Abseil, AGG, fast_float, FreeType, ICU, Little CMS, libjpeg-turbo, OpenJPEG,
 libpng, libtiff, LLVM libc, simdutf, and zlib.
 
 Rust dependency license metadata is available through `cargo metadata` and the
-corresponding crate packages. The project itself is available under either the
-MIT License or Apache License 2.0.
+corresponding crate packages. The project itself is available under the Apache
+License 2.0.

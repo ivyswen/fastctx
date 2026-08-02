@@ -7,12 +7,12 @@ $root = Split-Path -Parent $PSScriptRoot
 $destination = Join-Path $root $OutputDirectory
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
 $cargoVersion = (Select-String -LiteralPath (Join-Path $root "Cargo.toml") -Pattern '^version = "([^"]+)"$').Matches[0].Groups[1].Value
-$licenseFiles = @("licenses/LICENSE-MIT", "licenses/LICENSE-APACHE", "licenses/NOTICE", "licenses/THIRD_PARTY_LICENSES.md")
+$licenseFiles = @("licenses/LICENSE-APACHE", "licenses/NOTICE", "licenses/THIRD_PARTY_LICENSES.md")
 
 function Stage-Licenses([string]$Directory) {
     $licenseDirectory = Join-Path $Directory "licenses"
     New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
-    foreach ($name in @("LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")) {
+    foreach ($name in @("LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")) {
         Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $licenseDirectory $name) -Force
     }
 }

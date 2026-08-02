@@ -57,7 +57,7 @@ if ($sourceHash -ne $stagedHash) {
 function Stage-Licenses([string]$Directory) {
     $licenseDirectory = Join-Path $Directory "licenses"
     New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
-    foreach ($name in @("LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")) {
+    foreach ($name in @("LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")) {
         Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $licenseDirectory $name) -Force
     }
 }
@@ -104,7 +104,7 @@ function Pack-CheckedPackage([string]$Directory, [string[]]$AllowedFiles) {
     }
 }
 
-$licenseFiles = @("licenses/LICENSE-MIT", "licenses/LICENSE-APACHE", "licenses/NOTICE", "licenses/THIRD_PARTY_LICENSES.md")
+$licenseFiles = @("licenses/LICENSE-APACHE", "licenses/NOTICE", "licenses/THIRD_PARTY_LICENSES.md")
 Pack-CheckedPackage $packageDirectory (@("package.json", "bin/$($entry.Name)") + $licenseFiles)
 
 if ($IncludeRootPackages) {

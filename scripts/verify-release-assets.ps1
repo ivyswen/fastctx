@@ -15,7 +15,7 @@ $archives = [ordered]@{
     "fastctx-aarch64-apple-darwin.tar.gz" = "fastctx"
 }
 $releaseFiles = @($archives.Keys) + @("SHA256SUMS")
-$licenseFiles = @("LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")
+$licenseFiles = @("LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")
 $tarCommand = if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )) {

@@ -384,7 +384,11 @@ FastCtx 使用 `toml_edit` 修改已有 TOML，保留注释、格式和其他配
 
 ## License
 
-FastCtx 采用 MIT OR Apache-2.0 双许可证。再分发时须保留 [`NOTICE`](./NOTICE) 文件。内嵌 Pdfium 的第三方许可见 [`THIRD_PARTY_LICENSES.md`](./THIRD_PARTY_LICENSES.md)。
+FastCtx 采用 Apache License 2.0。
+
+再分发 FastCtx、将其内置进其他产品，或在其之上构建时，第 4(d) 条要求你在第三方声明通常出现的位置复现 [`NOTICE`](./NOTICE) 中的归属声明——对源码仓库而言，即你的 README。该声明标明来源 https://github.com/yc-duan/fastctx ，并写明你所做的改动是你自己的工作与你独自的责任，不代表本项目作者的认可，作者亦不承担由此产生的任何责任。第 4(b) 条另行要求你修改过的文件带有显著的修改声明。
+
+内嵌 Pdfium 的第三方许可见 [`THIRD_PARTY_LICENSES.md`](./THIRD_PARTY_LICENSES.md)。
 
 ## 联系方式
 

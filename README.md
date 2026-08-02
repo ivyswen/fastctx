@@ -390,7 +390,11 @@ FastCtx edits existing TOML with `toml_edit`, preserving comments, formatting, a
 
 ## License
 
-FastCtx is dual-licensed under MIT OR Apache-2.0. Redistributions must retain the [`NOTICE`](./NOTICE) file. Third-party notices for the bundled Pdfium build are listed in [`THIRD_PARTY_LICENSES.md`](./THIRD_PARTY_LICENSES.md).
+FastCtx is licensed under the Apache License 2.0.
+
+If you redistribute FastCtx, bundle it into another product, or build on top of it, Section 4(d) requires you to reproduce the attribution notice in [`NOTICE`](./NOTICE) wherever third-party notices normally appear — for a source repository, that means your README. That notice credits https://github.com/yc-duan/fastctx and states that your changes are your own work and your sole responsibility, carrying no endorsement or liability from this project's author. Section 4(b) separately requires files you modified to carry prominent notices that you changed them.
+
+Third-party notices for the bundled Pdfium build are listed in [`THIRD_PARTY_LICENSES.md`](./THIRD_PARTY_LICENSES.md).
 
 ## Contact
 

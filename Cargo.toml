@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "FastCtx — fast, context-efficient repository tools for AI agents."
 authors = ["yc-duan <dy2958830371@gmail.com>"]
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/yc-duan/fastctx"
 readme = "README.md"
 documentation = "https://docs.rs/fastctx"
@@ -16,7 +16,6 @@ include = [
     "/src/**",
     "/tests/**",
     "/README.md",
-    "/LICENSE-MIT",
     "/LICENSE-APACHE",
     "/NOTICE",
     "/THIRD_PARTY_LICENSES.md",

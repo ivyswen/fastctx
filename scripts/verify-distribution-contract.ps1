@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $cargoVersion = (Select-String -LiteralPath (Join-Path $root "Cargo.toml") -Pattern '^version = "([^"]+)"$').Matches[0].Groups[1].Value
 $author = "yc-duan <dy2958830371@gmail.com>"
-$license = "MIT OR Apache-2.0"
+$license = "Apache-2.0"
 $platforms = [ordered]@{
     "fastctx-win32-x64" = "@fastctx/win32-x64"
     "fastctx-linux-x64" = "@fastctx/linux-x64"
@@ -78,7 +78,7 @@ if ($privatePaths.Count -ne 0) {
     throw "Private design or agent files leaked into the public tree: $($privatePaths -join ', ')"
 }
 
-foreach ($name in @("LICENSE-MIT", "LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")) {
+foreach ($name in @("LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")) {
     if (-not (Test-Path -LiteralPath (Join-Path $root $name) -PathType Leaf)) {
         throw "Missing release license file: $name"
     }

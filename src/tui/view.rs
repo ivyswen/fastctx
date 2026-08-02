@@ -2380,7 +2380,7 @@ fn render_about(frame: &mut Frame<'_>, app: &App, area: Rect) {
             "https://github.com/yc-duan/fastctx/issues",
             Style::default().fg(theme::muted()),
         ),
-        Line::styled("MIT OR Apache-2.0", Style::default().fg(theme::muted())),
+        Line::styled("Apache-2.0", Style::default().fg(theme::muted())),
         Line::styled(
             "Copyright (c) 2026 yc-duan <dy2958830371@gmail.com>",
             Style::default().fg(theme::muted()),
@@ -2915,7 +2915,7 @@ fn render_narrow_about(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 "https://github.com/yc-duan/fastctx/issues",
                 Style::default().fg(theme::muted()),
             ),
-            Line::styled("MIT OR Apache-2.0", Style::default().fg(theme::muted())),
+            Line::styled("Apache-2.0", Style::default().fg(theme::muted())),
         ],
     );
 }
@@ -4343,7 +4343,7 @@ mod tests {
         app.handle_key(key(KeyCode::End));
         let about_end = render_text(&mut terminal, &mut app);
         assert!(
-            contains_visible_text(&about_end, "MIT OR Apache-2.0"),
+            contains_visible_text(&about_end, "Apache-2.0"),
             "{about_end}"
         );
 

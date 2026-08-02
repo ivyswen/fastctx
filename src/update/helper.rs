@@ -884,7 +884,6 @@ fn validate_flat_archive_name(name: &str) -> Result<&str, String> {
 fn validate_archive_contents(names: &BTreeSet<String>, binary_name: &str) -> Result<(), String> {
     let expected = BTreeSet::from([
         binary_name.to_string(),
-        "LICENSE-MIT".to_string(),
         "LICENSE-APACHE".to_string(),
         "NOTICE".to_string(),
         "THIRD_PARTY_LICENSES.md".to_string(),
@@ -2023,7 +2022,6 @@ mod tests {
     fn release_entries(binary_name: &'static str) -> Vec<(&'static str, &'static [u8])> {
         vec![
             (binary_name, b"release binary"),
-            ("LICENSE-MIT", b"MIT"),
             ("LICENSE-APACHE", b"Apache"),
             ("NOTICE", b"Notice"),
             ("THIRD_PARTY_LICENSES.md", b"Third party"),
