@@ -157,8 +157,22 @@ jobs:
       - name: Test contracts
         run: cargo test --locked --all-features --target ${{ matrix.target }}
 
+      # Contract tests leave control centers riding out their idle window and
+      # detached job supervisors finishing their commands. Windows cannot
+      # replace a mapped binary, so the next cargo invocation would fail with
+      # os error 5 while relinking the same target. Drain between groups.
+      - name: Drain test processes
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/drain-test-processes.ps1
+
       - name: Test contracts without PDF support
         run: cargo test --locked --no-default-features --target ${{ matrix.target }}
+
+      - name: Drain test processes before the release profile
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/drain-test-processes.ps1
 
       - name: Test release profile
         run: cargo test --locked --release --target ${{ matrix.target }}
@@ -192,6 +206,11 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 22
+
+      - name: Drain test processes before packaging
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/drain-test-processes.ps1
 
       - name: Build npm binary
         run: cargo build --locked --release --target ${{ matrix.target }}
