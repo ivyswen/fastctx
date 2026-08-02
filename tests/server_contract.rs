@@ -24,11 +24,16 @@ fn isolated_home() -> &'static std::path::Path {
 
 /// Spawns the MCP binary with the control-center idle timeout shared by the test tree.
 fn fastctx_command() -> Command {
+    fastctx_command_for_home(isolated_home())
+}
+
+fn fastctx_command_for_home(home: &std::path::Path) -> Command {
+    std::fs::create_dir_all(home).expect("the isolated server profile should be creatable");
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
     command
         .env("FASTCTX_TEST_RUNTIME_IDLE_MS", common::TEST_HOST_IDLE_MS)
-        .env("HOME", isolated_home())
-        .env("USERPROFILE", isolated_home());
+        .env("HOME", home)
+        .env("USERPROFILE", home);
     command
 }
 
@@ -544,10 +549,9 @@ fn non_pdf_stdio_calls_do_not_extract_the_bundled_engine() {
     let file = temp.path().join("plain.txt");
     write(&file, b"plain");
     let cache_root = temp.path().join("cache-root");
-    let build_id = format!("pdf-lazy-{}", std::process::id());
-    let mut command = fastctx_command();
+    let home = temp.path().join("home");
+    let mut command = fastctx_command_for_home(&home);
     command
-        .env("FASTCTX_TEST_BUILD_ID", build_id)
         .current_dir(temp.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -612,10 +616,9 @@ fn stdio_pdf_call_extracts_one_hashed_engine_and_preserves_image_meta() {
     let pdf = temp.path().join("page.pdf");
     write_pdf(&pdf, &[Some("MCP PDF one"), Some("MCP PDF two")]);
     let cache_root = temp.path().join("cache-root");
-    let build_id = format!("pdf-extract-{}", std::process::id());
-    let mut command = fastctx_command();
+    let home = temp.path().join("home");
+    let mut command = fastctx_command_for_home(&home);
     command
-        .env("FASTCTX_TEST_BUILD_ID", build_id)
         .current_dir(temp.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1095,10 +1098,11 @@ fn stdio_pdf_initialization_uses_the_request_session_cache_environment() {
     write_pdf(&pdf, &[Some("Session cache")]);
     let bootstrap_cache = temp.path().join("bootstrap-cache");
     let request_cache = temp.path().join("request-cache");
-    let build_id = format!("pdf-session-{}", std::process::id());
+    let home = temp.path().join("home");
 
-    let mut bootstrap = fastctx_command();
-    bootstrap.env("FASTCTX_TEST_BUILD_ID", &build_id);
+    // A shared private HOME selects one fresh control center in every build profile; unlike the
+    // debug-only build-id hook, this also keeps release tests isolated from an earlier PDF user.
+    let mut bootstrap = fastctx_command_for_home(&home);
     let bootstrap_engine = configure_isolated_cache(&mut bootstrap, &bootstrap_cache);
     let first = call_tool(
         bootstrap,
@@ -1107,8 +1111,7 @@ fn stdio_pdf_initialization_uses_the_request_session_cache_environment() {
     );
     assert_eq!(first["result"]["isError"], false);
 
-    let mut request = fastctx_command();
-    request.env("FASTCTX_TEST_BUILD_ID", &build_id);
+    let mut request = fastctx_command_for_home(&home);
     let request_engine = configure_isolated_cache(&mut request, &request_cache);
     let second = call_tool(
         request,
