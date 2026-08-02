@@ -8,11 +8,27 @@ use rmcp::ServerHandler;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+/// One temporary profile shared by every server this binary spawns.
+///
+/// An inherited HOME resolves the control-center endpoint, the Codex profile, and the provider
+/// guard from the developer's real machine. A third-party provider there activates Guarded mode,
+/// which silently rewrites the budget variables these tests set. CI images have no Codex profile,
+/// so the failure only ever appears on a developer machine.
+fn isolated_home() -> &'static std::path::Path {
+    static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
+    HOME.get_or_init(|| tempfile::tempdir().expect("a temporary profile for the test servers"))
+        .path()
+}
 
 /// Spawns the MCP binary with the control-center idle timeout shared by the test tree.
 fn fastctx_command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
-    command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", common::TEST_HOST_IDLE_MS);
+    command
+        .env("FASTCTX_TEST_RUNTIME_IDLE_MS", common::TEST_HOST_IDLE_MS)
+        .env("HOME", isolated_home())
+        .env("USERPROFILE", isolated_home());
     command
 }
 

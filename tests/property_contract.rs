@@ -38,8 +38,12 @@ fn independent_o200k_oracle_keeps_high_entropy_outputs_below_the_budget() {
     }
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    // HOME isolation keeps the developer's real Codex profile (and its provider guard, which
+    // rewrites budget variables) out of this session's environment.
     command
         .args(["serve", "--enable-shell"])
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path())
         .env("FASTCTX_TOKEN_BUDGET", BUDGET.to_string())
         .env("FASTCTX_READ_TOKEN_BUDGET", BUDGET.to_string())
         .env("FASTCTX_GREP_TOKEN_BUDGET", BUDGET.to_string())
@@ -154,6 +158,8 @@ fn stdio_grep_and_glob_errors_obey_tiny_budgets_with_an_independent_oracle() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
         command
             .arg("serve")
+            .env("HOME", temp.path())
+            .env("USERPROFILE", temp.path())
             .env("FASTCTX_TOKEN_BUDGET", budget.to_string())
             .env("FASTCTX_GREP_TOKEN_BUDGET", budget.to_string())
             .env("FASTCTX_GLOB_TOKEN_BUDGET", budget.to_string());

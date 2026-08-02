@@ -15,7 +15,10 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-const PROCESS_DEADLINE: Duration = Duration::from_secs(15);
+// Every use is a positive poll-until wait, so widening only delays failure reports. Some waits
+// cover real command runtime: pushing 2 MiB through the Git Bash pipe plus supervisor draining
+// measures 15-18 s on a loaded Windows host, which sat exactly on the previous 15 s deadline.
+const PROCESS_DEADLINE: Duration = Duration::from_secs(45);
 
 #[test]
 fn unavailable_control_center_falls_back_before_stdin_is_consumed_and_reports_it() {

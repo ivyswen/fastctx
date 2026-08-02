@@ -349,7 +349,14 @@ fn edit_session(root: &Path, budget: Option<&str>) -> McpSession {
 
 fn edit_command(root: &Path, budget: Option<&str>, compatibility_flag: bool) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
-    command.arg("serve").current_dir(root);
+    // Isolate the session from the developer's real profile: an inherited HOME resolves the
+    // control-center endpoint, the Codex config, and the provider guard from the machine's real
+    // configuration, which silently rewrites this session's budget variables under Guarded mode.
+    command
+        .arg("serve")
+        .current_dir(root)
+        .env("HOME", root)
+        .env("USERPROFILE", root);
     if compatibility_flag {
         command.arg("--enable-edit");
     }
