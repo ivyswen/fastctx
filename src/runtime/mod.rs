@@ -325,7 +325,7 @@ pub(crate) async fn run_host_entry(
     let state = HostState::new();
     let shutdown = CancellationToken::new();
     let idle_timeout = idle_timeout_ms
-        .or_else(|| debug_duration_override(&environment, "FASTCTX_TEST_RUNTIME_IDLE_MS"))
+        .or_else(|| duration_override(&environment, "FASTCTX_TEST_RUNTIME_IDLE_MS"))
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_IDLE_TIMEOUT);
     let (idle_candidate_tx, mut idle_candidate_rx) = tokio::sync::mpsc::channel(1);
@@ -339,9 +339,7 @@ pub(crate) async fn run_host_entry(
         Arc::clone(&state),
         shutdown.clone(),
         maintenance_interval_ms
-            .or_else(|| {
-                debug_duration_override(&environment, "FASTCTX_TEST_RUNTIME_MAINTENANCE_MS")
-            })
+            .or_else(|| duration_override(&environment, "FASTCTX_TEST_RUNTIME_MAINTENANCE_MS"))
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL),
     ));
@@ -415,14 +413,14 @@ pub(crate) async fn run_host_entry(
     Ok(())
 }
 
-#[cfg(debug_assertions)]
-fn debug_duration_override(environment: &SessionEnvironment, name: &str) -> Option<u64> {
+/// Reads a millisecond timer override for the control center's own loops.
+///
+/// Deliberately honoured in every profile. While this was `debug_assertions`-only, one release
+/// test run left sixty-five control centers holding the production ten-minute timeout, which is
+/// the very process pile-up this runtime exists to remove. Both timers only shorten the host's
+/// own life, so a value from the environment cannot outlive or override a caller's session.
+fn duration_override(environment: &SessionEnvironment, name: &str) -> Option<u64> {
     environment.var(name).ok()?.parse::<u64>().ok()
-}
-
-#[cfg(not(debug_assertions))]
-fn debug_duration_override(_environment: &SessionEnvironment, _name: &str) -> Option<u64> {
-    None
 }
 
 #[cfg(debug_assertions)]
