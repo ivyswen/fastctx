@@ -1,10 +1,11 @@
 //! Byte-preserving editable text snapshots, line anchors, CAS, and atomic commit.
 
 use crate::control::transaction;
-use crate::encoding::{EditableDecodedText, EncodingDecision, ValidatedFileEncoding};
+use crate::encoding::{EncodingDecision, ValidatedFileEncoding};
 use crate::paths::{display_path, io_error_message, missing_file_message, parse_input_path};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -16,8 +17,8 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-pub(crate) const MAX_EDIT_FILE_BYTES: u64 = 64 * 1024 * 1024;
-pub(crate) const MAX_REPLACE_RESULT_BYTES: usize = 256 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
+const OFFSET_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Newline style used for every boundary introduced by an edit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,8 +38,34 @@ impl EolStyle {
 
 struct LogicalView {
     logical: String,
-    raw_boundaries: Vec<Option<usize>>,
+    source_line_endings: SourceLineEndings,
     eol: EolStyle,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourceLineEndings {
+    crlf_bits: Vec<u64>,
+    len: usize,
+}
+
+impl SourceLineEndings {
+    fn push(&mut self, is_crlf: bool) {
+        let index = self.len;
+        if index.is_multiple_of(64) {
+            self.crlf_bits.push(0);
+        }
+        if is_crlf {
+            self.crlf_bits[index / 64] |= 1_u64 << (index % 64);
+        }
+        self.len = self.len.saturating_add(1);
+    }
+
+    fn is_crlf(&self, index: usize) -> bool {
+        debug_assert!(index < self.len);
+        self.crlf_bits
+            .get(index / 64)
+            .is_some_and(|bits| bits & (1_u64 << (index % 64)) != 0)
+    }
 }
 
 /// Frozen source bytes and every derived view needed for safe line edits.
@@ -49,7 +76,7 @@ pub(crate) struct TextDocument {
     raw: Vec<u8>,
     validated: ValidatedFileEncoding,
     logical: String,
-    logical_raw_boundaries: Vec<Option<usize>>,
+    source_line_endings: SourceLineEndings,
     eol: EolStyle,
     trailing_newline: bool,
     unix_mode: Option<u32>,
@@ -57,7 +84,11 @@ pub(crate) struct TextDocument {
 
 impl TextDocument {
     /// Opens one absolute regular-file target, following symlinks while preserving the link itself.
-    pub(crate) fn open(file_path: &str, encoding: Option<&str>) -> Result<Self, String> {
+    pub(crate) fn open(
+        file_path: &str,
+        encoding: Option<&str>,
+        max_file_size_mib: u64,
+    ) -> Result<Self, String> {
         let requested_path = parse_input_path(file_path);
         if !requested_path.is_absolute() {
             return Err(missing_file_message(file_path));
@@ -79,14 +110,17 @@ impl TextDocument {
                 display_path(&requested_path)
             ));
         }
-        if metadata.len() > MAX_EDIT_FILE_BYTES {
-            return Err(format!(
-                "File too large for line edits: {} is {:.1} MiB (limit: 64 MiB).",
-                display_path(&requested_path),
-                metadata.len() as f64 / 1_048_576.0
-            ));
-        }
-        let raw = fs::read(&target_path).map_err(|error| io_error_message(&target_path, &error))?;
+        let maximum_bytes = max_file_size_mib.saturating_mul(MIB);
+        let raw = match read_limited(&target_path, maximum_bytes)? {
+            LimitedRead::Bytes(raw) => raw,
+            LimitedRead::TooLarge(actual_bytes) => {
+                return Err(file_too_large_message(
+                    &requested_path,
+                    actual_bytes,
+                    max_file_size_mib,
+                ));
+            }
+        };
         let validated = match crate::encoding::validate_file_encoding(&target_path, encoding)
             .map_err(|error| io_error_message(&target_path, &error))?
         {
@@ -101,9 +135,7 @@ impl TextDocument {
                 return Err(rejection.message(&display_path(&requested_path)));
             }
         };
-        let current =
-            fs::read(&target_path).map_err(|error| io_error_message(&target_path, &error))?;
-        if current != raw {
+        if !file_matches_bytes(&target_path, &raw)? {
             return Err(concurrent_message(&requested_path));
         }
         let editable = validated.decode_editable_snapshot(&raw).map_err(|reason| {
@@ -114,9 +146,9 @@ impl TextDocument {
         })?;
         let LogicalView {
             logical,
-            raw_boundaries: logical_raw_boundaries,
+            source_line_endings,
             eol,
-        } = logical_view(&editable)?;
+        } = logical_view(editable);
         let trailing_newline = logical.ends_with('\n');
         let unix_mode = transaction::existing_unix_mode(&target_path);
         Ok(Self {
@@ -125,7 +157,7 @@ impl TextDocument {
             raw,
             validated,
             logical,
-            logical_raw_boundaries,
+            source_line_endings,
             eol,
             trailing_newline,
             unix_mode,
@@ -161,15 +193,15 @@ impl TextDocument {
     }
 
     /// Commits one frozen snapshot if and only if the target still equals B0.
-    pub(crate) fn commit(&self, new_bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn commit(mut self, new_bytes: &[u8]) -> Result<(), String> {
         #[cfg(test)]
         run_before_commit_hook(&self.target_path);
-        let current = fs::read(&self.target_path)
-            .map_err(|error| io_error_message(&self.target_path, &error))?;
-        if current != self.raw {
+        drop(std::mem::take(&mut self.logical));
+        if !file_matches_bytes(&self.target_path, &self.raw)? {
             return Err(concurrent_message(&self.requested_path));
         }
         reject_hard_link(&self.target_path)?;
+        drop(std::mem::take(&mut self.raw));
         transaction::atomic_replace(&self.target_path, new_bytes, self.unix_mode, false)
     }
 
@@ -184,14 +216,71 @@ impl TextDocument {
         })
     }
 
-    pub(crate) fn raw_offset(&self, logical_offset: usize) -> Result<usize, String> {
-        self.logical_raw_boundaries
-            .get(logical_offset)
-            .and_then(|offset| *offset)
-            .ok_or_else(|| {
+    pub(crate) fn raw_offset_cursor(&self) -> Result<RawOffsetCursor<'_>, String> {
+        let carriage_return_bytes = self.validated.encode_fragment("\r").ok_or_else(|| {
+            format!(
+                "Internal edit failure: source encoding {} cannot reproduce line endings.",
+                self.encoding_label()
+            )
+        })?;
+        Ok(RawOffsetCursor {
+            document: self,
+            logical_offset: 0,
+            raw_offset: self.validated.editable_raw_start(),
+            newline_index: 0,
+            carriage_return_bytes: carriage_return_bytes.len(),
+        })
+    }
+}
+
+pub(crate) struct RawOffsetCursor<'a> {
+    document: &'a TextDocument,
+    logical_offset: usize,
+    raw_offset: usize,
+    newline_index: usize,
+    carriage_return_bytes: usize,
+}
+
+impl RawOffsetCursor<'_> {
+    /// Advances monotonically through logical text while reconstructing original raw offsets.
+    pub(crate) fn advance_to(&mut self, target: usize) -> Result<usize, String> {
+        let logical = self.document.logical_text();
+        if target < self.logical_offset
+            || target > logical.len()
+            || !logical.is_char_boundary(target)
+        {
+            return Err(
                 "Internal edit failure: a logical range did not end on a character boundary."
-                    .to_string()
-            })
+                    .to_string(),
+            );
+        }
+        while self.logical_offset < target {
+            let end = next_char_boundary(logical, self.logical_offset, target, OFFSET_CHUNK_BYTES);
+            let chunk = &logical[self.logical_offset..end];
+            let encoded = self
+                .document
+                .validated
+                .encode_fragment(chunk)
+                .ok_or_else(|| {
+                    format!(
+                        "Internal edit failure: source encoding {} cannot reproduce unchanged text.",
+                        self.document.encoding_label()
+                    )
+                })?;
+            self.raw_offset = self.raw_offset.saturating_add(encoded.len());
+            for _ in chunk.bytes().filter(|byte| *byte == b'\n') {
+                if self
+                    .document
+                    .source_line_endings
+                    .is_crlf(self.newline_index)
+                {
+                    self.raw_offset = self.raw_offset.saturating_add(self.carriage_return_bytes);
+                }
+                self.newline_index = self.newline_index.saturating_add(1);
+            }
+            self.logical_offset = end;
+        }
+        Ok(self.raw_offset)
     }
 }
 
@@ -209,50 +298,123 @@ fn run_before_commit_hook(path: &Path) {
     });
 }
 
-fn logical_view(editable: &EditableDecodedText) -> Result<LogicalView, String> {
-    let mut logical = String::with_capacity(editable.text.len());
-    let mut boundaries = vec![None; editable.text.len().saturating_add(1)];
-    boundaries[0] = editable.raw_boundaries[0];
+fn logical_view(text: String) -> LogicalView {
+    let mut bytes = text.into_bytes();
+    let mut source_line_endings = SourceLineEndings::default();
     let mut crlf = 0_usize;
     let mut lf = 0_usize;
-    let mut cursor = 0_usize;
-    while cursor < editable.text.len() {
-        let character = editable.text[cursor..]
-            .chars()
-            .next()
-            .expect("cursor remains on a character boundary");
-        let next = cursor + character.len_utf8();
-        if character == '\r' && editable.text[next..].starts_with('\n') {
-            let decoded_end = next + 1;
-            let logical_start = logical.len();
-            logical.push('\n');
-            boundaries.resize(logical.len() + 1, None);
-            boundaries[logical_start] = editable.raw_boundaries[cursor];
-            boundaries[logical.len()] = editable.raw_boundaries[decoded_end];
+    let mut read = 0_usize;
+    let mut write = 0_usize;
+    while read < bytes.len() {
+        if bytes[read] == b'\r' && bytes.get(read + 1) == Some(&b'\n') {
+            bytes[write] = b'\n';
+            write += 1;
+            read += 2;
+            source_line_endings.push(true);
             crlf += 1;
-            cursor = decoded_end;
             continue;
         }
-        let logical_start = logical.len();
-        logical.push(character);
-        boundaries.resize(logical.len() + 1, None);
-        boundaries[logical_start] = editable.raw_boundaries[cursor];
-        boundaries[logical.len()] = editable.raw_boundaries[next];
-        if character == '\n' {
+        let byte = bytes[read];
+        bytes[write] = byte;
+        write += 1;
+        read += 1;
+        if byte == b'\n' {
+            source_line_endings.push(false);
             lf += 1;
         }
-        cursor = next;
     }
+    bytes.truncate(write);
+    let logical = String::from_utf8(bytes).expect("removing ASCII CR bytes preserves UTF-8");
     let eol = if crlf > lf {
         EolStyle::Crlf
     } else {
         EolStyle::Lf
     };
-    Ok(LogicalView {
+    LogicalView {
         logical,
-        raw_boundaries: boundaries,
+        source_line_endings,
         eol,
-    })
+    }
+}
+
+fn next_char_boundary(text: &str, start: usize, target: usize, maximum_bytes: usize) -> usize {
+    let mut end = start.saturating_add(maximum_bytes).min(target);
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == start { target } else { end }
+}
+
+enum LimitedRead {
+    Bytes(Vec<u8>),
+    TooLarge(u64),
+}
+
+fn read_limited(path: &Path, maximum_bytes: u64) -> Result<LimitedRead, String> {
+    let mut file = fs::File::open(path).map_err(|error| io_error_message(path, &error))?;
+    let initial_len = file
+        .metadata()
+        .map_err(|error| io_error_message(path, &error))?
+        .len();
+    if initial_len > maximum_bytes {
+        return Ok(LimitedRead::TooLarge(initial_len));
+    }
+    let capacity = usize::try_from(initial_len).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut buffer = [0_u8; OFFSET_CHUNK_BYTES];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| io_error_message(path, &error))?;
+        if count == 0 {
+            return Ok(LimitedRead::Bytes(bytes));
+        }
+        let projected = bytes.len().saturating_add(count);
+        if u64::try_from(projected).unwrap_or(u64::MAX) > maximum_bytes {
+            let observed = file
+                .metadata()
+                .map(|metadata| metadata.len())
+                .unwrap_or(maximum_bytes.saturating_add(1))
+                .max(u64::try_from(projected).unwrap_or(u64::MAX));
+            return Ok(LimitedRead::TooLarge(observed));
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn file_matches_bytes(path: &Path, expected: &[u8]) -> Result<bool, String> {
+    let mut file = fs::File::open(path).map_err(|error| io_error_message(path, &error))?;
+    if file
+        .metadata()
+        .map_err(|error| io_error_message(path, &error))?
+        .len()
+        != u64::try_from(expected.len()).unwrap_or(u64::MAX)
+    {
+        return Ok(false);
+    }
+    let mut offset = 0_usize;
+    let mut buffer = [0_u8; OFFSET_CHUNK_BYTES];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| io_error_message(path, &error))?;
+        if count == 0 {
+            return Ok(offset == expected.len());
+        }
+        let end = offset.saturating_add(count);
+        if expected.get(offset..end) != Some(&buffer[..count]) {
+            return Ok(false);
+        }
+        offset = end;
+    }
+}
+
+fn file_too_large_message(path: &Path, actual_bytes: u64, maximum_mib: u64) -> String {
+    format!(
+        "File too large for line edits: {} is {:.1} MiB (limit: {maximum_mib} MiB).",
+        display_path(path),
+        actual_bytes as f64 / 1_048_576.0
+    )
 }
 
 fn resolve_target(requested: &Path) -> Result<PathBuf, String> {
@@ -339,11 +501,12 @@ mod tests {
             raw.extend(unit.to_le_bytes());
         }
         std::fs::write(&path, &raw).unwrap();
-        let document = TextDocument::open(path.to_str().unwrap(), None).unwrap();
+        let document = TextDocument::open(path.to_str().unwrap(), None, 256).unwrap();
         let start = document.logical_text().find("two").unwrap();
         let end = start + "two".len();
-        let raw_start = document.raw_offset(start).unwrap();
-        let raw_end = document.raw_offset(end).unwrap();
+        let mut cursor = document.raw_offset_cursor().unwrap();
+        let raw_start = cursor.advance_to(start).unwrap();
+        let raw_end = cursor.advance_to(end).unwrap();
         let mut result = Vec::new();
         result.extend_from_slice(&document.original_bytes()[..raw_start]);
         result.extend_from_slice(&document.encode_for_target("TWO").unwrap());
@@ -359,7 +522,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let link = temp.path().join("dangling.txt");
         symlink(temp.path().join("missing.txt"), &link).unwrap();
-        let error = TextDocument::open(link.to_str().unwrap(), None).unwrap_err();
+        let error = TextDocument::open(link.to_str().unwrap(), None, 256).unwrap_err();
         assert_eq!(
             error,
             format!(

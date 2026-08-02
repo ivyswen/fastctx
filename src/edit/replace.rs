@@ -1,6 +1,6 @@
 //! Two-pass batch replacement with full blast-radius counting and per-file CAS commits.
 
-use super::document::{MAX_REPLACE_RESULT_BYTES, TextDocument};
+use super::document::TextDocument;
 use super::locks::{FilePathLock, PathIdentity};
 use super::{ReplaceRequest, ReplaceService, edit_token_budget, plural};
 use crate::budget::{
@@ -39,7 +39,11 @@ struct ReportGroup {
     lines: Vec<String>,
 }
 
-pub(super) fn replace(editor: &ReplaceService, request: ReplaceRequest) -> ToolResponse {
+pub(super) fn replace(
+    editor: &ReplaceService,
+    request: ReplaceRequest,
+    max_file_size_mib: u64,
+) -> ToolResponse {
     let budget = match edit_token_budget() {
         Ok(budget) => budget,
         Err(error) => return ToolResponse::error(error),
@@ -116,6 +120,7 @@ pub(super) fn replace(editor: &ReplaceService, request: ReplaceRequest) -> ToolR
             &candidate.display,
             request.encoding.as_deref(),
             request.fallback_encoding.as_deref(),
+            max_file_size_mib,
         );
         let (document, used_fallback) = match opened {
             Ok(opened) => opened,
@@ -188,7 +193,9 @@ pub(super) fn replace(editor: &ReplaceService, request: ReplaceRequest) -> ToolR
         if analysis.matches == 0 {
             continue;
         }
-        if let Err(message) = build_replacement(&document, &regex, &request.replacement) {
+        if let Err(message) =
+            validate_replacement(&document, &regex, &request.replacement, max_file_size_mib)
+        {
             if single_file {
                 return ToolResponse::error(message);
             }
@@ -278,6 +285,7 @@ pub(super) fn replace(editor: &ReplaceService, request: ReplaceRequest) -> ToolR
             } else {
                 None
             },
+            max_file_size_mib,
         ) {
             Ok(document) => document,
             Err(error) => {
@@ -318,16 +326,17 @@ pub(super) fn replace(editor: &ReplaceService, request: ReplaceRequest) -> ToolR
             });
             continue;
         }
-        let built = match build_replacement(&document, &regex, &request.replacement) {
-            Ok(built) => built,
-            Err(error) => {
-                failures.push(Issue {
-                    path: file.path.clone(),
-                    message: error,
-                });
-                continue;
-            }
-        };
+        let built =
+            match build_replacement(&document, &regex, &request.replacement, max_file_size_mib) {
+                Ok(built) => built,
+                Err(error) => {
+                    failures.push(Issue {
+                        path: file.path.clone(),
+                        message: error,
+                    });
+                    continue;
+                }
+            };
         if built.matches != file.matches {
             failures.push(Issue {
                 path: file.path.clone(),
@@ -418,42 +427,105 @@ struct BuiltReplacement {
     matches: usize,
 }
 
+struct ReplacementOutput {
+    bytes: Option<Vec<u8>>,
+    len: usize,
+}
+
+impl ReplacementOutput {
+    fn new(capacity: usize, materialize: bool) -> Self {
+        Self {
+            bytes: materialize.then(|| Vec::with_capacity(capacity)),
+            len: 0,
+        }
+    }
+
+    fn extend(&mut self, bytes: &[u8], path: &str, max_result_size_mib: u64) -> Result<(), String> {
+        self.len = checked_result_size(self.len, bytes.len(), path, max_result_size_mib)?;
+        if let Some(output) = &mut self.bytes {
+            output.extend_from_slice(bytes);
+        }
+        Ok(())
+    }
+
+    fn remove_suffix(&mut self, suffix: &[u8]) {
+        let suffix_is_present = self
+            .bytes
+            .as_ref()
+            .is_none_or(|output| output.ends_with(suffix));
+        if suffix_is_present && self.len >= suffix.len() {
+            self.len -= suffix.len();
+            if let Some(output) = &mut self.bytes {
+                output.truncate(self.len);
+            }
+        }
+    }
+}
+
+fn validate_replacement(
+    document: &TextDocument,
+    regex: &Regex,
+    replacement: &str,
+    max_result_size_mib: u64,
+) -> Result<(), String> {
+    process_replacement(document, regex, replacement, max_result_size_mib, false).map(drop)
+}
+
 fn build_replacement(
     document: &TextDocument,
     regex: &Regex,
     replacement: &str,
+    max_result_size_mib: u64,
 ) -> Result<BuiltReplacement, String> {
-    let mut output = Vec::with_capacity(document.original_bytes().len());
+    let (output, matches) =
+        process_replacement(document, regex, replacement, max_result_size_mib, true)?;
+    Ok(BuiltReplacement {
+        bytes: output
+            .bytes
+            .expect("materialized replacement always has an output buffer"),
+        matches,
+    })
+}
+
+fn process_replacement(
+    document: &TextDocument,
+    regex: &Regex,
+    replacement: &str,
+    max_result_size_mib: u64,
+    materialize: bool,
+) -> Result<(ReplacementOutput, usize), String> {
+    let mut output = ReplacementOutput::new(document.original_bytes().len(), materialize);
     let mut previous_raw = 0_usize;
     let mut previous_logical = 0_usize;
     let mut matches = 0_usize;
     let mut result_ends_newline = false;
+    let mut raw_cursor = document.raw_offset_cursor()?;
     for captures in regex.captures_iter(document.logical_text()) {
         let matched = captures.get(0).expect("every capture set has group zero");
         let expanded = expand(&captures, replacement);
         if matched.start() == matched.end() && expanded.is_empty() {
             continue;
         }
-        let raw_start = document.raw_offset(matched.start())?;
-        let raw_end = document.raw_offset(matched.end())?;
-        extend_checked(
-            &mut output,
+        let raw_start = raw_cursor.advance_to(matched.start())?;
+        let raw_end = raw_cursor.advance_to(matched.end())?;
+        output.extend(
             &document.original_bytes()[previous_raw..raw_start],
             &document.display_path(),
+            max_result_size_mib,
         )?;
         let unchanged = &document.logical_text()[previous_logical..matched.start()];
         observe_tail(unchanged, &mut result_ends_newline);
         let encoded = document.encode_for_target(&expanded)?;
-        extend_checked(&mut output, &encoded, &document.display_path())?;
+        output.extend(&encoded, &document.display_path(), max_result_size_mib)?;
         observe_tail(&expanded, &mut result_ends_newline);
         previous_raw = raw_end;
         previous_logical = matched.end();
         matches = matches.saturating_add(1);
     }
-    extend_checked(
-        &mut output,
+    output.extend(
         &document.original_bytes()[previous_raw..],
         &document.display_path(),
+        max_result_size_mib,
     )?;
     observe_tail(
         &document.logical_text()[previous_logical..],
@@ -462,27 +534,26 @@ fn build_replacement(
 
     let newline = document.encode_for_target("\n")?;
     if document.trailing_newline() && !result_ends_newline {
-        extend_checked(&mut output, &newline, &document.display_path())?;
-    } else if !document.trailing_newline() && result_ends_newline && output.ends_with(&newline) {
-        output.truncate(output.len() - newline.len());
+        output.extend(&newline, &document.display_path(), max_result_size_mib)?;
+    } else if !document.trailing_newline() && result_ends_newline {
+        // With no original trailing newline, only encoded replacement text can introduce this
+        // final boundary, so the validation-only pass can prove the same suffix without bytes.
+        output.remove_suffix(&newline);
     }
-    Ok(BuiltReplacement {
-        bytes: output,
-        matches,
-    })
+    Ok((output, matches))
 }
 
-fn extend_checked(output: &mut Vec<u8>, bytes: &[u8], path: &str) -> Result<(), String> {
-    checked_result_size(output.len(), bytes.len(), path)?;
-    output.extend_from_slice(bytes);
-    Ok(())
-}
-
-fn checked_result_size(current: usize, additional: usize, path: &str) -> Result<usize, String> {
+fn checked_result_size(
+    current: usize,
+    additional: usize,
+    path: &str,
+    max_result_size_mib: u64,
+) -> Result<usize, String> {
     let projected = current.saturating_add(additional);
-    if projected > MAX_REPLACE_RESULT_BYTES {
+    let maximum_bytes = max_result_size_mib.saturating_mul(1024 * 1024);
+    if u64::try_from(projected).unwrap_or(u64::MAX) > maximum_bytes {
         return Err(format!(
-            "Refusing to write {path}: the result would be {:.1} MiB, over the 256 MiB safety limit. Narrow the pattern.",
+            "Refusing to write {path}: the result would be {:.1} MiB, over the {max_result_size_mib} MiB safety limit. Narrow the pattern.",
             projected as f64 / 1_048_576.0
         ));
     }
@@ -505,8 +576,9 @@ fn open_candidate(
     path: &str,
     explicit: Option<&str>,
     fallback: Option<&str>,
+    max_file_size_mib: u64,
 ) -> Result<(TextDocument, bool), String> {
-    match TextDocument::open(path, explicit) {
+    match TextDocument::open(path, explicit, max_file_size_mib) {
         Ok(document) => Ok((document, false)),
         Err(error)
             if explicit.is_none()
@@ -514,7 +586,7 @@ fn open_candidate(
                 && is_encoding_error(&error)
                 && !error.contains("byte order mark") =>
         {
-            TextDocument::open(path, fallback).map(|document| (document, true))
+            TextDocument::open(path, fallback, max_file_size_mib).map(|document| (document, true))
         }
         Err(error) => Err(error),
     }
@@ -947,7 +1019,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("replace.txt");
         std::fs::write(&path, b"ab ab").unwrap();
-        let document = TextDocument::open(path.to_str().unwrap(), None).unwrap();
+        let document = TextDocument::open(path.to_str().unwrap(), None, 256).unwrap();
         let compiled = build_regex(&request("(a)(b)", "$2$1$$")).unwrap();
         let analysis = analyze_file(&document, &compiled.regex, "$2$1$$", usize::MAX);
         assert_eq!(analysis.matches, 2);
@@ -992,11 +1064,11 @@ mod tests {
     #[test]
     fn replacement_size_guard_accepts_the_exact_limit_and_rejects_one_byte_more() {
         assert_eq!(
-            super::checked_result_size(super::MAX_REPLACE_RESULT_BYTES - 1, 1, "target"),
-            Ok(super::MAX_REPLACE_RESULT_BYTES)
+            super::checked_result_size(256 * 1024 * 1024 - 1, 1, "target", 256),
+            Ok(256 * 1024 * 1024)
         );
         assert_eq!(
-            super::checked_result_size(super::MAX_REPLACE_RESULT_BYTES, 1, "target").unwrap_err(),
+            super::checked_result_size(256 * 1024 * 1024, 1, "target", 256).unwrap_err(),
             "Refusing to write target: the result would be 256.0 MiB, over the 256 MiB safety limit. Narrow the pattern."
         );
     }

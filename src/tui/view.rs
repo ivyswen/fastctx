@@ -10,7 +10,9 @@ use super::theme;
 use crate::control::apply::{PreviewAction, PreviewItem, PreviewTarget};
 use crate::control::doctor::DoctorCheckStatus;
 use crate::control::i18n::ALL_LANGUAGES;
-use crate::control::settings::{Tier, ToolBudgetLevel};
+use crate::control::settings::{
+    MAX_REPLACE_FILE_LIMIT_MIB, MIN_REPLACE_FILE_LIMIT_MIB, Tier, ToolBudgetLevel,
+};
 use crate::search_parallelism::{self, SearchParallelismInputError};
 use crate::shell::jobs::{JobSourceSummary, JobSummary};
 use crate::update::{NpmDiscovery, NpmVersionAuthority, StartupUpdate};
@@ -1232,6 +1234,41 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     Style::default().fg(theme::muted()),
                 ),
             ]
+        }
+        ConfigValue::ReplaceLimit(value) => {
+            let valid = (MIN_REPLACE_FILE_LIMIT_MIB..=MAX_REPLACE_FILE_LIMIT_MIB).contains(&value);
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(
+                        app.config_messages().replace_limit_label,
+                        Style::default()
+                            .fg(theme::accent())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  ·  ", Style::default().fg(theme::border())),
+                    Span::styled(
+                        config_value_label(app, entry.item, ConfigValue::ReplaceLimit(value)),
+                        Style::default()
+                            .fg(config_value_color(ConfigValue::ReplaceLimit(value)))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::raw(""),
+                Line::styled(
+                    app.config_messages().replace_limit_note,
+                    Style::default().fg(theme::fg()),
+                ),
+            ];
+            if !valid {
+                lines.push(Line::raw(""));
+                lines.push(Line::styled(
+                    format!(
+                        "replace.max_file_size_mib · {MIN_REPLACE_FILE_LIMIT_MIB}..={MAX_REPLACE_FILE_LIMIT_MIB} MiB"
+                    ),
+                    Style::default().fg(theme::danger()),
+                ));
+            }
+            lines
         }
         ConfigValue::Source(source) => vec![
             Line::from(vec![
@@ -3430,6 +3467,10 @@ fn config_value_label(app: &App, item: ConfigItemId, value: ConfigValue) -> Stri
             }
         }
         ConfigValue::Number(value) => value.to_string(),
+        ConfigValue::ReplaceLimit(value) if value >= 1_024 && value % 1_024 == 0 => {
+            format!("{} GiB", value / 1_024)
+        }
+        ConfigValue::ReplaceLimit(value) => format!("{value} MiB"),
         ConfigValue::CpuLimit(None) => app.config_messages().automatic_label.to_string(),
         ConfigValue::CpuLimit(Some(value)) => value.to_string(),
         ConfigValue::Source(source) => source.as_str().to_string(),
@@ -3453,6 +3494,12 @@ fn config_value_color(value: ConfigValue) -> Color {
         ConfigValue::Toggle(true) => theme::success(),
         ConfigValue::Toggle(false) => theme::muted(),
         ConfigValue::Number(_) => theme::fg(),
+        ConfigValue::ReplaceLimit(value)
+            if (MIN_REPLACE_FILE_LIMIT_MIB..=MAX_REPLACE_FILE_LIMIT_MIB).contains(&value) =>
+        {
+            theme::accent()
+        }
+        ConfigValue::ReplaceLimit(_) => theme::danger(),
         ConfigValue::CpuLimit(None) => theme::muted(),
         ConfigValue::CpuLimit(Some(value)) => {
             if search_parallelism::resolve(Some(value)).is_ok() {
@@ -4715,15 +4762,15 @@ mod tests {
                     for expected in [
                         app.messages().menu_config,
                         app.messages().config_title,
-                        app.messages().extensions_title,
+                        app.config_messages().editing_group_title,
                         app.messages().tier_label,
                         app.guard_messages().label,
+                        app.config_messages().replace_limit_label,
                         "read",
                         "grep",
                         "glob",
                         "run",
                         "job_output",
-                        app.messages().fastshell_label,
                     ] {
                         assert!(
                             contains_visible_text(&text, expected),
@@ -4777,7 +4824,7 @@ mod tests {
     }
 
     #[test]
-    fn search_and_reset_config_groups_render_in_all_languages_and_supported_widths() {
+    fn editing_search_and_reset_groups_render_in_all_languages_and_supported_widths() {
         let temp = tempfile::tempdir().unwrap();
         let paths = ControlPaths::for_home(temp.path());
         let executable = temp.path().join("source");
@@ -4789,6 +4836,12 @@ mod tests {
             app.language = language;
             app.screen = Screen::Config;
             for (cursor, expected_group, expected_item, expected_value) in [
+                (
+                    cursor_for(ConfigItemId::ReplaceFileLimit),
+                    app.config_messages().editing_group_title,
+                    app.config_messages().replace_limit_label,
+                    Some("256 MiB"),
+                ),
                 (
                     cursor_for(ConfigItemId::SearchCpuLimit),
                     app.config_messages().search_group_title,

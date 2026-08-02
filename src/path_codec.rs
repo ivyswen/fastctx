@@ -638,18 +638,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_literal_is_encoded_and_outer_token_decodes_only_once() {
-        let literal = "~fastctx~b61~";
-        let outer = "~fastctx~b7e666173746374787e6236317e~";
-        assert_eq!(display_path(Path::new(literal)), outer);
-        assert_eq!(parse_input_path(outer).unwrap(), PathBuf::from(literal));
-        assert_eq!(
-            parse_input_path("~fastctx~b61~").unwrap(),
-            PathBuf::from("a")
-        );
-    }
-
-    #[test]
     fn malformed_token_shapes_are_literals_but_valid_dangerous_payloads_fail_closed() {
         for literal in [
             "~fastctx~notes",

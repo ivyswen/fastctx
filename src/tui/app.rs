@@ -670,6 +670,8 @@ impl App {
                     || updated.fastshell.job_list_limit != self.settings.fastshell.job_list_limit;
                 let search_changed =
                     updated.search.max_cpu_cores != self.settings.search.max_cpu_cores;
+                let replace_limit_changed =
+                    updated.replace.max_file_size_mib != self.settings.replace.max_file_size_mib;
                 self.save_settings(&updated).map(|_| {
                     self.settings = updated;
                     // Saving is a step inside the settings page, not a way out of it: the draft
@@ -685,6 +687,9 @@ impl App {
                     }
                     if search_changed {
                         message.push(self.config_messages().cpu_limit_note);
+                    }
+                    if replace_limit_changed {
+                        message.push(self.config_messages().replace_limit_saved_note);
                     }
                     if guard_changed {
                         message.push(if self.settings.output_guard.enabled {
@@ -2109,6 +2114,7 @@ mod tests {
             ConfigItemId::RunBudget,
             ConfigItemId::JobOutputBudget,
             ConfigItemId::OutputGuard,
+            ConfigItemId::ReplaceFileLimit,
             ConfigItemId::FastShell,
             ConfigItemId::JobStorageLimit,
             ConfigItemId::MaxRunningJobs,
@@ -2137,6 +2143,11 @@ mod tests {
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
         app.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            app.config_cursor.entry().item,
+            ConfigItemId::ReplaceFileLimit
+        );
+        app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::FastShell);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::SearchCpuLimit);
@@ -2164,6 +2175,11 @@ mod tests {
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::SearchCpuLimit);
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::FastShell);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(
+            app.config_cursor.entry().item,
+            ConfigItemId::ReplaceFileLimit
+        );
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
     }
@@ -2257,9 +2273,7 @@ mod tests {
         let (_temp, mut app) = fixture();
         app.settings.language = Some("en".to_string());
         app.screen = Screen::Config;
-        for _ in 0..7 {
-            app.handle_key(key(KeyCode::Down));
-        }
+        app.config_cursor = config::cursor_for(ConfigItemId::FastShell);
         assert_eq!(app.config_cursor.entry().item, ConfigItemId::FastShell);
         app.handle_key(key(KeyCode::Right));
         assert!(!app.settings.fastshell.enabled);
@@ -2277,13 +2291,13 @@ mod tests {
     }
 
     #[test]
-    fn current_user_job_limits_save_immediately_without_apply() {
+    fn current_user_limits_save_immediately_without_apply() {
         let (_temp, mut app) = fixture();
         app.settings.language = Some("en".to_string());
         app.screen = Screen::Config;
-        for _ in 0..8 {
-            app.handle_key(key(KeyCode::Down));
-        }
+        app.config_cursor = config::cursor_for(ConfigItemId::ReplaceFileLimit);
+        app.handle_key(key(KeyCode::Right));
+        app.config_cursor = config::cursor_for(ConfigItemId::JobStorageLimit);
         assert_eq!(
             app.config_cursor.entry().item,
             ConfigItemId::JobStorageLimit
@@ -2302,16 +2316,19 @@ mod tests {
         assert_eq!(app.settings.fastshell.job_storage_limit_mib, 2_048);
         assert_eq!(app.settings.fastshell.max_running_jobs, 256);
         assert_eq!(app.settings.fastshell.job_list_limit, 50);
+        assert_eq!(app.settings.replace.max_file_size_mib, 512);
         assert!(app.settings.applied.is_none());
-        assert!(
-            app.toast.as_ref().is_some_and(|toast| {
-                toast.message.contains(app.job_messages().user_limit_note)
-            })
-        );
+        assert!(app.toast.as_ref().is_some_and(|toast| {
+            toast.message.contains(app.job_messages().user_limit_note)
+                && toast
+                    .message
+                    .contains(app.config_messages().replace_limit_saved_note)
+        }));
         let persisted = crate::control::settings::load(&app.paths).unwrap();
         assert_eq!(persisted.fastshell.job_storage_limit_mib, 2_048);
         assert_eq!(persisted.fastshell.max_running_jobs, 256);
         assert_eq!(persisted.fastshell.job_list_limit, 50);
+        assert_eq!(persisted.replace.max_file_size_mib, 512);
         assert!(persisted.applied.is_none());
     }
 
@@ -2320,11 +2337,7 @@ mod tests {
         let (_temp, mut app) = fixture();
         app.settings.language = Some("en".to_string());
         app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default()
-            .next_group()
-            .next_group()
-            .next_group()
-            .next_group();
+        app.config_cursor = config::cursor_for(ConfigItemId::UpdateAutoCheck);
         assert_eq!(
             app.config_cursor.entry().item,
             ConfigItemId::UpdateAutoCheck

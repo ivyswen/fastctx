@@ -29,6 +29,12 @@ pub const DEFAULT_MAX_RUNNING_JOBS: u64 = 128;
 pub const DEFAULT_JOB_LIST_LIMIT: u64 = 20;
 /// Largest configurable page size accepted by `job_list`.
 pub const MAX_JOB_LIST_LIMIT: u64 = 100;
+/// Default replace input and output safety limit in MiB.
+pub const DEFAULT_REPLACE_FILE_LIMIT_MIB: i64 = 256;
+/// Smallest replace safety limit accepted by the control plane.
+pub const MIN_REPLACE_FILE_LIMIT_MIB: i64 = 64;
+/// Largest replace safety limit offered by the control plane.
+pub const MAX_REPLACE_FILE_LIMIT_MIB: i64 = 4_096;
 
 /// Effective current-user job limits plus whether persisted values required fallback.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,6 +87,40 @@ pub struct SearchSettings {
 impl SearchSettings {
     fn is_default(&self) -> bool {
         self.max_cpu_cores.is_none()
+    }
+}
+
+/// Current-user replace memory-safety settings, reloaded for every request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ReplaceSettings {
+    /// Maximum size of both an input file and its replacement result, in MiB.
+    pub max_file_size_mib: i64,
+}
+
+impl ReplaceSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Resolves a persisted limit without silently clamping an invalid user choice.
+    pub(crate) fn resolved_file_limit_mib(self) -> Result<u64, String> {
+        if !(MIN_REPLACE_FILE_LIMIT_MIB..=MAX_REPLACE_FILE_LIMIT_MIB)
+            .contains(&self.max_file_size_mib)
+        {
+            return Err(format!(
+                "replace.max_file_size_mib must be a whole number from {MIN_REPLACE_FILE_LIMIT_MIB}..={MAX_REPLACE_FILE_LIMIT_MIB} MiB"
+            ));
+        }
+        Ok(self.max_file_size_mib as u64)
+    }
+}
+
+impl Default for ReplaceSettings {
+    fn default() -> Self {
+        Self {
+            max_file_size_mib: DEFAULT_REPLACE_FILE_LIMIT_MIB,
+        }
     }
 }
 
@@ -683,6 +723,9 @@ pub struct FastCtxSettings {
     /// Current-user grep/glob CPU limit, effective after the shared control center restarts.
     #[serde(skip_serializing_if = "SearchSettings::is_default")]
     pub search: SearchSettings,
+    /// Current-user replace input and result limit, effective on the next replace request.
+    #[serde(skip_serializing_if = "ReplaceSettings::is_default")]
+    pub replace: ReplaceSettings,
     /// Legacy config key accepted but omitted from every newly written settings file.
     #[serde(default, skip_serializing)]
     pub fastedit: FeatureToggle,
@@ -713,6 +756,7 @@ impl Default for FastCtxSettings {
             fastshell: FastShellSettings::default(),
             update: UpdateSettings::default(),
             search: SearchSettings::default(),
+            replace: ReplaceSettings::default(),
             fastedit: FeatureToggle::default(),
             applied: None,
         }
@@ -895,6 +939,11 @@ impl FastCtxSettings {
         search_parallelism::resolve(self.search.max_cpu_cores)
             .map_err(|error| format!("search.max_cpu_cores {error}"))
     }
+
+    /// Resolves the replace limit or reports the exact persisted key that needs repair.
+    pub(crate) fn replace_file_limit_mib(&self) -> Result<u64, String> {
+        self.replace.resolved_file_limit_mib()
+    }
 }
 
 /// Restores every user preference while retaining the Apply ownership receipt.
@@ -916,6 +965,12 @@ fn search_parallelism_repair_hint() -> String {
     )
 }
 
+fn replace_limit_repair_hint() -> String {
+    format!(
+        "For replace.max_file_size_mib, use a whole number from {MIN_REPLACE_FILE_LIMIT_MIB}..={MAX_REPLACE_FILE_LIMIT_MIB} MiB. "
+    )
+}
+
 fn source_mentions_search_parallelism(source: &str) -> bool {
     let mut in_search_table = false;
     for line in source.lines() {
@@ -929,6 +984,25 @@ fn source_mentions_search_parallelism(source: &str) -> bool {
         };
         let key = key.trim();
         if key == "search.max_cpu_cores" || (in_search_table && key == "max_cpu_cores") {
+            return true;
+        }
+    }
+    false
+}
+
+fn source_mentions_replace_limit(source: &str) -> bool {
+    let mut in_replace_table = false;
+    for line in source.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.starts_with('[') {
+            in_replace_table = line == "[replace]";
+            continue;
+        }
+        let Some((key, _value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key == "replace.max_file_size_mib" || (in_replace_table && key == "max_file_size_mib") {
             return true;
         }
     }
@@ -962,6 +1036,33 @@ fn validate_search_parallelism_type(
     Ok(())
 }
 
+fn validate_replace_limit_type(
+    document: &toml_edit::DocumentMut,
+    path: &Path,
+) -> Result<(), String> {
+    let Some(replace) = document.get("replace") else {
+        return Ok(());
+    };
+    let Some(table) = replace.as_table_like() else {
+        return Err(format!(
+            "Cannot parse fastctx settings {}: replace must be a table. {}Repair the file and retry.",
+            crate::paths::display_path(path),
+            replace_limit_repair_hint()
+        ));
+    };
+    if table
+        .get("max_file_size_mib")
+        .is_some_and(|value| value.as_integer().is_none())
+    {
+        return Err(format!(
+            "Cannot parse fastctx settings {}: replace.max_file_size_mib must be an integer. {}Repair the file and retry.",
+            crate::paths::display_path(path),
+            replace_limit_repair_hint()
+        ));
+    }
+    Ok(())
+}
+
 /// Loads configuration from a supplied path for tests and migrations.
 pub fn load_from(path: &Path) -> Result<FastCtxSettings, String> {
     let source = match fs::read_to_string(path) {
@@ -981,11 +1082,13 @@ pub fn load_from(path: &Path) -> Result<FastCtxSettings, String> {
 
 fn decode_source(path: &Path, source: &str) -> Result<FastCtxSettings, String> {
     let document = source.parse::<toml_edit::DocumentMut>().map_err(|error| {
-        let hint = if source_mentions_search_parallelism(source) {
-            search_parallelism_repair_hint()
-        } else {
-            String::new()
-        };
+        let mut hint = String::new();
+        if source_mentions_search_parallelism(source) {
+            hint.push_str(&search_parallelism_repair_hint());
+        }
+        if source_mentions_replace_limit(source) {
+            hint.push_str(&replace_limit_repair_hint());
+        }
         format!(
             "Cannot parse fastctx settings {}: {error}. {hint}Repair or remove the file and retry.",
             crate::paths::display_path(path)
@@ -1024,6 +1127,7 @@ fn decode_source(path: &Path, source: &str) -> Result<FastCtxSettings, String> {
         ));
     }
     validate_search_parallelism_type(&document, path)?;
+    validate_replace_limit_type(&document, path)?;
     let mut settings: FastCtxSettings = toml_edit::de::from_str(source).map_err(|error| {
         format!(
             "Cannot parse fastctx settings {}: {error}. Repair or remove the file and retry.",
@@ -1086,6 +1190,9 @@ pub fn encode(settings: &FastCtxSettings) -> Result<Vec<u8>, String> {
     settings
         .search_parallelism()
         .map_err(|error| format!("Cannot encode fastctx settings: {error}."))?;
+    settings
+        .replace_file_limit_mib()
+        .map_err(|error| format!("Cannot encode fastctx settings: {error}."))?;
     let mut source = toml_edit::ser::to_string_pretty(settings)
         .map_err(|error| format!("Cannot encode fastctx settings: {error}"))?;
     if !source.ends_with('\n') {
@@ -1123,8 +1230,9 @@ pub fn save(paths: &ControlPaths, settings: &FastCtxSettings) -> Result<bool, St
 mod tests {
     use super::{
         AppliedRecord, CURRENT_SCHEMA_VERSION, DEFAULT_JOB_LIST_LIMIT,
-        DEFAULT_JOB_STORAGE_LIMIT_MIB, DEFAULT_MAX_RUNNING_JOBS, FastCtxSettings,
-        MAX_JOB_LIST_LIMIT, ManagedFileRecord, TOOL_BUDGET_EPOCH, Tier, ToolBudgetLevel,
+        DEFAULT_JOB_STORAGE_LIMIT_MIB, DEFAULT_MAX_RUNNING_JOBS, DEFAULT_REPLACE_FILE_LIMIT_MIB,
+        FastCtxSettings, MAX_JOB_LIST_LIMIT, MAX_REPLACE_FILE_LIMIT_MIB,
+        MIN_REPLACE_FILE_LIMIT_MIB, ManagedFileRecord, TOOL_BUDGET_EPOCH, Tier, ToolBudgetLevel,
         UpdateSource, encode, job_limit_status, load_for_startup, load_from,
         reset_user_preferences, save, search_parallelism_status, update_settings_status,
     };
@@ -1153,8 +1261,13 @@ mod tests {
         // Only read scales with the tier by intent; the other four merely must never shrink when
         // the user moves up. Without this, retuning one tier's percentages in isolation can make
         // a wider tier deliver less than a narrower one for everything except read.
+        let expected = [
+            (Tier::Compact, [18_000, 9_000, 4_500, 9_000, 4_500]),
+            (Tier::Standard, [54_000, 10_800, 5_400, 10_800, 5_400]),
+            (Tier::High, [90_000, 10_800, 5_400, 10_800, 5_400]),
+        ];
         let mut previous: Option<[usize; 5]> = None;
-        for tier in [Tier::Compact, Tier::Standard, Tier::High] {
+        for (tier, published) in expected {
             let defaults = tier.default_budgets();
             let global = tier.fastctx_budget();
             assert_eq!(defaults.read, ToolBudgetLevel::Inherit);
@@ -1169,6 +1282,9 @@ mod tests {
                 resolved.iter().all(|budget| *budget <= global),
                 "{tier:?} resolves a per-tool budget above the global budget"
             );
+            // Hard-coded rather than recomputed: these numbers are the published contract, and
+            // deriving them from the same percentages under test would assert nothing.
+            assert_eq!(resolved, published, "{tier:?}");
             if let Some(previous) = previous {
                 for (index, (lower, higher)) in previous.iter().zip(resolved.iter()).enumerate() {
                     assert!(
@@ -1178,32 +1294,6 @@ mod tests {
                 }
             }
             previous = Some(resolved);
-        }
-    }
-
-    #[test]
-    fn tier_defaults_resolve_to_the_published_budgets() {
-        // Hard-coded rather than recomputed: these numbers are the published contract, and
-        // deriving them from the same percentages under test would assert nothing.
-        let expected = [
-            (Tier::Compact, [18_000, 9_000, 4_500, 9_000, 4_500]),
-            (Tier::Standard, [54_000, 10_800, 5_400, 10_800, 5_400]),
-            (Tier::High, [90_000, 10_800, 5_400, 10_800, 5_400]),
-        ];
-        for (tier, budgets) in expected {
-            let defaults = tier.default_budgets();
-            let global = tier.fastctx_budget();
-            assert_eq!(
-                [
-                    defaults.read.ceiling(global),
-                    defaults.grep.ceiling(global),
-                    defaults.glob.ceiling(global),
-                    defaults.run.ceiling(global),
-                    defaults.job_output.ceiling(global),
-                ],
-                budgets,
-                "{tier:?}"
-            );
         }
     }
 
@@ -1300,10 +1390,7 @@ mod tests {
         assert!(source.contains("glob = \"percent50\""), "{source}");
         assert!(source.contains("run = \"percent25\""), "{source}");
         assert!(source.contains("job_output = 33"), "{source}");
-    }
 
-    #[test]
-    fn every_accepted_spelling_of_a_share_parses_back_to_one_value() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
         std::fs::write(
@@ -1714,6 +1801,7 @@ mod tests {
     fn search_cpu_limit_is_omitted_by_default_and_valid_boundaries_round_trip() {
         let default = String::from_utf8(encode(&FastCtxSettings::default()).unwrap()).unwrap();
         assert!(!default.contains("[search]"), "{default}");
+        assert!(!default.contains("[replace]"), "{default}");
 
         let maximum = crate::search_parallelism::detected_available();
         let middle = (maximum / 2).max(1);
@@ -1736,6 +1824,29 @@ mod tests {
             let encoded = String::from_utf8(encode(&settings).unwrap()).unwrap();
             assert!(
                 encoded.contains(&format!("[search]\nmax_cpu_cores = {configured}")),
+                "{encoded}"
+            );
+        }
+
+        for configured in [
+            MIN_REPLACE_FILE_LIMIT_MIB,
+            DEFAULT_REPLACE_FILE_LIMIT_MIB,
+            MAX_REPLACE_FILE_LIMIT_MIB,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            std::fs::write(
+                &path,
+                format!("schema_version = 1\n\n[replace]\nmax_file_size_mib = {configured}\n"),
+            )
+            .unwrap();
+            let settings = load_from(&path).unwrap();
+            assert_eq!(settings.replace.max_file_size_mib, configured);
+            assert_eq!(settings.replace_file_limit_mib(), Ok(configured as u64));
+            let encoded = String::from_utf8(encode(&settings).unwrap()).unwrap();
+            assert_eq!(
+                encoded.contains(&format!("[replace]\nmax_file_size_mib = {configured}")),
+                configured != DEFAULT_REPLACE_FILE_LIMIT_MIB,
                 "{encoded}"
             );
         }
@@ -1789,6 +1900,41 @@ mod tests {
         let error = load_from(&path).unwrap_err();
         assert!(!error.contains("search.max_cpu_cores"), "{error}");
         assert!(!error.contains("automatic mode"), "{error}");
+
+        for configured in [
+            MIN_REPLACE_FILE_LIMIT_MIB - 1,
+            MAX_REPLACE_FILE_LIMIT_MIB + 1,
+            -1,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            let source =
+                format!("schema_version = 1\n\n[replace]\nmax_file_size_mib = {configured}\n");
+            std::fs::write(&path, source.as_bytes()).unwrap();
+            let settings = load_from(&path).unwrap();
+            assert_eq!(settings.replace.max_file_size_mib, configured);
+            let error = encode(&settings).unwrap_err();
+            assert!(error.contains("replace.max_file_size_mib"), "{error}");
+            assert!(error.contains("64..=4096 MiB"), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+        }
+
+        for raw in ["\"large\"", "64.5", "true", ""] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            let source = format!("schema_version = 1\n[replace]\nmax_file_size_mib = {raw}\n");
+            std::fs::write(&path, source.as_bytes()).unwrap();
+            let error = load_from(&path).unwrap_err();
+            for expected in [
+                "Cannot parse fastctx settings",
+                "replace.max_file_size_mib",
+                "whole number",
+                "64..=4096 MiB",
+            ] {
+                assert!(error.contains(expected), "missing {expected:?}: {error}");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), source.as_bytes());
+        }
     }
 
     #[test]
@@ -1830,6 +1976,7 @@ mod tests {
         settings.update.auto_check = false;
         settings.update.source = UpdateSource::Npmmirror;
         settings.search.max_cpu_cores = Some(1);
+        settings.replace.max_file_size_mib = MAX_REPLACE_FILE_LIMIT_MIB;
 
         let reset = reset_user_preferences(&settings);
         assert!(reset.output_guard.enabled);

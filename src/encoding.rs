@@ -117,15 +117,6 @@ pub(crate) struct ValidatedFileEncoding {
     explicit_utf8_warning: bool,
 }
 
-/// Fully decoded bytes plus an exact decoded-character-boundary to raw-byte map.
-#[derive(Clone, Debug)]
-pub(crate) struct EditableDecodedText {
-    /// Strictly decoded text, including original CRLF characters.
-    pub(crate) text: String,
-    /// For every UTF-8 byte boundary in `text`, the corresponding raw-file byte offset.
-    pub(crate) raw_boundaries: Vec<Option<usize>>,
-}
-
 impl ValidatedFileEncoding {
     /// Returns the raw snapshot offset where decoded UTF-8 begins when no transcoding is needed.
     pub(crate) fn utf8_snapshot_start(&self) -> Option<u64> {
@@ -199,38 +190,43 @@ impl ValidatedFileEncoding {
         }
     }
 
-    /// Decodes an already-read snapshot and proves an exact raw boundary for every character.
-    pub(crate) fn decode_editable_snapshot(
-        &self,
-        raw: &[u8],
-    ) -> Result<EditableDecodedText, String> {
+    /// Decodes an already-read snapshot and proves that stateless re-encoding reproduces it exactly.
+    pub(crate) fn decode_editable_snapshot(&self, raw: &[u8]) -> Result<String, String> {
         let text = decode_bytes(raw, &self.detected)
             .ok_or_else(|| "the file changed after encoding validation".to_string())?;
         let bom_len = self.detected.bom_len as usize;
-        let mut boundaries = vec![None; text.len().saturating_add(1)];
-        boundaries[0] = Some(bom_len);
-        let mut encoded = Vec::with_capacity(raw.len().saturating_sub(bom_len));
-        for (start, character) in text.char_indices() {
-            let end = start + character.len_utf8();
-            let fragment = self.encode_fragment(&character.to_string()).ok_or_else(|| {
+        let mut text_offset = 0_usize;
+        let mut raw_offset = bom_len;
+        while text_offset < text.len() {
+            let end = next_char_boundary(&text, text_offset, DECODE_CHUNK_BYTES);
+            let fragment = self.encode_fragment(&text[text_offset..end]).ok_or_else(|| {
                 format!(
                     "stateful source encoding {} cannot provide byte-preserving edit boundaries",
                     self.encoding_label()
                 )
             })?;
-            encoded.extend_from_slice(&fragment);
-            boundaries[end] = Some(bom_len.saturating_add(encoded.len()));
+            let Some(raw_end) = raw_offset.checked_add(fragment.len()) else {
+                return Err(format!(
+                    "source encoding {} did not reproduce the original bytes exactly",
+                    self.encoding_label()
+                ));
+            };
+            if raw.get(raw_offset..raw_end) != Some(fragment.as_slice()) {
+                return Err(format!(
+                    "source encoding {} did not reproduce the original bytes exactly",
+                    self.encoding_label()
+                ));
+            }
+            text_offset = end;
+            raw_offset = raw_end;
         }
-        if raw.get(bom_len..) != Some(encoded.as_slice()) {
+        if raw_offset != raw.len() {
             return Err(format!(
                 "source encoding {} did not reproduce the original bytes exactly",
                 self.encoding_label()
             ));
         }
-        Ok(EditableDecodedText {
-            text,
-            raw_boundaries: boundaries,
-        })
+        Ok(text)
     }
 
     /// Encodes newly inserted text without adding a BOM; `None` means unmappable or stateful.
@@ -278,6 +274,28 @@ impl ValidatedFileEncoding {
     /// Returns the canonical file encoding for diagnostics and write-back metadata.
     pub(crate) fn encoding_label(&self) -> &'static str {
         self.detected.source_encoding.unwrap_or("UTF-8")
+    }
+
+    /// Returns the first raw byte after a preserved byte-order mark.
+    pub(crate) fn editable_raw_start(&self) -> usize {
+        self.detected.bom_len as usize
+    }
+}
+
+fn next_char_boundary(text: &str, start: usize, maximum_bytes: usize) -> usize {
+    let mut end = start.saturating_add(maximum_bytes).min(text.len());
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == start && start < text.len() {
+        start
+            + text[start..]
+                .chars()
+                .next()
+                .expect("start is before the end of text")
+                .len_utf8()
+    } else {
+        end
     }
 }
 

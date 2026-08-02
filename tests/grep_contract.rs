@@ -1012,6 +1012,28 @@ fn grep_rejects_a_single_line_beyond_the_search_buffer_limit() {
     handle.write_all(&vec![b'a'; 8 * 1024]).unwrap();
     handle.set_len(64 * 1024 * 1024 + 1).unwrap();
     drop(handle);
+
+    let valid = temp.path().join("valid.txt");
+    write(&valid, b"a\n");
+    set_mtime(&file, 1_700_000_002);
+    set_mtime(&valid, 1_700_000_001);
+    let directory = text(grep_files(request(temp.path(), "a", OutputMode::Content)));
+    assert!(
+        directory.contains(&format!("{}\n1:a", normalized(&valid))),
+        "{directory}"
+    );
+    assert!(
+        directory.contains(&format!(
+            "{} — a line or multiline buffer exceeds the 64 MiB safety limit",
+            normalized(&file)
+        )),
+        "{directory}"
+    );
+    assert!(
+        directory.ends_with("(Complete: all 1 result shown; 1 file skipped.)"),
+        "{directory}"
+    );
+
     assert_eq!(
         error_text(grep_files(request(&file, "a", OutputMode::Content))),
         format!(

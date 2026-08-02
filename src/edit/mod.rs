@@ -80,7 +80,18 @@ impl ReplaceService {
 
     /// Applies one regex plan across all candidates after a full blast-radius count.
     pub fn replace(&self, request: ReplaceRequest) -> ToolResponse {
-        replace::replace(self, request)
+        self.replace_with_limit(
+            request,
+            crate::control::settings::DEFAULT_REPLACE_FILE_LIMIT_MIB as u64,
+        )
+    }
+
+    pub(crate) fn replace_with_limit(
+        &self,
+        request: ReplaceRequest,
+        max_file_size_mib: u64,
+    ) -> ToolResponse {
+        replace::replace(self, request, max_file_size_mib)
     }
 }
 

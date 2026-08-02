@@ -119,15 +119,15 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
             "modes: \"files_with_matches\" (default, paths only), \"content\", \"count\" (total\n",
             "matches, not matching lines), \"summary\" (global totals). Respects .gitignore;\n",
             "searches hidden files; skips .git and binaries. Files are decoded to UTF-8\n",
-            "before searching; files whose encoding can't be determined, or that change\n",
-            "during a directory search, are skipped and listed; a changing single-file\n",
-            "target returns an error. Matching is line-by-line: `^` and `$` anchor line\n",
-            "boundaries and are CRLF-aware. A path component of the form ~fastctx~b...~\n",
-            "(reversible bytes/UTF-8) or ~fastctx~w...~ (Windows UTF-16) is a filename\n",
-            "escape; copy that whole component verbatim in later calls and do not decode\n",
-            "or rewrite it. The last line of every successful result states Complete or\n",
-            "Partial — continue only with the exact offset a Partial note provides; errors\n",
-            "are self-contained."
+            "before searching; files whose encoding can't be determined, that change, or\n",
+            "that cannot be searched are skipped and listed for directory targets; the\n",
+            "equivalent single-file failure returns an error. Matching is line-by-line:\n",
+            "`^` and `$` anchor line boundaries and are CRLF-aware. A path component of the\n",
+            "form ~fastctx~b...~ (reversible bytes/UTF-8) or ~fastctx~w...~ (Windows UTF-16)\n",
+            "is a filename escape; copy that whole component verbatim in later calls and\n",
+            "do not decode or rewrite it. The last line of every successful result states\n",
+            "Complete or Partial — continue only with the exact offset a Partial note\n",
+            "provides; errors are self-contained."
         ))
     );
     assert_eq!(

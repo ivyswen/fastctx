@@ -113,7 +113,7 @@ fastctx unapply --yes
 
 `status` uses three states: `[PASS]`, `[INFO]`, and `[FAIL]`. It also reports the detected search CPU ceiling and the configured/effective parallelism. A `[FAIL]` result returns a non-zero exit code.
 
-### Search CPU limit and settings reset
+### Tool limits and settings reset
 
 grep/glob uses automatic parallelism by default: the operating system's available parallelism, capped at 16. In **Config → Search**, choose a preset with ←/→ or press Enter and type `auto` or any integer in the displayed `1..=maximum` range. The setting is loaded when the shared control center starts, takes effect after that control center restarts, and does not require Apply.
 
@@ -126,7 +126,16 @@ max_cpu_cores = 4
 
 Omitting the key keeps the previous automatic behavior. Invalid types, empty values, zero, negative numbers, and values above the engine's displayed ceiling prevent a session from starting and produce a diagnostic without rewriting the file. The limit sets one request's effective search parallelism to its base lane plus shared extra workers, at most N. Across every session in the per-user control center, concurrent requests retain independent base lanes but share one pool of at most N−1 extra lanes, so the upper bound for R concurrent requests is R+N−1. This is not CPU affinity or a strict system-wide governor.
 
-**Config → Reset → Reset all settings** opens with **No** selected. Confirming restores every user preference, including language, output budgets, Bash/job limits, search CPU limit, and update settings. It preserves the Apply ownership receipt, installed binary, host configuration, and running jobs. Restoring the default 1024 MiB job-history quota may immediately evict the oldest finished records above that quota.
+replace accepts files and replacement results up to 256 MiB by default. In **Config → Editing**, choose a coarse 64 MiB–4 GiB preset with ←/→. Saving takes effect on the next replace request, including requests from an already-open Codex session, and does not require Apply. Larger limits allow replace to use more memory; values set too high may cause an out-of-memory failure.
+
+The same limit can be written manually; 64 MiB is the minimum and 4096 MiB is the maximum:
+
+```toml
+[replace]
+max_file_size_mib = 512
+```
+
+**Config → Reset → Reset all settings** opens with **No** selected. Confirming restores every user preference, including language, output budgets, Bash/job limits, search CPU limit, replace file limit, and update settings. It preserves the Apply ownership receipt, installed binary, host configuration, and running jobs. Restoring the default 1024 MiB job-history quota may immediately evict the oldest finished records above that quota.
 
 ### Other distribution channels
 

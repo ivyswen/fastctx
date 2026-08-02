@@ -2,6 +2,7 @@ mod common;
 
 use common::{McpSession, mcp_text, normalized, write};
 use encoding_rs::{GBK, SHIFT_JIS};
+use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
@@ -238,10 +239,15 @@ fn directory_replace_lists_binary_and_encoding_skips_without_losing_totals() {
 }
 
 #[test]
-fn replace_errors_are_explicit_and_leave_files_unchanged() {
+fn replace_errors_are_explicit_and_the_file_limit_reloads_within_one_session() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("source.txt");
     write(&path, b"one\n");
+    let config = temp.path().join(".fastctx/config.toml");
+    write(
+        &config,
+        b"schema_version = 1\n\n[replace]\nmax_file_size_mib = 64\n",
+    );
     let mut session = edit_session(temp.path(), None);
 
     let missing_path = session.call(
@@ -255,10 +261,10 @@ fn replace_errors_are_explicit_and_leave_files_unchanged() {
     );
 
     let huge = temp.path().join("over-64-mib.txt");
-    std::fs::File::create(&huge)
-        .unwrap()
-        .set_len(64 * 1024 * 1024 + 1)
-        .unwrap();
+    let huge_len = 64 * 1024 * 1024 + 1;
+    let mut huge_file = std::fs::File::create(&huge).unwrap();
+    std::io::copy(&mut std::io::repeat(b'x').take(huge_len), &mut huge_file).unwrap();
+    drop(huge_file);
     let too_large = session.call(
         "replace",
         serde_json::json!({
@@ -274,6 +280,35 @@ fn replace_errors_are_explicit_and_leave_files_unchanged() {
         )
     );
     assert_eq!(std::fs::read(&path).unwrap(), b"one\n");
+
+    write(
+        &config,
+        b"schema_version = 1\n\n[replace]\nmax_file_size_mib = 128\n",
+    );
+    let after_save = session.call(
+        "replace",
+        serde_json::json!({
+            "path":normalized(&huge), "pattern":"^x", "replacement":"y"
+        }),
+    );
+    assert_eq!(
+        after_save["result"]["isError"],
+        false,
+        "{}",
+        mcp_text(&after_save)
+    );
+    assert!(
+        mcp_text(&after_save).ends_with("(Complete: 1 replacement in 1 file.)"),
+        "{}",
+        mcp_text(&after_save)
+    );
+    assert_eq!(std::fs::metadata(&huge).unwrap().len(), huge_len);
+    let mut first = [0_u8; 1];
+    std::fs::File::open(&huge)
+        .unwrap()
+        .read_exact(&mut first)
+        .unwrap();
+    assert_eq!(first, [b'y']);
     assert!(session.close().success());
 
     let mut invalid_budget = edit_session(temp.path(), Some("broken"));

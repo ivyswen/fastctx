@@ -5,6 +5,10 @@ use super::i18n::Language;
 /// Complete editor, save, and reset string set for one language.
 #[derive(Debug)]
 pub(crate) struct ConfigMessages {
+    pub(crate) editing_group_title: &'static str,
+    pub(crate) replace_limit_label: &'static str,
+    pub(crate) replace_limit_note: &'static str,
+    pub(crate) replace_limit_saved_note: &'static str,
     pub(crate) search_group_title: &'static str,
     pub(crate) cpu_limit_label: &'static str,
     /// Shown wherever a setting tracks something else instead of holding a chosen value.
@@ -47,8 +51,12 @@ pub(crate) struct ConfigMessages {
 
 impl ConfigMessages {
     #[cfg(test)]
-    fn values(&self) -> [&'static str; 28] {
+    fn values(&self) -> [&'static str; 32] {
         [
+            self.editing_group_title,
+            self.replace_limit_label,
+            self.replace_limit_note,
+            self.replace_limit_saved_note,
             self.search_group_title,
             self.cpu_limit_label,
             self.automatic_label,
@@ -106,6 +114,8 @@ pub(crate) const fn messages(language: Language) -> &'static ConfigMessages {
 
 macro_rules! config_messages {
     (
+        $editing_group_title:expr, $replace_limit_label:expr,
+        $replace_limit_note:expr, $replace_limit_saved_note:expr,
         $search_group_title:expr, $cpu_limit_label:expr, $automatic_label:expr,
         $cpu_limit_note:expr, $cpu_edit_title:expr, $cpu_edit_prompt:expr,
         $input_error_empty:expr, $input_error_not_integer:expr, $input_error_range:expr,
@@ -118,6 +128,10 @@ macro_rules! config_messages {
         $save_all_note:expr, $saving_notice:expr
     ) => {
         ConfigMessages {
+            editing_group_title: $editing_group_title,
+            replace_limit_label: $replace_limit_label,
+            replace_limit_note: $replace_limit_note,
+            replace_limit_saved_note: $replace_limit_saved_note,
             search_group_title: $search_group_title,
             cpu_limit_label: $cpu_limit_label,
             automatic_label: $automatic_label,
@@ -151,6 +165,10 @@ macro_rules! config_messages {
 }
 
 const EN: ConfigMessages = config_messages!(
+    "Editing",
+    "Replace file limit",
+    "Larger limits allow replace to use more memory; values set too high may cause an out-of-memory failure.",
+    "The new replace limit applies to the next request. Apply is not required.",
     "Search",
     "CPU limit",
     "Automatic",
@@ -182,6 +200,10 @@ const EN: ConfigMessages = config_messages!(
 );
 
 const ZH_CN: ConfigMessages = config_messages!(
+    "编辑",
+    "replace 文件限制",
+    "限制越高，replace 可使用的内存越多；设置过高可能导致内存不足。",
+    "新的 replace 限制会在下一次请求时生效。无需 Apply。",
     "搜索",
     "CPU 限制",
     "自动",
@@ -213,6 +235,10 @@ const ZH_CN: ConfigMessages = config_messages!(
 );
 
 const ZH_TW: ConfigMessages = config_messages!(
+    "編輯",
+    "replace 檔案限制",
+    "限制越高，replace 可使用的記憶體越多；設定過高可能導致記憶體不足。",
+    "新的 replace 限制會在下一次請求時生效。不需要 Apply。",
     "搜尋",
     "CPU 限制",
     "自動",
@@ -244,6 +270,10 @@ const ZH_TW: ConfigMessages = config_messages!(
 );
 
 const JA: ConfigMessages = config_messages!(
+    "編集",
+    "replace ファイル制限",
+    "上限を大きくすると replace のメモリ使用量が増えます。高すぎる値はメモリ不足を招くことがあります。",
+    "新しい replace 制限は次のリクエストから有効です。Apply は不要です。",
     "検索",
     "CPU 制限",
     "自動",
@@ -275,6 +305,10 @@ const JA: ConfigMessages = config_messages!(
 );
 
 const KO: ConfigMessages = config_messages!(
+    "편집",
+    "replace 파일 제한",
+    "제한을 높이면 replace가 더 많은 메모리를 사용할 수 있으며, 너무 높으면 메모리 부족이 발생할 수 있습니다.",
+    "새 replace 제한은 다음 요청부터 적용됩니다. Apply는 필요하지 않습니다.",
     "검색",
     "CPU 제한",
     "자동",
@@ -306,6 +340,10 @@ const KO: ConfigMessages = config_messages!(
 );
 
 const ES: ConfigMessages = config_messages!(
+    "Edición",
+    "Límite de archivo de replace",
+    "Los límites mayores permiten que replace use más memoria; un valor demasiado alto puede causar falta de memoria.",
+    "El nuevo límite de replace se aplica a la siguiente solicitud. No hace falta Apply.",
     "Búsqueda",
     "Límite de CPU",
     "Automático",
@@ -337,6 +375,10 @@ const ES: ConfigMessages = config_messages!(
 );
 
 const FR: ConfigMessages = config_messages!(
+    "Édition",
+    "Limite de fichier replace",
+    "Une limite plus élevée permet à replace d’utiliser plus de mémoire ; une valeur excessive peut provoquer un manque de mémoire.",
+    "La nouvelle limite de replace s’applique à la prochaine requête. Apply n’est pas nécessaire.",
     "Recherche",
     "Limite du processeur",
     "Automatique",
@@ -368,6 +410,10 @@ const FR: ConfigMessages = config_messages!(
 );
 
 const DE: ConfigMessages = config_messages!(
+    "Bearbeitung",
+    "Dateilimit für replace",
+    "Höhere Limits erlauben replace mehr Speicher zu verwenden; ein zu hoher Wert kann zu Speichermangel führen.",
+    "Das neue replace-Limit gilt ab der nächsten Anfrage. Apply ist nicht erforderlich.",
     "Suche",
     "CPU-Limit",
     "Automatisch",
@@ -399,6 +445,10 @@ const DE: ConfigMessages = config_messages!(
 );
 
 const PT_BR: ConfigMessages = config_messages!(
+    "Edição",
+    "Limite de arquivo do replace",
+    "Limites maiores permitem que replace use mais memória; um valor alto demais pode causar falta de memória.",
+    "O novo limite de replace vale na próxima solicitação. Não é necessário usar Apply.",
     "Pesquisa",
     "Limite de CPU",
     "Automático",
@@ -430,6 +480,10 @@ const PT_BR: ConfigMessages = config_messages!(
 );
 
 const RU: ConfigMessages = config_messages!(
+    "Редактирование",
+    "Лимит файла replace",
+    "Чем выше лимит, тем больше памяти может использовать replace; слишком большое значение может вызвать нехватку памяти.",
+    "Новый лимит replace действует со следующего запроса. Нажимать Apply не нужно.",
     "Поиск",
     "Лимит ЦП",
     "Автоматически",
@@ -461,6 +515,10 @@ const RU: ConfigMessages = config_messages!(
 );
 
 const IT: ConfigMessages = config_messages!(
+    "Modifica",
+    "Limite file di replace",
+    "Limiti più alti consentono a replace di usare più memoria; un valore eccessivo può causare memoria insufficiente.",
+    "Il nuovo limite di replace vale dalla prossima richiesta. Apply non è necessario.",
     "Ricerca",
     "Limite CPU",
     "Automatico",
@@ -492,6 +550,10 @@ const IT: ConfigMessages = config_messages!(
 );
 
 const TR: ConfigMessages = config_messages!(
+    "Düzenleme",
+    "replace dosya sınırı",
+    "Daha yüksek sınırlar replace için daha fazla bellek kullanımına izin verir; aşırı yüksek bir değer bellek yetersizliğine yol açabilir.",
+    "Yeni replace sınırı bir sonraki istekte geçerli olur. Apply gerekmez.",
     "Arama",
     "CPU sınırı",
     "Otomatik",
@@ -523,6 +585,10 @@ const TR: ConfigMessages = config_messages!(
 );
 
 const PL: ConfigMessages = config_messages!(
+    "Edycja",
+    "Limit pliku replace",
+    "Wyższy limit pozwala replace użyć więcej pamięci; zbyt wysoka wartość może spowodować brak pamięci.",
+    "Nowy limit replace obowiązuje od następnego żądania. Apply nie jest wymagane.",
     "Wyszukiwanie",
     "Limit CPU",
     "Automatycznie",
@@ -554,6 +620,10 @@ const PL: ConfigMessages = config_messages!(
 );
 
 const NL: ConfigMessages = config_messages!(
+    "Bewerken",
+    "Bestandslimiet voor replace",
+    "Hogere limieten laten replace meer geheugen gebruiken; een te hoge waarde kan geheugentekort veroorzaken.",
+    "De nieuwe replace-limiet geldt vanaf de volgende aanvraag. Apply is niet nodig.",
     "Zoeken",
     "CPU-limiet",
     "Automatisch",
@@ -585,6 +655,10 @@ const NL: ConfigMessages = config_messages!(
 );
 
 const VI: ConfigMessages = config_messages!(
+    "Chỉnh sửa",
+    "Giới hạn tệp replace",
+    "Giới hạn lớn hơn cho phép replace dùng nhiều bộ nhớ hơn; giá trị quá cao có thể gây hết bộ nhớ.",
+    "Giới hạn replace mới có hiệu lực từ yêu cầu kế tiếp. Không cần Apply.",
     "Tìm kiếm",
     "Giới hạn CPU",
     "Tự động",
@@ -616,6 +690,10 @@ const VI: ConfigMessages = config_messages!(
 );
 
 const ID: ConfigMessages = config_messages!(
+    "Penyuntingan",
+    "Batas file replace",
+    "Batas yang lebih tinggi memungkinkan replace memakai lebih banyak memori; nilai yang terlalu tinggi dapat menyebabkan kehabisan memori.",
+    "Batas replace baru berlaku pada permintaan berikutnya. Apply tidak diperlukan.",
     "Pencarian",
     "Batas CPU",
     "Otomatis",
@@ -647,6 +725,10 @@ const ID: ConfigMessages = config_messages!(
 );
 
 const UK: ConfigMessages = config_messages!(
+    "Редагування",
+    "Ліміт файлу replace",
+    "Вищий ліміт дозволяє replace використовувати більше пам’яті; надто велике значення може спричинити нестачу пам’яті.",
+    "Новий ліміт replace діє з наступного запиту. Apply не потрібен.",
     "Пошук",
     "Ліміт ЦП",
     "Автоматично",

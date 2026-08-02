@@ -5,7 +5,8 @@ use crate::control::guard_i18n::GuardMessages;
 use crate::control::i18n::Messages;
 use crate::control::job_i18n::JobMessages;
 use crate::control::settings::{
-    FastCtxSettings, Tier, ToolBudgetLevel, ToolBudgetPreferences, UpdateSource,
+    FastCtxSettings, MAX_REPLACE_FILE_LIMIT_MIB, MIN_REPLACE_FILE_LIMIT_MIB, Tier, ToolBudgetLevel,
+    ToolBudgetPreferences, UpdateSource,
 };
 use crate::search_parallelism;
 use crate::tui::update::UpdateMessages;
@@ -15,6 +16,7 @@ use crate::tui::update::UpdateMessages;
 pub(crate) enum ConfigGroupId {
     Output,
     Guard,
+    Editing,
     Extensions,
     Search,
     Update,
@@ -27,6 +29,7 @@ pub(crate) enum ConfigGroupId {
 pub(crate) enum ConfigItemId {
     OutputTier,
     OutputGuard,
+    ReplaceFileLimit,
     ReadBudget,
     GrepBudget,
     GlobBudget,
@@ -116,7 +119,7 @@ const EXTENSION_CHILDREN: [ConfigItemId; 3] = [
 
 const UPDATE_CHILDREN: [ConfigItemId; 1] = [ConfigItemId::UpdateSource];
 
-const CONFIG_GROUPS: [ConfigGroupSpec; 7] = [
+const CONFIG_GROUPS: [ConfigGroupSpec; 8] = [
     ConfigGroupSpec {
         id: ConfigGroupId::Output,
         parent: ConfigItemId::OutputTier,
@@ -129,6 +132,13 @@ const CONFIG_GROUPS: [ConfigGroupSpec; 7] = [
     ConfigGroupSpec {
         id: ConfigGroupId::Guard,
         parent: ConfigItemId::OutputGuard,
+        children: &[],
+        standalone_items: true,
+        pinned: false,
+    },
+    ConfigGroupSpec {
+        id: ConfigGroupId::Editing,
+        parent: ConfigItemId::ReplaceFileLimit,
         children: &[],
         standalone_items: true,
         pinned: false,
@@ -197,6 +207,7 @@ pub(crate) fn group_title(
     Some(match group {
         ConfigGroupId::Output => messages.config_title,
         ConfigGroupId::Guard => guard_messages.section_title,
+        ConfigGroupId::Editing => config_messages.editing_group_title,
         ConfigGroupId::Extensions => messages.extensions_title,
         ConfigGroupId::Search => config_messages.search_group_title,
         ConfigGroupId::Update => updates.page_title,
@@ -218,6 +229,7 @@ pub(crate) fn item_label(
     match item {
         ConfigItemId::OutputTier => messages.tier_label,
         ConfigItemId::OutputGuard => guard_messages.label,
+        ConfigItemId::ReplaceFileLimit => config_messages.replace_limit_label,
         ConfigItemId::ReadBudget => "read",
         ConfigItemId::GrepBudget => "grep",
         ConfigItemId::GlobBudget => "glob",
@@ -509,6 +521,7 @@ pub(crate) enum ConfigValue {
     Budget(BudgetValue),
     Toggle(bool),
     Number(u64),
+    ReplaceLimit(i64),
     CpuLimit(Option<i64>),
     Source(UpdateSource),
     Action,
@@ -583,6 +596,7 @@ impl OutputConfigDraft {
 pub(crate) struct ConfigDraft {
     pub(crate) output: OutputConfigDraft,
     pub(crate) output_guard_enabled: bool,
+    pub(crate) replace_file_limit_mib: i64,
     pub(crate) fastshell_enabled: bool,
     pub(crate) job_storage_limit_mib: u64,
     pub(crate) max_running_jobs: u64,
@@ -601,6 +615,7 @@ impl ConfigDraft {
                 budgets: settings.tool_budgets,
             },
             output_guard_enabled: settings.output_guard.enabled,
+            replace_file_limit_mib: settings.replace.max_file_size_mib,
             fastshell_enabled: settings.fastshell.enabled,
             job_storage_limit_mib: settings.fastshell.job_storage_limit_mib,
             max_running_jobs: settings.fastshell.max_running_jobs,
@@ -616,6 +631,7 @@ impl ConfigDraft {
         settings.tier = self.output.tier;
         settings.tool_budgets = self.output.budgets;
         settings.output_guard.enabled = self.output_guard_enabled;
+        settings.replace.max_file_size_mib = self.replace_file_limit_mib;
         settings.fastshell.enabled = self.fastshell_enabled;
         settings.fastshell.job_storage_limit_mib = self.job_storage_limit_mib;
         settings.fastshell.max_running_jobs = self.max_running_jobs;
@@ -638,6 +654,9 @@ impl ConfigDraft {
             ConfigItemId::OutputTier if guarded => ConfigValue::GuardedTier(self.output.tier),
             ConfigItemId::OutputTier => ConfigValue::Tier(self.output.tier),
             ConfigItemId::OutputGuard => ConfigValue::Toggle(self.output_guard_enabled),
+            ConfigItemId::ReplaceFileLimit => {
+                ConfigValue::ReplaceLimit(self.replace_file_limit_mib)
+            }
             ConfigItemId::ReadBudget
             | ConfigItemId::GrepBudget
             | ConfigItemId::GlobBudget
@@ -689,6 +708,11 @@ impl ConfigDraft {
                 };
             }
             ConfigItemId::OutputTier | ConfigItemId::OutputGuard => {}
+            ConfigItemId::ReplaceFileLimit => cycle_i64_preset(
+                &mut self.replace_file_limit_mib,
+                &[64, 128, 256, 512, 1_024, 2_048, 4_096],
+                forward,
+            ),
             ConfigItemId::ReadBudget
             | ConfigItemId::GrepBudget
             | ConfigItemId::GlobBudget
@@ -823,6 +847,32 @@ fn cycle_preset(value: &mut u64, presets: &[u64], forward: bool) {
     *value = next;
 }
 
+fn cycle_i64_preset(value: &mut i64, presets: &[i64], forward: bool) {
+    debug_assert_eq!(presets.first(), Some(&MIN_REPLACE_FILE_LIMIT_MIB));
+    debug_assert_eq!(presets.last(), Some(&MAX_REPLACE_FILE_LIMIT_MIB));
+    let next = if let Some(index) = presets.iter().position(|preset| preset == value) {
+        if forward {
+            presets[(index + 1) % presets.len()]
+        } else {
+            presets[(index + presets.len() - 1) % presets.len()]
+        }
+    } else if forward {
+        presets
+            .iter()
+            .copied()
+            .find(|preset| preset > value)
+            .unwrap_or(presets[0])
+    } else {
+        presets
+            .iter()
+            .copied()
+            .rev()
+            .find(|preset| preset < value)
+            .unwrap_or(*presets.last().expect("replace presets are non-empty"))
+    };
+    *value = next;
+}
+
 fn cycle_cpu_limit(value: &mut Option<i64>, maximum: usize, forward: bool) {
     let middle = (maximum / 2).max(1) as i64;
     let maximum = maximum as i64;
@@ -952,6 +1002,7 @@ mod tests {
                 ConfigItemRole::Child { is_last: true },
             ),
             (ConfigItemId::OutputGuard, ConfigItemRole::Parent),
+            (ConfigItemId::ReplaceFileLimit, ConfigItemRole::Parent),
             (ConfigItemId::FastShell, ConfigItemRole::Parent),
             (ConfigItemId::JobStorageLimit, ConfigItemRole::Parent),
             (ConfigItemId::MaxRunningJobs, ConfigItemRole::Parent),
@@ -977,6 +1028,8 @@ mod tests {
                 ConfigGroupId::Extensions
             } else if item == ConfigItemId::OutputGuard {
                 ConfigGroupId::Guard
+            } else if item == ConfigItemId::ReplaceFileLimit {
+                ConfigGroupId::Editing
             } else if item == ConfigItemId::SearchCpuLimit {
                 ConfigGroupId::Search
             } else if matches!(
@@ -1048,12 +1101,14 @@ mod tests {
     fn tab_navigation_always_lands_on_a_group_parent() {
         let output = ConfigCursor::default();
         let guard = output.next_group();
-        let extensions = guard.next_group();
+        let editing = guard.next_group();
+        let extensions = editing.next_group();
         let search = extensions.next_group();
         let update = search.next_group();
         let reset = update.next_group();
         let save = reset.next_group();
         assert_eq!(guard.entry().item, ConfigItemId::OutputGuard);
+        assert_eq!(editing.entry().item, ConfigItemId::ReplaceFileLimit);
         assert_eq!(extensions.entry().item, ConfigItemId::FastShell);
         assert_eq!(search.entry().item, ConfigItemId::SearchCpuLimit);
         assert_eq!(update.entry().item, ConfigItemId::UpdateAutoCheck);
@@ -1063,7 +1118,8 @@ mod tests {
         assert_eq!(save.next_group(), output);
         assert_eq!(output.previous_group(), save);
         assert_eq!(guard.previous_group(), output);
-        assert_eq!(extensions.previous_group(), guard);
+        assert_eq!(editing.previous_group(), guard);
+        assert_eq!(extensions.previous_group(), editing);
         assert_eq!(search.previous_group(), extensions);
         assert_eq!(update.previous_group(), search);
         assert_eq!(reset.previous_group(), update);
@@ -1093,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn job_list_page_size_cycles_all_presets_and_normalizes_custom_values() {
+    fn coarse_limits_cycle_all_presets_and_normalize_custom_values() {
         let settings = FastCtxSettings::default();
         let mut draft = ConfigDraft::from_settings(&settings);
         assert_eq!(draft.job_list_limit, 20);
@@ -1113,6 +1169,18 @@ mod tests {
         draft.job_list_limit = 37;
         draft.adjust(ConfigItemId::JobListLimit, false);
         assert_eq!(draft.job_list_limit, 20);
+
+        assert_eq!(draft.replace_file_limit_mib, 256);
+        for expected in [512, 1_024, 2_048, 4_096, 64, 128, 256] {
+            draft.adjust(ConfigItemId::ReplaceFileLimit, true);
+            assert_eq!(draft.replace_file_limit_mib, expected);
+        }
+        draft.replace_file_limit_mib = 300;
+        draft.adjust(ConfigItemId::ReplaceFileLimit, true);
+        assert_eq!(draft.replace_file_limit_mib, 512);
+        draft.replace_file_limit_mib = 300;
+        draft.adjust(ConfigItemId::ReplaceFileLimit, false);
+        assert_eq!(draft.replace_file_limit_mib, 256);
     }
 
     #[test]
@@ -1145,7 +1213,7 @@ mod tests {
     #[test]
     fn viewport_keeps_focus_visible_and_reports_both_hidden_edges() {
         let rows = list_rows();
-        assert_eq!(rows.len(), 21);
+        assert_eq!(rows.len(), 23);
         let mut viewport = ConfigViewport::default();
         let top = viewport.window(ConfigCursor::default(), rows.len(), 5);
         assert_eq!((top.start, top.end), (0, 4));

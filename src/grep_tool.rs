@@ -113,6 +113,10 @@ struct SearchOutcome {
 enum CandidateSkip {
     Encoding(EncodingRejection),
     ChangedWhileSearched,
+    SearchFailure {
+        reason: String,
+        single_file_message: String,
+    },
 }
 
 impl CandidateSkip {
@@ -120,6 +124,7 @@ impl CandidateSkip {
         match self {
             Self::Encoding(rejection) => rejection.skip_reason(),
             Self::ChangedWhileSearched => "changed while being searched".to_string(),
+            Self::SearchFailure { reason, .. } => reason.clone(),
         }
     }
 
@@ -130,6 +135,10 @@ impl CandidateSkip {
                 "File changed while it was being searched: {}. Retry the grep request.",
                 candidate.display
             ),
+            Self::SearchFailure {
+                single_file_message,
+                ..
+            } => single_file_message.clone(),
         }
     }
 }
@@ -143,13 +152,8 @@ enum SearchFailure {
     CaptureOverflow,
     Cancelled,
     EpochRetired,
-    Message(String),
-}
-
-impl From<String> for SearchFailure {
-    fn from(message: String) -> Self {
-        Self::Message(message)
-    }
+    Candidate(CandidateSkip),
+    Fatal(String),
 }
 
 fn failure_message(candidate: &Candidate, failure: SearchFailure) -> String {
@@ -159,7 +163,38 @@ fn failure_message(candidate: &Candidate, failure: SearchFailure) -> String {
         SearchFailure::EpochRetired => {
             unreachable!("retired speculative work is never delivered to the reducer")
         }
-        SearchFailure::Message(message) => message,
+        SearchFailure::Candidate(skip) => skip.single_file_message(candidate),
+        SearchFailure::Fatal(message) => message,
+    }
+}
+
+fn candidate_failure(candidate: &Candidate, message: String) -> SearchFailure {
+    let prefixes = [
+        format!("Cannot search file {}: ", candidate.display),
+        format!(
+            "Cannot create a stable search snapshot for {}: ",
+            candidate.display
+        ),
+    ];
+    let remainder = prefixes
+        .iter()
+        .find_map(|prefix| message.strip_prefix(prefix))
+        .unwrap_or(&message);
+    let reason = remainder
+        .split_once(". ")
+        .map_or(remainder, |(first, _)| first)
+        .trim_end_matches('.')
+        .to_string();
+    SearchFailure::Candidate(CandidateSkip::SearchFailure {
+        reason,
+        single_file_message: message,
+    })
+}
+
+fn capture_overflow_skip(candidate: &Candidate) -> CandidateSkip {
+    CandidateSkip::SearchFailure {
+        reason: "matching content and context exceed the 64 MiB safety limit".to_string(),
+        single_file_message: capture_limit_error(candidate),
     }
 }
 
@@ -550,7 +585,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
                 )
             },
             move |index, _| {
-                Err(SearchFailure::Message(format!(
+                Err(SearchFailure::Fatal(format!(
                     "Search worker panicked while processing {}.",
                     panic_candidates[index].display
                 )))
@@ -559,6 +594,10 @@ fn grep_files_with_budget_source_and_execution_unadapted(
                 let candidate = &candidates[index];
                 let outcome = match outcome {
                     Ok(outcome) => outcome,
+                    Err(SearchFailure::Candidate(skip)) if !single_file_target => {
+                        skipped_files.record(candidate.display.as_ref(), &skip);
+                        return ControlFlow::Continue(());
+                    }
                     Err(kind) => {
                         failure = Some(ToolResponse::error(failure_message(candidate, kind)));
                         return ControlFlow::Break(());
@@ -670,7 +709,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
             )
         },
         move |index, _| {
-            Err(SearchFailure::Message(format!(
+            Err(SearchFailure::Fatal(format!(
                 "Search worker panicked while processing {}.",
                 panic_candidates[index].display
             )))
@@ -709,11 +748,24 @@ fn grep_files_with_budget_source_and_execution_unadapted(
                         Some(&exact_work),
                     ) {
                         Ok(outcome) => (outcome, true),
+                        Err(SearchFailure::CaptureOverflow) if !single_file_target => {
+                            let skip = capture_overflow_skip(candidate);
+                            skipped_files.record(candidate.display.as_ref(), &skip);
+                            return ControlFlow::Continue(());
+                        }
+                        Err(SearchFailure::Candidate(skip)) if !single_file_target => {
+                            skipped_files.record(candidate.display.as_ref(), &skip);
+                            return ControlFlow::Continue(());
+                        }
                         Err(kind) => {
                             failure = Some(failure_message(candidate, kind));
                             return ControlFlow::Break(());
                         }
                     }
+                }
+                Err(SearchFailure::Candidate(skip)) if !single_file_target => {
+                    skipped_files.record(candidate.display.as_ref(), &skip);
+                    return ControlFlow::Continue(());
                 }
                 Err(kind) => {
                     failure = Some(failure_message(candidate, kind));
@@ -914,13 +966,22 @@ fn search_candidate(
         Err(CaptureFailure::Cancelled) => return Err(SearchFailure::Cancelled),
         Err(CaptureFailure::EpochRetired) => return Err(SearchFailure::EpochRetired),
         Err(CaptureFailure::InvalidEncoding(rejection)) => {
-            return Err(rejection.message(candidate.display.as_ref()).into());
+            return Err(candidate_failure(
+                candidate,
+                rejection.message(candidate.display.as_ref()),
+            ));
         }
         Err(CaptureFailure::Io(error)) => {
-            return Err(io_error_message(&candidate.native, &error).into());
+            return Err(candidate_failure(
+                candidate,
+                io_error_message(&candidate.native, &error),
+            ));
         }
         Err(CaptureFailure::Snapshot(error)) => {
-            return Err(snapshot_error_message(candidate, &error).into());
+            return Err(candidate_failure(
+                candidate,
+                snapshot_error_message(candidate, &error),
+            ));
         }
     };
     debug_assert_eq!(snapshot.path().native, candidate.native);
@@ -991,18 +1052,18 @@ fn search_candidate(
     let mut searcher = searcher.build();
     let content_backing = if plan.content_multiline().is_some() {
         if let Some(start) = validated.utf8_snapshot_start() {
-            let range = snapshot
-                .shared_range(start)
-                .map_err(|error| snapshot_error_message(candidate, &error))?;
+            let range = snapshot.shared_range(start).map_err(|error| {
+                candidate_failure(candidate, snapshot_error_message(candidate, &error))
+            })?;
             Some(SearchText::from_snapshot(range))
         } else {
-            let reader = validated
-                .open_source_reader(source)
-                .map_err(|error| snapshot_error_message(candidate, &error))?;
+            let reader = validated.open_source_reader(source).map_err(|error| {
+                candidate_failure(candidate, snapshot_error_message(candidate, &error))
+            })?;
             Some(
                 SearchText::capture(reader, operation).map_err(|failure| match failure {
                     SearchTextFailure::Io(error) => {
-                        SearchFailure::Message(snapshot_error_message(candidate, &error))
+                        candidate_failure(candidate, snapshot_error_message(candidate, &error))
                     }
                     SearchTextFailure::Stopped(WorkStop::RequestCancelled) => {
                         SearchFailure::Cancelled
@@ -1027,9 +1088,9 @@ fn search_candidate(
         match backing.memory_bytes() {
             Some(bytes) => searcher.search_slice(matcher, bytes, &mut sink),
             None => {
-                let reader = backing
-                    .open_reader()
-                    .map_err(|error| snapshot_error_message(candidate, &error))?;
+                let reader = backing.open_reader().map_err(|error| {
+                    candidate_failure(candidate, snapshot_error_message(candidate, &error))
+                })?;
                 searcher.search_reader(matcher, reader, &mut sink)
             }
         }
@@ -1037,17 +1098,19 @@ fn search_candidate(
         match snapshot.memory_bytes() {
             Some(bytes) => {
                 let Some(decoded) = validated.decode_for_search(bytes) else {
-                    return Err(validated
-                        .malformed_rejection()
-                        .message(candidate.display.as_ref())
-                        .into());
+                    return Err(candidate_failure(
+                        candidate,
+                        validated
+                            .malformed_rejection()
+                            .message(candidate.display.as_ref()),
+                    ));
                 };
                 searcher.search_slice(matcher, &decoded, &mut sink)
             }
             None => {
-                let reader = validated
-                    .open_source_reader(source)
-                    .map_err(|error| snapshot_error_message(candidate, &error))?;
+                let reader = validated.open_source_reader(source).map_err(|error| {
+                    candidate_failure(candidate, snapshot_error_message(candidate, &error))
+                })?;
                 searcher.search_reader(matcher, reader, &mut sink)
             }
         }
@@ -1058,16 +1121,20 @@ fn search_candidate(
             GrepSinkError::Stopped(WorkStop::RequestCancelled) => SearchFailure::Cancelled,
             GrepSinkError::Stopped(WorkStop::EpochRetired) => SearchFailure::EpochRetired,
             GrepSinkError::CaptureOverflow => SearchFailure::CaptureOverflow,
-            GrepSinkError::CountOverflow => SearchFailure::Message(format!(
-                "Cannot search file {}: the occurrence count overflowed.",
-                candidate.display
-            )),
-            GrepSinkError::Search(message) => SearchFailure::Message(format!(
-                "Cannot search file {}: {message}",
-                candidate.display
-            )),
+            GrepSinkError::CountOverflow => candidate_failure(
+                candidate,
+                format!(
+                    "Cannot search file {}: the occurrence count overflowed.",
+                    candidate.display
+                ),
+            ),
+            GrepSinkError::Search(message) => candidate_failure(
+                candidate,
+                format!("Cannot search file {}: {message}", candidate.display),
+            ),
             GrepSinkError::Io(error) if error.kind() == io::ErrorKind::InvalidData => {
-                SearchFailure::Message(
+                candidate_failure(
+                    candidate,
                     validated
                         .malformed_rejection()
                         .message(candidate.display.as_ref()),
@@ -1075,7 +1142,8 @@ fn search_candidate(
             }
             GrepSinkError::Io(error) => {
                 let message = error.to_string().to_ascii_lowercase();
-                SearchFailure::Message(
+                candidate_failure(
+                    candidate,
                     if message.contains("heap limit") || message.contains("allocation limit") {
                         search_error_message(candidate, &error)
                     } else {
@@ -1130,7 +1198,9 @@ fn validate_search_encoding(
 ) -> Result<EncodingDecision, SearchFailure> {
     validate_snapshot_encoding(snapshot, explicit_encoding, operation).map_err(|failure| {
         match failure {
-            EncodingPipelineFailure::Io(error) => snapshot_error_message(candidate, &error).into(),
+            EncodingPipelineFailure::Io(error) => {
+                candidate_failure(candidate, snapshot_error_message(candidate, &error))
+            }
             EncodingPipelineFailure::Stopped(WorkStop::RequestCancelled) => {
                 SearchFailure::Cancelled
             }
@@ -3487,10 +3557,21 @@ mod tests {
         let mut exact_overflow = grep_request(temp.path(), OutputMode::Content);
         exact_overflow.offset = Some(80);
         exact_overflow.head_limit = Some(1);
-        let (error, retries, burst, tickets) =
+        let (skipped, retries, burst, tickets) =
             grep_files_with_parallelism_and_capture_limit(exact_overflow, 100_000, 4, 8);
-        assert!(error.is_error, "{error:?}");
-        assert_eq!(retries, 1, "an exact retry must never retry itself");
+        assert!(!skipped.is_error, "{skipped:?}");
+        let ToolContent::Text(output) = &skipped.content[0] else {
+            panic!("expected text")
+        };
+        assert!(
+            output.contains("matching content and context exceed the 64 MiB safety limit"),
+            "{output}"
+        );
+        assert!(output.contains("1 file skipped"), "{output}");
+        assert_eq!(
+            retries, 4,
+            "each of the four candidates gets at most one exact retry"
+        );
         for ledger in [burst, tickets] {
             assert_eq!(ledger.released, ledger.allocated);
             assert_eq!(ledger.live, 0);
