@@ -4821,6 +4821,24 @@ mod tests {
 
         let backend = TestBackend::new(52, 18);
         let mut terminal = Terminal::new(backend).unwrap();
+        app.config_cursor = ConfigCursor::default();
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputTier);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let list_top = buffer_text(&terminal);
+        assert!(!contains_visible_text(
+            &list_top,
+            app.messages().config_more_above
+        ));
+
+        app.config_cursor = ConfigCursor::default().next();
+        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let first_child = buffer_text(&terminal);
+        assert!(!contains_visible_text(
+            &first_child,
+            app.messages().config_more_above
+        ));
+
         app.config_cursor = ConfigCursor::default().next().next();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let top = buffer_text(&terminal);
