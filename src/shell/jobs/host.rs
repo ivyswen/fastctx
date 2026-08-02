@@ -333,7 +333,7 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
     let mut capture_error = None;
     let mut output_truncation = None;
     let (status, termination) = loop {
-        drain_output_events(
+        let drained_output = drain_output_events(
             &events,
             &spec.job_dir,
             &mut log,
@@ -414,12 +414,16 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
                 }
             }
         }
-        std::thread::sleep(CONTROL_POLL);
+        if drained_output {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(CONTROL_POLL);
+        }
     };
 
     let deadline = Instant::now() + READER_JOIN_TIMEOUT;
     while Instant::now() < deadline {
-        drain_output_events(
+        let drained_output = drain_output_events(
             &events,
             &spec.job_dir,
             &mut log,
@@ -431,7 +435,11 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
         if reader.is_finished() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        if drained_output {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
     if reader.is_finished() {
         let _ = reader.join();
@@ -566,8 +574,10 @@ fn drain_output_events(
     had_loss: &mut bool,
     capture_error: &mut Option<CaptureErrorRecord>,
     output_truncation: &mut Option<OutputTruncationRecord>,
-) {
+) -> bool {
+    let mut drained = false;
     while let Ok(event) = events.receiver.try_recv() {
+        drained = true;
         match event {
             OutputEvent::Normalized(event) => {
                 if let Some(writer) = log.as_mut() {
@@ -621,6 +631,7 @@ fn drain_output_events(
             OutputEvent::Finished => {}
         }
     }
+    drained
 }
 
 fn capture_failure(

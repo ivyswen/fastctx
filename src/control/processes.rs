@@ -840,24 +840,34 @@ mod tests {
         let managed = temp.path().join("bin");
         std::fs::create_dir(&managed).unwrap();
         let executable = managed.join("fastctx");
-        super::publish_unix_executable_fixture(std::path::Path::new("/bin/sh"), &executable)
+        super::publish_unix_executable_fixture(std::path::Path::new("/bin/sleep"), &executable)
             .unwrap();
         let mut child = std::process::Command::new(&executable)
-            .args(["-c", "while :; do sleep 1; done"])
+            .arg("30")
             .spawn()
             .unwrap();
+        crate::process_identity::process_identity(child.id())
+            .expect("the fixture process identity should be inspectable");
         std::fs::remove_file(&executable).unwrap();
         std::fs::remove_dir(&managed).unwrap();
 
-        let processes = installed_processes(&managed).unwrap();
-        assert!(
-            processes
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let found = loop {
+            let found = installed_processes(&managed)
+                .unwrap()
                 .iter()
-                .any(|process| process.identity.pid == child.id()),
-            "a deleted image remains attributable to its original managed path"
-        );
+                .any(|process| process.identity.pid == child.id());
+            if found || std::time::Instant::now() >= deadline {
+                break found;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
 
         let _ = child.kill();
         let _ = child.wait();
+        assert!(
+            found,
+            "a deleted image remains attributable to its original managed path"
+        );
     }
 }
