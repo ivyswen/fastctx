@@ -513,10 +513,11 @@ fn live_connection_survives_idle_and_host_exits_only_after_disconnect() {
     std::fs::create_dir_all(&workspace).unwrap();
     let event_log = temp.path().join("runtime-events.log");
     let mut command = server_command(&home, &workspace, &event_log);
-    command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", "300");
+    // The contract is a fresh idle window, not a 300 ms proxy-close benchmark. (2026-08-02)
+    command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", "1000");
     let mut session = McpSession::start(command);
     let host = wait_for_host_starts(&event_log, 1, PROCESS_DEADLINE)[0];
-    std::thread::sleep(Duration::from_millis(900));
+    std::thread::sleep(Duration::from_millis(1500));
     assert!(
         process_is_alive(host),
         "a live connection must suppress idle shutdown"
