@@ -389,19 +389,21 @@ pub(crate) async fn run_host_entry(
     shutdown.cancel();
     let deadline = tokio::time::sleep(SERVICE_SHUTDOWN_TIMEOUT);
     tokio::pin!(deadline);
-    loop {
+    // Drain only while connections remain. The endpoint stays bound until this function returns,
+    // and a proxy that connects during the wait is never accepted: it stalls, then degrades to a
+    // standalone server. An always-enabled deadline branch would make every exit wait in full.
+    while !connections.is_empty() {
         tokio::select! {
             _ = &mut deadline => {
                 connections.abort_all();
                 while connections.join_next().await.is_some() {}
                 break;
             }
-            result = connections.join_next(), if !connections.is_empty() => {
-                if result.is_none() || connections.is_empty() {
+            result = connections.join_next() => {
+                if result.is_none() {
                     break;
                 }
             }
-            else => break,
         }
     }
     monitor.abort();

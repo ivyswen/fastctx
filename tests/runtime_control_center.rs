@@ -530,14 +530,16 @@ fn running_job_delays_zero_connection_idle_exit() {
     let mut session = McpSession::start(command);
     let response = session.call(
         "run_background",
-        serde_json::json!({"command": "sleep 1; exit 0", "login_shell": false}),
+        serde_json::json!({"command": "sleep 3; exit 0", "login_shell": false}),
     );
     let job_id = started_job_id(mcp_text(&response));
     let job_exit = home.join(".fastctx/jobs").join(job_id).join("exit.json");
     let host = wait_for_host_starts(&event_log, 1, PROCESS_DEADLINE)[0];
     assert!(session.close().success());
 
-    std::thread::sleep(Duration::from_millis(700));
+    // The job outlives the observation window on purpose: without the running-job check the host
+    // reaches zero connections and exits roughly one idle period after close, well before 1.2 s.
+    std::thread::sleep(Duration::from_millis(1200));
     assert!(
         process_is_alive(host),
         "a running job must suppress zero-connection idle shutdown"
