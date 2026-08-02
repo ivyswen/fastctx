@@ -9,6 +9,15 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
+/// Spawns the MCP binary with the short control-center idle timeout shared by the test tree.
+/// A host that outlives its suite keeps the test binary open on Windows, so the next `cargo test`
+/// invocation cannot relink it.
+fn fastctx_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", "5000");
+    command
+}
+
 #[test]
 fn default_tool_definitions_publish_replace_with_explicit_permissions() {
     let tools = FastCtxServer::new().tool_definitions();
@@ -466,7 +475,7 @@ fn stdio_glob_uses_the_server_working_directory_when_path_is_omitted() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("cwd.txt");
     write(&file, b"cwd");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_fastctx"))
+    let mut child = fastctx_command()
         .current_dir(temp.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -522,7 +531,7 @@ fn non_pdf_stdio_calls_do_not_extract_the_bundled_engine() {
     write(&file, b"plain");
     let cache_root = temp.path().join("cache-root");
     let build_id = format!("pdf-lazy-{}", std::process::id());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    let mut command = fastctx_command();
     command
         .env("FASTCTX_TEST_BUILD_ID", build_id)
         .current_dir(temp.path())
@@ -590,7 +599,7 @@ fn stdio_pdf_call_extracts_one_hashed_engine_and_preserves_image_meta() {
     write_pdf(&pdf, &[Some("MCP PDF one"), Some("MCP PDF two")]);
     let cache_root = temp.path().join("cache-root");
     let build_id = format!("pdf-extract-{}", std::process::id());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    let mut command = fastctx_command();
     command
         .env("FASTCTX_TEST_BUILD_ID", build_id)
         .current_dir(temp.path())
@@ -665,7 +674,7 @@ fn stdio_pdf_call_extracts_one_hashed_engine_and_preserves_image_meta() {
 #[test]
 fn stdio_mcp_is_tool_only_lists_tools_and_never_returns_structured_content() {
     let temp = tempfile::tempdir().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_fastctx"))
+    let mut child = fastctx_command()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -829,7 +838,7 @@ fn stdio_head_limit_zero_still_uses_the_environment_token_budget() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("many.txt");
     write(&file, "hit\n".repeat(100));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    let mut command = fastctx_command();
     command
         .env("HOME", temp.path())
         .env("USERPROFILE", temp.path())
@@ -859,7 +868,7 @@ fn stdio_preserves_utf8_text_without_host_codepage_transcoding() {
     let file = temp.path().join("unicode.txt");
     write(&file, "alpha\n中文 sentinel\n".as_bytes());
     let response = call_tool(
-        Command::new(env!("CARGO_BIN_EXE_fastctx")),
+        fastctx_command(),
         "read",
         serde_json::json!({"file_path": normalized(&file)}),
     );
@@ -875,7 +884,7 @@ fn stdio_invalid_token_budget_is_an_exact_tool_error() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("plain.txt");
     write(&file, b"plain");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    let mut command = fastctx_command();
     command.env("FASTCTX_TOKEN_BUDGET", "0");
     let response = call_tool(
         command,
@@ -894,7 +903,7 @@ fn stdio_batch_read_requires_room_for_one_line_and_its_exact_continuation() {
     let temp = tempfile::tempdir().unwrap();
     let file = temp.path().join("plain.txt");
     write(&file, b"plain\nmore");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    let mut command = fastctx_command();
     command
         .env("FASTCTX_TOKEN_BUDGET", "10")
         .env("FASTCTX_READ_TOKEN_BUDGET", "1");
@@ -934,7 +943,7 @@ fn stdio_per_tool_budgets_must_not_exceed_the_global_budget() {
     ];
 
     for (tool, variable, arguments) in cases {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+        let mut command = fastctx_command();
         command
             .env("FASTCTX_TOKEN_BUDGET", "100")
             .env(variable, "101");
@@ -973,7 +982,7 @@ fn stdio_per_tool_budgets_reject_non_positive_values() {
     ];
 
     for (tool, variable, arguments) in cases {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+        let mut command = fastctx_command();
         command.env(variable, "0");
         let response = call_tool(command, tool, arguments);
         assert_eq!(response["result"]["isError"], true);
@@ -991,7 +1000,7 @@ fn stdio_pdf_text_mode_uses_the_read_specific_page_budget() {
     let pdf = temp.path().join("budget.pdf");
     let long_page = "x".repeat(5_000);
     write_pdf(&pdf, &[Some("Small"), Some(long_page.as_str())]);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    let mut command = fastctx_command();
     command.env("FASTCTX_READ_TOKEN_BUDGET", "34");
     let response = call_tool(
         command,
@@ -1014,7 +1023,7 @@ fn stdio_pdf_call_repairs_a_corrupted_cached_engine() {
     let cache_root = temp.path().join("cache-root");
     let process_id = std::process::id();
 
-    let mut first_command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    let mut first_command = fastctx_command();
     first_command.env(
         "FASTCTX_TEST_BUILD_ID",
         format!("pdf-repair-a-{process_id}"),
@@ -1043,7 +1052,7 @@ fn stdio_pdf_call_repairs_a_corrupted_cached_engine() {
     }
     std::fs::write(&engine, b"corrupted").unwrap();
 
-    let mut second_command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    let mut second_command = fastctx_command();
     second_command.env(
         "FASTCTX_TEST_BUILD_ID",
         format!("pdf-repair-b-{process_id}"),
@@ -1070,7 +1079,7 @@ fn stdio_pdf_initialization_uses_the_request_session_cache_environment() {
     let request_cache = temp.path().join("request-cache");
     let build_id = format!("pdf-session-{}", std::process::id());
 
-    let mut bootstrap = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    let mut bootstrap = fastctx_command();
     bootstrap.env("FASTCTX_TEST_BUILD_ID", &build_id);
     let bootstrap_engine = configure_isolated_cache(&mut bootstrap, &bootstrap_cache);
     let first = call_tool(
@@ -1080,7 +1089,7 @@ fn stdio_pdf_initialization_uses_the_request_session_cache_environment() {
     );
     assert_eq!(first["result"]["isError"], false);
 
-    let mut request = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    let mut request = fastctx_command();
     request.env("FASTCTX_TEST_BUILD_ID", &build_id);
     let request_engine = configure_isolated_cache(&mut request, &request_cache);
     let second = call_tool(
@@ -1117,7 +1126,7 @@ fn no_pdf_build_rejects_pdf_without_affecting_the_public_read_schema() {
     let pdf = temp.path().join("disabled.pdf");
     write(&pdf, b"%PDF-1.4\n");
     let response = call_tool(
-        Command::new(env!("CARGO_BIN_EXE_fastctx")),
+        fastctx_command(),
         "read",
         serde_json::json!({"file_path": normalized(&pdf)}),
     );
@@ -1140,7 +1149,7 @@ fn read_response(reader: &mut impl BufRead) -> Value {
 }
 
 fn list_tool_names(args: &[&str]) -> Vec<String> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_fastctx"))
+    let mut child = fastctx_command()
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
