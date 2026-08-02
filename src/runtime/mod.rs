@@ -15,7 +15,7 @@ use local_ipc::{BoxedStream, Listener, LocalEndpoint};
 use rmcp::ServiceExt;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,9 +163,9 @@ fn short_hash(bytes: &[u8], characters: usize) -> String {
     hex::encode(digest)[..characters].to_string()
 }
 
-fn effective_build_id(environment: &SessionEnvironment) -> String {
+fn effective_build_id(_environment: &SessionEnvironment) -> String {
     #[cfg(debug_assertions)]
-    if let Ok(override_id) = environment.var("FASTCTX_TEST_BUILD_ID")
+    if let Ok(override_id) = _environment.var("FASTCTX_TEST_BUILD_ID")
         && !override_id.is_empty()
         && override_id.len() <= 32
         && override_id
@@ -425,6 +425,7 @@ fn debug_duration_override(_environment: &SessionEnvironment, _name: &str) -> Op
 #[cfg(debug_assertions)]
 fn record_test_host_start(environment: &SessionEnvironment) {
     use std::io::Write as _;
+    use std::path::PathBuf;
     let Some(path) = environment.var_os("FASTCTX_TEST_RUNTIME_EVENT_LOG") else {
         return;
     };
