@@ -17,6 +17,13 @@ use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+/// Idle timeout every test-spawned control center must use.
+///
+/// A host keeps the test binary open on Windows for as long as it lives, so one that outlives its
+/// suite makes the next `cargo test` invocation fail to relink. Any test that spawns the binary
+/// outside [`McpSession::start`] has to set `FASTCTX_TEST_RUNTIME_IDLE_MS` to this value itself.
+pub const TEST_HOST_IDLE_MS: &str = "5000";
+
 pub fn text(response: ToolResponse) -> String {
     assert!(!response.is_error, "unexpected tool error: {response:?}");
     assert_eq!(response.content.len(), 1);
@@ -79,7 +86,7 @@ impl McpSession {
             .get_envs()
             .any(|(name, _)| name == "FASTCTX_TEST_RUNTIME_IDLE_MS")
         {
-            command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", "5000");
+            command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", TEST_HOST_IDLE_MS);
         }
         command
             .stdin(Stdio::piped())

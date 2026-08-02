@@ -1,6 +1,6 @@
 mod common;
 
-use common::{McpSession, mcp_text, normalized};
+use common::{McpSession, TEST_HOST_IDLE_MS, mcp_text, normalized};
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -35,6 +35,9 @@ fn parent_watch_exits_without_stdin_eof_but_preserves_live_and_opted_out_servers
     let output = File::create(&response).unwrap();
     let mut live = Command::new(env!("CARGO_BIN_EXE_fastctx"))
         .arg("serve")
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path())
+        .env("FASTCTX_TEST_RUNTIME_IDLE_MS", TEST_HOST_IDLE_MS)
         .env_remove("FASTCTX_NO_PARENT_WATCH")
         .stdin(Stdio::from(stdin_reader))
         .stdout(Stdio::from(output))
@@ -165,6 +168,7 @@ fn stdin_eof_ends_inflight_foreground_work_promptly() {
         .env("TMPDIR", &temp_dir)
         .env("TMP", &temp_dir)
         .env("TEMP", &temp_dir)
+        .env("FASTCTX_TEST_RUNTIME_IDLE_MS", TEST_HOST_IDLE_MS)
         .env_remove("FASTCTX_NO_PARENT_WATCH")
         .stdin(Stdio::from(stdin_reader))
         .stdout(Stdio::from(output))
@@ -239,6 +243,9 @@ fn stdin_startup_read_error_is_not_reported_as_clean_eof() {
         .unwrap();
     let mut server = Command::new(env!("CARGO_BIN_EXE_fastctx"))
         .arg("serve")
+        .env("HOME", temp.path())
+        .env("USERPROFILE", temp.path())
+        .env("FASTCTX_TEST_RUNTIME_IDLE_MS", TEST_HOST_IDLE_MS)
         .env_remove("FASTCTX_NO_PARENT_WATCH")
         .stdin(Stdio::from(unreadable_stdin))
         .stdout(Stdio::null())
@@ -493,7 +500,9 @@ fn parent_watch_fixture_parent() {
         .open(&response_path)
         .unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
-    command.arg("serve");
+    command
+        .arg("serve")
+        .env("FASTCTX_TEST_RUNTIME_IDLE_MS", TEST_HOST_IDLE_MS);
     if std::env::var("FASTCTX_WATCH_FIXTURE_ENABLE_SHELL")
         .ok()
         .as_deref()
