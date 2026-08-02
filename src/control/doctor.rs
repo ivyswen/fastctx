@@ -269,14 +269,14 @@ fn check_search_parallelism(paths: &ControlPaths) -> DoctorCheck {
             (None, Some(effective)) => DoctorCheck::pass(
                 "Search CPU limit",
                 format!(
-                    "Automatic grep/glob parallelism: engine-visible upper bound {0}; effective P={effective}. No user CPU limit is configured.",
+                    "Automatic grep/glob parallelism: engine-visible upper bound {0}; effective P={effective} for the next control center. No user CPU limit is configured. A running control center keeps the parallelism it started with until every Codex session has closed.",
                     status.available
                 ),
             ),
             (Some(configured), Some(effective)) => DoctorCheck::pass(
                 "Search CPU limit",
                 format!(
-                    "Configured search.max_cpu_cores={configured}; engine-visible upper bound {}; effective P={effective}. The limit applies after the shared control center restarts.",
+                    "Configured search.max_cpu_cores={configured}; engine-visible upper bound {}; effective P={effective} for the next control center. A running control center keeps the parallelism it started with until every Codex session has closed.",
                     status.available
                 ),
             ),
@@ -286,7 +286,7 @@ fn check_search_parallelism(paths: &ControlPaths) -> DoctorCheck {
                     "search.max_cpu_cores={configured} is invalid on this machine; the legal range is 1..={}.",
                     status.available
                 ),
-                "Set search.max_cpu_cores to a legal integer or remove the key for automatic parallelism, then restart active FastCtx sessions.",
+                "Set search.max_cpu_cores to a legal integer or remove the key for automatic parallelism. The next control center picks up the value after every Codex session has closed.",
             ),
             (None, None) => unreachable!("automatic parallelism always resolves"),
         },
