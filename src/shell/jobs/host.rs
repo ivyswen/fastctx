@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_POLL: Duration = Duration::from_millis(20);
 const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+const WATCHDOG_IDENTITY_TIMEOUT: Duration = Duration::from_secs(1);
 const OUTPUT_EVENT_QUEUE: usize = 64;
 
 enum OutputEvent {
@@ -272,11 +273,48 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
         &spec.utf8_locale,
     )
     .map_err(|error| format!("Cannot start the command: {error}."))?;
-    let mut watchdog = match WatchdogGuard::arm(process.id(), &spec.environment, &spec.cwd) {
-        Ok(watchdog) => watchdog,
-        Err(error) => {
-            let _ = process.terminate_tree();
-            return Err(error);
+    let watchdog_deadline = Instant::now() + WATCHDOG_IDENTITY_TIMEOUT;
+    let (mut watchdog, mut early_exit) = loop {
+        match WatchdogGuard::arm(process.id(), &spec.environment, &spec.cwd) {
+            Ok(Some(watchdog)) => break (watchdog, None),
+            Ok(None) => match process.try_wait() {
+                Ok(Some(status)) => {
+                    let code = exit_code(status);
+                    process.terminate_tree().map_err(|error| {
+                        format!(
+                            "The command exited before orphan protection was established, but its descendant process tree could not be terminated: {error}"
+                        )
+                    })?;
+                    break (WatchdogGuard::disarmed(), Some(code));
+                }
+                Ok(None) if Instant::now() < watchdog_deadline => {
+                    std::thread::sleep(CONTROL_POLL);
+                }
+                Ok(None) => {
+                    let error = "Cannot identify the background command process for orphan protection after 1 second.";
+                    return match process.terminate_tree() {
+                        Ok(_) => Err(error.to_string()),
+                        Err(termination_error) => Err(format!(
+                            "{error} Terminating the unprotected command tree also failed: {termination_error}."
+                        )),
+                    };
+                }
+                Err(error) => {
+                    let message = format!(
+                        "Cannot inspect the background command while establishing orphan protection: {error}."
+                    );
+                    return match process.terminate_tree() {
+                        Ok(_) => Err(message),
+                        Err(termination_error) => Err(format!(
+                            "{message} Terminating the unprotected command tree also failed: {termination_error}."
+                        )),
+                    };
+                }
+            },
+            Err(error) => {
+                let _ = process.terminate_tree();
+                return Err(error);
+            }
         }
     };
     let supervisor = process_identity(std::process::id()).ok_or_else(|| {
@@ -356,6 +394,9 @@ fn supervise(spec: LaunchSpec) -> Result<(), String> {
             events.discard_output.store(true, Ordering::Release);
         }
 
+        if let Some(status) = early_exit.take() {
+            break (status, TerminationKind::Exited);
+        }
         match process.try_wait() {
             Ok(Some(status)) => {
                 let code = exit_code(status);
@@ -688,12 +729,12 @@ impl WatchdogGuard {
         process_pid: u32,
         environment: &crate::session::SessionEnvironment,
         cwd: &std::path::Path,
-    ) -> Result<Self, String> {
+    ) -> Result<Option<Self>, String> {
         use std::os::unix::process::CommandExt;
 
-        let identity = process_identity(process_pid).ok_or_else(|| {
-            "Cannot identify the background command process for orphan protection.".to_string()
-        })?;
+        let Some(identity) = process_identity(process_pid) else {
+            return Ok(None);
+        };
         let (reader, writer) = std::io::pipe().map_err(|error| {
             format!("Cannot create the background command orphan-protection pipe: {error}")
         })?;
@@ -720,9 +761,13 @@ impl WatchdogGuard {
         command.spawn().map_err(|error| {
             format!("Cannot start the background command orphan-protection helper: {error}")
         })?;
-        Ok(Self {
+        Ok(Some(Self {
             writer: Some(writer),
-        })
+        }))
+    }
+
+    fn disarmed() -> Self {
+        Self { writer: None }
     }
 
     fn disarm(&mut self) {
@@ -741,8 +786,12 @@ impl WatchdogGuard {
         _process_pid: u32,
         _environment: &crate::session::SessionEnvironment,
         _cwd: &std::path::Path,
-    ) -> Result<Self, String> {
-        Ok(Self)
+    ) -> Result<Option<Self>, String> {
+        Ok(Some(Self))
+    }
+
+    fn disarmed() -> Self {
+        Self
     }
 
     fn disarm(&mut self) {}
