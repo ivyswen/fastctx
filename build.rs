@@ -92,7 +92,7 @@ fn emit_build_id() {
         DISTRIBUTION_ENV,
     ] {
         hasher.update(name.as_bytes());
-        hasher.update([b'=']);
+        hasher.update(*b"=");
         if let Some(value) = env::var_os(name) {
             hasher.update(value.to_string_lossy().as_bytes());
         }
