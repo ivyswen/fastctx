@@ -22,6 +22,13 @@ use std::time::{Duration, Instant};
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(4);
 const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Budget for `initialize`, which also absorbs a cold control-center start.
+///
+/// The probed server is a thin proxy: it starts the shared control center, waits for it, and only
+/// falls back to a standalone server after its own startup timeout. Anything shorter reports a
+/// handshake failure for a server that is merely starting.
+const MCP_INITIALIZE_TIMEOUT: Duration =
+    Duration::from_secs(crate::runtime::STARTUP_TIMEOUT.as_secs() + 5);
 static CAPTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Three-state result for one doctor check; Info does not affect the status exit code.
@@ -865,7 +872,7 @@ pub fn probe_mcp_server(
                 }
             }),
         )?;
-        let initialized = receive_response(&receiver, 1, "initialize")?;
+        let initialized = receive_response(&receiver, 1, "initialize", MCP_INITIALIZE_TIMEOUT)?;
         if initialized.get("error").is_some() {
             return Err(format!(
                 "MCP handshake failed during initialize: {initialized}"
@@ -879,7 +886,7 @@ pub fn probe_mcp_server(
             &mut stdin,
             serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
         )?;
-        let listed = receive_response(&receiver, 2, "tools/list")?;
+        let listed = receive_response(&receiver, 2, "tools/list", MCP_RESPONSE_TIMEOUT)?;
         if listed.get("error").is_some() {
             return Err(format!("MCP handshake failed during tools/list: {listed}"));
         }
@@ -945,8 +952,9 @@ fn receive_response(
     receiver: &mpsc::Receiver<Result<String, String>>,
     expected_id: i64,
     stage: &str,
+    budget: Duration,
 ) -> Result<Value, String> {
-    let deadline = Instant::now() + MCP_RESPONSE_TIMEOUT;
+    let deadline = Instant::now() + budget;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1122,8 +1130,8 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DoctorCheckStatus, check_drift, check_extension_state, check_output_guard, receipt_drift,
-        run,
+        DoctorCheckStatus, MCP_INITIALIZE_TIMEOUT, check_drift, check_extension_state,
+        check_output_guard, receipt_drift, run,
     };
     use crate::control::codex_config::{self, ExpectedConfig};
     use crate::control::paths::ControlPaths;
@@ -1131,6 +1139,18 @@ mod tests {
         AppliedRecord, FastCtxSettings, ManagedFileRecord, Tier, ToolBudgetLevel,
         ToolBudgetPreferences, ToolBudgets,
     };
+
+    #[test]
+    fn the_initialize_budget_outlasts_a_cold_control_center_start() {
+        // The probed server is a thin proxy, so a passing handshake needs the shared control
+        // center to come up first. A budget at or below the proxy startup timeout turns "still
+        // starting" into a reported failure, which is what `fastctx status` did on a fresh home.
+        assert!(
+            MCP_INITIALIZE_TIMEOUT > crate::runtime::STARTUP_TIMEOUT,
+            "initialize budget {MCP_INITIALIZE_TIMEOUT:?} does not outlast a cold start of {:?}",
+            crate::runtime::STARTUP_TIMEOUT
+        );
+    }
 
     fn provider_record(
         tier: Tier,

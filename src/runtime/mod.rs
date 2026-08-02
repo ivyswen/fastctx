@@ -24,7 +24,8 @@ use tokio::io::{AsyncWriteExt, split};
 use tokio::sync::OnceCell;
 use tokio_util::sync::CancellationToken;
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a proxy waits for the control center before falling back to a standalone server.
+pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY: Duration = Duration::from_millis(20);
 const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
