@@ -151,6 +151,10 @@ impl McpSession {
         self.child.as_ref().unwrap().id()
     }
 
+    pub fn disconnect_stdin(&mut self) {
+        self.stdin.take();
+    }
+
     pub fn kill_proxy(mut self) -> ExitStatus {
         self.stdin.take();
         let mut child = self.child.take().unwrap();
@@ -163,6 +167,30 @@ impl McpSession {
         let mut child = self.child.take().unwrap();
         let _ = child.kill();
         let status = child.wait().unwrap();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.stderr.take() {
+            pipe.read_to_string(&mut stderr).unwrap();
+        }
+        (status, stderr)
+    }
+
+    pub fn wait_for_exit_with_stderr(mut self) -> (ExitStatus, String) {
+        let mut child = self.child.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let status = child.wait().unwrap();
+                panic!(
+                    "MCP server did not exit after its control center closed; killed with {status}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        self.stdin.take();
         let mut stderr = String::new();
         if let Some(mut pipe) = self.stderr.take() {
             pipe.read_to_string(&mut stderr).unwrap();

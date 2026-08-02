@@ -117,7 +117,7 @@ mod platform {
 
     pub(crate) struct Listener {
         endpoint: LocalEndpoint,
-        current: NamedPipeServer,
+        current: Option<NamedPipeServer>,
     }
 
     impl Listener {
@@ -125,17 +125,33 @@ mod platform {
             let current = create_server(endpoint, true)?;
             Ok(Self {
                 endpoint: endpoint.clone(),
-                current,
+                current: Some(current),
             })
         }
 
         pub(crate) async fn accept(&mut self) -> Result<BoxedStream, String> {
-            self.current
+            if self.current.is_none() {
+                self.current = Some(create_server(&self.endpoint, false)?);
+            }
+            if let Err(error) = self
+                .current
+                .as_mut()
+                .expect("the named-pipe listener is initialized before accept")
                 .connect()
                 .await
-                .map_err(|error| format!("Cannot accept a control-center connection: {error}"))?;
-            let next = create_server(&self.endpoint, false)?;
-            let connected = std::mem::replace(&mut self.current, next);
+            {
+                self.current = None;
+                return Err(format!(
+                    "Cannot accept a control-center connection: {error}"
+                ));
+            }
+            let connected = self
+                .current
+                .take()
+                .expect("the connected named-pipe listener remains present");
+            // Do not discard an already accepted session if allocating the next pipe instance
+            // fails. The following accept retries allocation while live sessions keep running.
+            self.current = create_server(&self.endpoint, false).ok();
             Ok(Box::new(connected))
         }
     }

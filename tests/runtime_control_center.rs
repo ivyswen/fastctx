@@ -100,6 +100,7 @@ fn connection_context_keeps_cwd_path_budget_cursor_and_cancellation_isolated() {
     let mut first_command = server_command(&home, &first, &event_log);
     prepend_path(&mut first_command, &first_bin);
     first_command
+        .env("FASTCTX_TEST_RUNTIME_IDLE_MS", "300")
         .env("SESSION_VALUE", "env-first")
         .env("FASTCTX_TOKEN_BUDGET", "1000")
         .env("FASTCTX_RUN_TOKEN_BUDGET", "1000");
@@ -195,13 +196,11 @@ fn connection_context_keeps_cwd_path_budget_cursor_and_cancellation_isolated() {
         "cancelled session A escaped its owner"
     );
 
-    assert_eq!(
-        wait_for_host_starts(&event_log, 1, PROCESS_DEADLINE).len(),
-        1
-    );
+    let hosts = wait_for_host_starts(&event_log, 1, PROCESS_DEADLINE);
+    assert_eq!(hosts.len(), 1);
     let _ = invalid_budget.kill_proxy();
     let _ = second_session.kill_proxy();
-    terminate_process(host_start_pids(&event_log)[0]);
+    wait_for_process_exit(hosts[0], PROCESS_DEADLINE);
 }
 
 #[test]
@@ -456,8 +455,16 @@ fn control_center_crash_rebuilds_once_without_replaying_an_inflight_request() {
     let first_host = wait_for_host_starts(&event_log, 1, PROCESS_DEADLINE)[0];
     terminate_process(first_host);
     wait_for_process_exit(first_host, PROCESS_DEADLINE);
-    wait_for_child_exit(first.child_id(), PROCESS_DEADLINE);
-    let _ = first.kill_proxy();
+    let (status, stderr) = first.wait_for_exit_with_stderr();
+    assert!(
+        !status.success(),
+        "proxy exited successfully after host crash"
+    );
+    assert!(
+        stderr.contains("FastCtx control-center")
+            && (stderr.contains("closed unexpectedly") || stderr.contains("connection failed")),
+        "missing explicit control-center failure: {stderr}"
+    );
 
     let mut replacement = McpSession::start(server_command(&home, &workspace, &event_log));
     let hosts = wait_for_host_starts(&event_log, 2, PROCESS_DEADLINE);
@@ -478,7 +485,40 @@ fn control_center_crash_rebuilds_once_without_replaying_an_inflight_request() {
 }
 
 #[test]
-fn idle_exit_waits_for_running_jobs_and_then_closes_leaked_connections() {
+fn live_connection_survives_idle_and_host_exits_only_after_disconnect() {
+    let _serial = runtime_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let event_log = temp.path().join("runtime-events.log");
+    let mut command = server_command(&home, &workspace, &event_log);
+    command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", "300");
+    let mut session = McpSession::start(command);
+    let host = wait_for_host_starts(&event_log, 1, PROCESS_DEADLINE)[0];
+    std::thread::sleep(Duration::from_millis(900));
+    assert!(
+        process_is_alive(host),
+        "a live connection must suppress idle shutdown"
+    );
+    let resumed = session.call(
+        "run",
+        serde_json::json!({"command": "printf resumed", "login_shell": false}),
+    );
+    assert!(mcp_text(&resumed).starts_with("resumed"), "{resumed}");
+
+    let status = session.close();
+    assert!(status.success(), "stdin EOF must remain a clean proxy exit");
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        process_is_alive(host),
+        "idle time must restart when the final connection disconnects"
+    );
+    wait_for_process_exit(host, PROCESS_DEADLINE);
+}
+
+#[test]
+fn running_job_delays_zero_connection_idle_exit() {
     let _serial = runtime_guard();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
@@ -493,19 +533,60 @@ fn idle_exit_waits_for_running_jobs_and_then_closes_leaked_connections() {
         serde_json::json!({"command": "sleep 1; exit 0", "login_shell": false}),
     );
     let job_id = started_job_id(mcp_text(&response));
+    let job_exit = home.join(".fastctx/jobs").join(job_id).join("exit.json");
     let host = wait_for_host_starts(&event_log, 1, PROCESS_DEADLINE)[0];
+    assert!(session.close().success());
+
     std::thread::sleep(Duration::from_millis(700));
     assert!(
         process_is_alive(host),
-        "running job must suppress idle shutdown"
+        "a running job must suppress zero-connection idle shutdown"
     );
-    wait_for_file(
-        &home.join(".fastctx/jobs").join(job_id).join("exit.json"),
-        PROCESS_DEADLINE,
-    );
+    wait_for_file(&job_exit, PROCESS_DEADLINE);
     wait_for_process_exit(host, PROCESS_DEADLINE);
-    wait_for_child_exit(session.child_id(), PROCESS_DEADLINE);
-    let _ = session.kill_proxy();
+}
+
+#[test]
+fn multiple_idle_connections_resume_together_through_the_same_host() {
+    let _serial = runtime_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let event_log = temp.path().join("runtime-events.log");
+    let mut first_command = server_command(&home, &workspace, &event_log);
+    first_command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", "300");
+    let mut second_command = server_command(&home, &workspace, &event_log);
+    second_command.env("FASTCTX_TEST_RUNTIME_IDLE_MS", "300");
+    let mut first = McpSession::start(first_command);
+    let mut second = McpSession::start(second_command);
+    let host = wait_for_host_starts(&event_log, 1, PROCESS_DEADLINE)[0];
+
+    std::thread::sleep(Duration::from_millis(900));
+    assert!(process_is_alive(host), "live idle sessions lost their host");
+    let first_id = first.begin_call(
+        "run",
+        serde_json::json!({"command": "printf first", "login_shell": false}),
+    );
+    let second_id = second.begin_call(
+        "run",
+        serde_json::json!({"command": "printf second", "login_shell": false}),
+    );
+    let first_response = first.await_response(first_id);
+    let second_response = second.await_response(second_id);
+    assert!(mcp_text(&first_response).starts_with("first"));
+    assert!(mcp_text(&second_response).starts_with("second"));
+    assert_eq!(
+        host_start_pids(&event_log),
+        vec![host],
+        "idle recovery must neither replace nor duplicate the control center"
+    );
+
+    first.disconnect_stdin();
+    second.disconnect_stdin();
+    assert!(first.close().success());
+    assert!(second.close().success());
+    wait_for_process_exit(host, PROCESS_DEADLINE);
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -684,10 +765,6 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) {
         assert!(Instant::now() < deadline, "process {pid} did not exit");
         std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-fn wait_for_child_exit(pid: u32, timeout: Duration) {
-    wait_for_process_exit(pid, timeout);
 }
 
 #[cfg(unix)]

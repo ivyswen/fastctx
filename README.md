@@ -8,7 +8,7 @@ FastCtx is a local Rust tool runtime. It provides file reading, content search, 
 
 Repository operations run in a persistent process with stable input schemas and output formats. The model can gather the context it needs in fewer steps and spend more attention on understanding code, planning changes, and verifying results.
 
-Each `fastctx serve` process is a thin stdio proxy. Proxies for the same user and FastCtx build share one private local control center, including its search executor and global admission limits, while every MCP connection keeps its own working directory, native environment, cancellation state, and background-output cursor. The control center exits after ten minutes with no active request and no running background job; leaked idle proxies then exit with it. If the private control center cannot start or accept a session, the proxy reports the problem and falls back to a complete standalone server before consuming MCP input.
+Each `fastctx serve` process is a thin stdio proxy. Proxies for the same user and FastCtx build share one private local control center, including its search executor and global admission limits, while every MCP connection keeps its own working directory, native environment, cancellation state, and background-output cursor. The control center never disconnects a live proxy; after the last proxy disconnects, it exits once ten minutes have passed with no active request and no running background job. If the private control center cannot start or accept a session, the proxy reports the problem and falls back to a complete standalone server before consuming MCP input.
 
 ```console
 npm install --global fastctx

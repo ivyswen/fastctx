@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY: Duration = Duration::from_millis(20);
+const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const SERVICE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -326,10 +327,12 @@ pub(crate) async fn run_host_entry(
         .or_else(|| debug_duration_override(&environment, "FASTCTX_TEST_RUNTIME_IDLE_MS"))
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_IDLE_TIMEOUT);
+    let (idle_candidate_tx, mut idle_candidate_rx) = tokio::sync::mpsc::channel(1);
     let monitor = tokio::spawn(monitor_idle(
         Arc::clone(&state),
         shutdown.clone(),
         idle_timeout,
+        idle_candidate_tx,
     ));
     let maintenance = tokio::spawn(monitor_maintenance(
         Arc::clone(&state),
@@ -345,16 +348,36 @@ pub(crate) async fn run_host_entry(
 
     loop {
         tokio::select! {
-            () = shutdown.cancelled() => break,
             accepted = listener.accept() => {
-                let stream = accepted?;
-                state.activity.touch();
-                connections.spawn(serve_connection(
-                    stream,
-                    Arc::clone(&state),
-                    shutdown.clone(),
-                ));
+                match accepted {
+                    Ok(stream) => {
+                        let Some(connection) = state.activity.try_connection() else {
+                            drop(stream);
+                            continue;
+                        };
+                        connections.spawn(serve_connection(
+                            stream,
+                            Arc::clone(&state),
+                            shutdown.clone(),
+                            connection,
+                        ));
+                    }
+                    Err(error) => {
+                        eprintln!("fastctx control center: {error}; retrying.");
+                        tokio::select! {
+                            () = shutdown.cancelled() => break,
+                            () = tokio::time::sleep(ACCEPT_RETRY) => {}
+                        }
+                    }
+                }
             }
+            Some(()) = idle_candidate_rx.recv() => {
+                if state.activity.try_begin_shutdown(idle_timeout) {
+                    shutdown.cancel();
+                    break;
+                }
+            }
+            () = shutdown.cancelled() => break,
             result = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = result {
                     eprintln!("fastctx control center: connection task failed: {error}");
@@ -446,6 +469,7 @@ async fn serve_connection(
     mut stream: BoxedStream,
     state: Arc<HostState>,
     shutdown: CancellationToken,
+    _connection: activity::ConnectionActivityGuard,
 ) {
     let handshake = match protocol::read_handshake(&mut stream).await {
         Ok(handshake) => handshake,
@@ -499,7 +523,12 @@ async fn serve_connection(
     }
 }
 
-async fn monitor_idle(state: Arc<HostState>, shutdown: CancellationToken, idle_timeout: Duration) {
+async fn monitor_idle(
+    state: Arc<HostState>,
+    shutdown: CancellationToken,
+    idle_timeout: Duration,
+    candidate: tokio::sync::mpsc::Sender<()>,
+) {
     let interval = idle_timeout
         .div_f64(4.0)
         .clamp(Duration::from_millis(50), Duration::from_secs(30));
@@ -508,12 +537,14 @@ async fn monitor_idle(state: Arc<HostState>, shutdown: CancellationToken, idle_t
             () = shutdown.cancelled() => return,
             () = tokio::time::sleep(interval) => {}
         }
-        if !state.activity.is_idle_for(idle_timeout) {
+        if !state.activity.is_shutdown_eligible(idle_timeout) {
             continue;
         }
         let Some(paths) = state.control_paths.get().cloned() else {
-            shutdown.cancel();
-            return;
+            if candidate.send(()).await.is_err() {
+                return;
+            }
+            continue;
         };
         let running = tokio::task::spawn_blocking(move || {
             crate::shell::jobs::running_summaries(&paths).map(|jobs| !jobs.is_empty())
@@ -522,11 +553,12 @@ async fn monitor_idle(state: Arc<HostState>, shutdown: CancellationToken, idle_t
         match running {
             Ok(Ok(false)) => {
                 // A request may have arrived while the registry scan ran off-thread.
-                if !state.activity.is_idle_for(idle_timeout) {
+                if !state.activity.is_shutdown_eligible(idle_timeout) {
                     continue;
                 }
-                shutdown.cancel();
-                return;
+                if candidate.send(()).await.is_err() {
+                    return;
+                }
             }
             Ok(Ok(true)) => {}
             Ok(Err(error)) => eprintln!(
@@ -566,11 +598,11 @@ pub(crate) async fn forward_stdio(
     tokio::pin!(stdin_error_wait);
 
     let result = tokio::select! {
-        result = &mut download => match result {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) => Err(format!("The FastCtx control-center connection failed: {error}")),
-            Err(error) => Err(format!("The FastCtx control-center output task failed: {error}")),
-        },
+        biased;
+        error = &mut stdin_error_wait => Err(error),
+        () = stdin_eof.cancelled() => Ok(()),
+        () = &mut parent_exit => Ok(()),
+        () = wait_for_termination_signal() => Ok(()),
         result = &mut upload => match stdin_error.borrow().clone() {
             Some(error) => Err(error),
             None => match result {
@@ -579,10 +611,14 @@ pub(crate) async fn forward_stdio(
                 Err(error) => Err(format!("The FastCtx control-center input task failed: {error}")),
             }
         },
-        error = &mut stdin_error_wait => Err(error),
-        () = stdin_eof.cancelled() => Ok(()),
-        () = &mut parent_exit => Ok(()),
-        () = wait_for_termination_signal() => Ok(()),
+        result = &mut download => match result {
+            Ok(Ok(_)) => Err(
+                "The FastCtx control-center connection closed unexpectedly; the in-flight request was not replayed."
+                    .to_string(),
+            ),
+            Ok(Err(error)) => Err(format!("The FastCtx control-center connection failed: {error}")),
+            Err(error) => Err(format!("The FastCtx control-center output task failed: {error}")),
+        },
     };
     upload.abort();
     download.abort();
