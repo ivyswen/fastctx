@@ -157,6 +157,15 @@ jobs:
       - name: Test release contracts
         run: cargo test --locked --release --target ${{ matrix.target }}
 
+      # The contract tests above leave control centers riding out their idle window and detached
+      # job supervisors finishing their commands. Windows cannot replace a mapped binary, so the
+      # release build below fails with os error 5 while relinking the same path. CI drains between
+      # its test groups for the same reason; this job relinks right after a test group too.
+      - name: Drain test processes before the release build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/drain-test-processes.ps1
+
       - name: Build single-file executable
         if: matrix.target != 'x86_64-unknown-linux-gnu'
         env:
@@ -245,8 +254,15 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
           binary=/opt/fastctx
+          # Every check below reports what it wanted and what it got. A bare `[[ ]]` or `grep -q`
+          # under `set -e` fails the whole release with an empty log, which is how a real defect
+          # here once cost an afternoon of bisecting.
           version="$("$binary" --version)"
-          [[ "$version" == fastctx\ * ]]
+          echo "fastctx reports: $version"
+          if [[ "$version" != fastctx\ * ]]; then
+            echo "::error::glibc smoke test: --version printed $version"
+            exit 1
+          fi
           responses="$(
             printf '%s\n' \
               '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"glibc-smoke","version":"1.0"}}}' \
@@ -254,10 +270,18 @@ jobs:
               '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' |
               timeout 15s "$binary" serve
           )"
-          grep -Eq '"id"[[:space:]]*:[[:space:]]*1' <<<"$responses"
-          grep -Eq '"id"[[:space:]]*:[[:space:]]*2' <<<"$responses"
-          grep -Eq '"name"[[:space:]]*:[[:space:]]*"read"' <<<"$responses"
-          grep -Eq '"name"[[:space:]]*:[[:space:]]*"replace"' <<<"$responses"
+          require() {
+            if ! grep -Eq "$1" <<<"$responses"; then
+              echo "::error::glibc smoke test: the MCP responses carry no $2"
+              echo "Captured ${#responses} bytes of responses:"
+              head -c 2000 <<<"$responses"
+              exit 1
+            fi
+          }
+          require '"id"[[:space:]]*:[[:space:]]*1' 'answer to initialize'
+          require '"id"[[:space:]]*:[[:space:]]*2' 'answer to tools/list'
+          require '"name"[[:space:]]*:[[:space:]]*"read"' 'read tool'
+          require '"name"[[:space:]]*:[[:space:]]*"replace"' 'replace tool'
           SCRIPT
           chmod +x target/glibc-smoke.sh
           binary="$PWD/target/${{ matrix.target }}/release/${{ matrix.binary }}"
