@@ -229,6 +229,71 @@ fn stdin_eof_ends_inflight_foreground_work_promptly() {
     );
 }
 
+/// The counterweight to the promptness contract above: ending a session must not cost the answers
+/// the server already owes. `initialize | tools/list | close stdin` is how a script or a smoke test
+/// drives an MCP server, and a proxy that abandons the connection at EOF answers none of it while
+/// still exiting successfully.
+#[test]
+fn stdin_eof_still_answers_requests_that_were_already_sent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let response_path = root.join("response.jsonl");
+    let diagnostics_path = root.join("stderr.txt");
+    let output = File::create(&response_path).unwrap();
+    let diagnostics = File::create(&diagnostics_path).unwrap();
+    let (stdin_reader, mut stdin_writer) = anonymous_pipe();
+    let mut server = Command::new(env!("CARGO_BIN_EXE_fastctx"))
+        .arg("serve")
+        .current_dir(root)
+        .env("HOME", root)
+        .env("USERPROFILE", root)
+        .env("FASTCTX_TEST_RUNTIME_IDLE_MS", TEST_HOST_IDLE_MS)
+        .env_remove("FASTCTX_NO_PARENT_WATCH")
+        .stdin(Stdio::from(stdin_reader))
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::from(diagnostics))
+        .spawn()
+        .unwrap();
+
+    // Everything this client will ever say, then EOF, with no read in between.
+    write_initialize(&mut stdin_writer);
+    send_json(
+        &mut stdin_writer,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }),
+    );
+    send_json(
+        &mut stdin_writer,
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    );
+    let eof_started = Instant::now();
+    drop(stdin_writer);
+
+    let Some(status) = wait_for_child_exit(&mut server, PROCESS_DEADLINE) else {
+        let _ = server.kill();
+        let _ = server.wait();
+        panic!("serve did not exit within {PROCESS_DEADLINE:?} after stdin EOF");
+    };
+    let eof_delay = eof_started.elapsed();
+    assert!(status.success(), "serve failed after stdin EOF: {status}");
+
+    let answers = std::fs::read_to_string(&response_path).unwrap();
+    let answered = answers
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|message| message.get("id").and_then(Value::as_u64))
+        .collect::<Vec<_>>();
+    let diagnostics = std::fs::read_to_string(&diagnostics_path).unwrap_or_default();
+    assert!(
+        answered.contains(&1) && answered.contains(&2),
+        "stdin EOF discarded answers that were already owed after {eof_delay:?}; \
+         answered {answered:?}, stdout {answers:?}, stderr {diagnostics:?}"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn stdin_startup_read_error_is_not_reported_as_clean_eof() {

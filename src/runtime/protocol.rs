@@ -1,12 +1,16 @@
-//! Length-delimited control-center handshake followed by an untouched MCP byte stream.
+//! Length-delimited control-center handshake, framed requests, and a raw MCP answer stream.
 
 use crate::server::ServerOptions;
 use crate::session::SessionEnvironment;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_HANDSHAKE_BYTES: usize = 16 * 1024 * 1024;
+/// Largest payload the proxy places in one request frame, and the buffer the control center reads
+/// it back into.
+pub(crate) const MAX_REQUEST_FRAME_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct Handshake {
@@ -92,6 +96,80 @@ pub(crate) async fn read_handshake_response(
     match response.error {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// Streams MCP stdin to the control center as length-prefixed frames, ending with a zero-length
+/// frame once stdin closes.
+///
+/// A raw byte stream cannot say "no more requests" on every platform: Unix half-closes a socket,
+/// Windows named pipes have no equivalent. Without that mark the control center holds a finished
+/// session open, and a proxy whose stdin closed would have to guess how long to wait for the
+/// answers it is still owed — a guess that is either too short to deliver them or too long to
+/// shut down promptly. The explicit end-of-input frame removes the guess. Both ends always come
+/// from the same build, because the endpoint name carries the build id, so the framing needs no
+/// negotiation.
+/// `forwarded` records that at least one request byte reached the control center, which is how the
+/// caller tells "answers are owed" from "the client never asked anything".
+pub(crate) async fn forward_requests(
+    input: &mut (impl AsyncRead + Unpin),
+    output: &mut (impl AsyncWrite + Unpin),
+    forwarded: &AtomicBool,
+) -> std::io::Result<()> {
+    let mut buffer = vec![0_u8; MAX_REQUEST_FRAME_BYTES];
+    loop {
+        let read = input.read(&mut buffer).await?;
+        let length =
+            u32::try_from(read).expect("a single read never exceeds the request frame buffer");
+        output.write_all(&length.to_be_bytes()).await?;
+        if read == 0 {
+            return output.flush().await;
+        }
+        output.write_all(&buffer[..read]).await?;
+        forwarded.store(true, Ordering::Release);
+        output.flush().await?;
+    }
+}
+
+/// Reassembles framed requests into the plain byte stream the MCP server reads.
+///
+/// Returns once the proxy marks the end of input, which is what makes the server observe EOF and
+/// end the session.
+pub(crate) async fn receive_requests(
+    input: &mut (impl AsyncRead + Unpin),
+    output: &mut (impl AsyncWrite + Unpin),
+) -> Result<(), String> {
+    let mut header = [0_u8; 4];
+    let mut payload = vec![0_u8; MAX_REQUEST_FRAME_BYTES];
+    loop {
+        match input.read_exact(&mut header).await {
+            Ok(_) => {}
+            // A proxy that died without marking the end of input tells the server the same thing:
+            // nothing more is coming.
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(error) => return Err(format!("Cannot read the request frame length: {error}")),
+        }
+        let length = u32::from_be_bytes(header) as usize;
+        if length == 0 {
+            return Ok(());
+        }
+        if length > MAX_REQUEST_FRAME_BYTES {
+            return Err(format!(
+                "A {length}-byte request frame exceeds the {MAX_REQUEST_FRAME_BYTES}-byte limit."
+            ));
+        }
+        input
+            .read_exact(&mut payload[..length])
+            .await
+            .map_err(|error| format!("Cannot read a {length}-byte request frame: {error}"))?;
+        output
+            .write_all(&payload[..length])
+            .await
+            .map_err(|error| format!("Cannot hand a request frame to the MCP server: {error}"))?;
+        output
+            .flush()
+            .await
+            .map_err(|error| format!("Cannot flush a request frame to the MCP server: {error}"))?;
     }
 }
 

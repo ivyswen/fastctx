@@ -31,6 +31,12 @@ const ACCEPT_RETRY: Duration = Duration::from_secs(1);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const SERVICE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Backstop for a closing proxy waiting on answers the control center already owes. A session that
+/// ends normally never reaches it: the control center closes the connection once it has answered.
+const RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long work in progress may keep running after its client stopped reading. Long enough for a
+/// finished handler to write its answer, short enough that nothing outlives the session by much.
+const INPUT_CLOSED_GRACE: Duration = Duration::from_millis(250);
 #[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 
@@ -530,14 +536,24 @@ async fn serve_connection(
     {
         return;
     }
-    let (reader, writer) = split(stream);
+    let (mut reader, writer) = split(stream);
+    // Requests arrive framed so the proxy can mark the end of input; the MCP server reads the
+    // plain stream that comes back out, and the sink closing is what it sees as EOF.
+    let (requests, mut request_sink) = tokio::io::simplex(protocol::MAX_REQUEST_FRAME_BYTES);
+    let mut unframe = tokio::spawn(async move {
+        if let Err(error) = protocol::receive_requests(&mut reader, &mut request_sink).await {
+            eprintln!("fastctx control center: {error}");
+        }
+        drop(request_sink);
+    });
     let service = match FastCtxServer::with_session_and_runtime(handshake.options, session, runtime)
-        .serve((reader, writer))
+        .serve((requests, writer))
         .await
     {
         Ok(service) => service,
         Err(error) => {
             eprintln!("fastctx control center: cannot start MCP connection: {error}");
+            unframe.abort();
             return;
         }
     };
@@ -546,12 +562,30 @@ async fn serve_connection(
     tokio::select! {
         _ = shutdown.cancelled() => {
             cancellation.cancel();
-            if tokio::time::timeout(SERVICE_SHUTDOWN_TIMEOUT, &mut waiting).await.is_err() {
-                waiting.abort();
-                let _ = waiting.await;
+            end_service(&mut waiting).await;
+        }
+        _ = &mut unframe => {
+            // The client is gone. Work that already finished still gets its answer written, but
+            // an MCP server left holding the transport would keep running a request nobody can
+            // read — the reason a closed stdin has to end foreground work rather than outlive it.
+            if tokio::time::timeout(INPUT_CLOSED_GRACE, &mut waiting).await.is_err() {
+                cancellation.cancel();
+                end_service(&mut waiting).await;
             }
         }
         _ = &mut waiting => {}
+    }
+    unframe.abort();
+}
+
+/// Waits out a cancelled MCP service, then stops waiting.
+async fn end_service<T>(waiting: &mut tokio::task::JoinHandle<T>) {
+    if tokio::time::timeout(SERVICE_SHUTDOWN_TIMEOUT, &mut *waiting)
+        .await
+        .is_err()
+    {
+        waiting.abort();
+        let _ = waiting.await;
     }
 }
 
@@ -620,6 +654,14 @@ async fn monitor_idle(
     }
 }
 
+/// Why a proxy session stopped pumping bytes.
+enum ProxyStop {
+    /// stdin reached EOF. No further request can arrive, but answers already owed are still due.
+    InputClosed,
+    /// The session ends now, with nothing left to deliver.
+    Immediate,
+}
+
 /// Pumps MCP bytes after the handshake. Any post-establishment failure exits without fallback.
 pub(crate) async fn forward_stdio(
     stream: BoxedStream,
@@ -630,8 +672,14 @@ pub(crate) async fn forward_stdio(
     let stdin_error = stdin.read_error_receiver();
     let (mut reader, mut writer) = split(stream);
     let mut stdout = tokio::io::stdout();
+    let forwarded = Arc::new(AtomicBool::new(false));
+    let upload_forwarded = Arc::clone(&forwarded);
     let mut upload = tokio::spawn(async move {
-        let result = tokio::io::copy(&mut { stdin }, &mut writer).await;
+        // The end-of-input frame, not the socket state, is what tells the control center that no
+        // further request is coming; closing the write direction only releases it where the
+        // transport supports that.
+        let result =
+            protocol::forward_requests(&mut { stdin }, &mut writer, &upload_forwarded).await;
         let shutdown = writer.shutdown().await;
         result.and(shutdown)
     });
@@ -646,16 +694,16 @@ pub(crate) async fn forward_stdio(
     let stdin_error_wait = wait_for_stdin_error(stdin_error.clone());
     tokio::pin!(stdin_error_wait);
 
-    let result = tokio::select! {
+    let stop = tokio::select! {
         biased;
         error = &mut stdin_error_wait => Err(error),
-        () = stdin_eof.cancelled() => Ok(()),
-        () = &mut parent_exit => Ok(()),
-        () = wait_for_termination_signal() => Ok(()),
+        () = stdin_eof.cancelled() => Ok(ProxyStop::InputClosed),
+        () = &mut parent_exit => Ok(ProxyStop::Immediate),
+        () = wait_for_termination_signal() => Ok(ProxyStop::Immediate),
         result = &mut upload => match stdin_error.borrow().clone() {
             Some(error) => Err(error),
             None => match result {
-                Ok(Ok(_)) => Ok(()),
+                Ok(Ok(_)) => Ok(ProxyStop::InputClosed),
                 Ok(Err(error)) => Err(format!("Cannot forward MCP stdin to the FastCtx control center: {error}")),
                 Err(error) => Err(format!("The FastCtx control-center input task failed: {error}")),
             }
@@ -669,6 +717,15 @@ pub(crate) async fn forward_stdio(
             Err(error) => Err(format!("The FastCtx control-center output task failed: {error}")),
         },
     };
+
+    let result = match stop {
+        Err(error) => Err(error),
+        Ok(ProxyStop::Immediate) => Ok(()),
+        // Nothing was ever asked, so nothing can be owed; waiting would only stall a client that
+        // opened the transport and changed its mind.
+        Ok(ProxyStop::InputClosed) if !forwarded.load(Ordering::Acquire) => Ok(()),
+        Ok(ProxyStop::InputClosed) => drain_owed_answers(&mut download, &mut parent_exit).await,
+    };
     upload.abort();
     download.abort();
     monitor_stop.store(true, Ordering::Release);
@@ -677,6 +734,33 @@ pub(crate) async fn forward_stdio(
     }
     result?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Delivers the answers the control center still owes once stdin has closed.
+///
+/// A stdio proxy that abandoned the connection at EOF would report success while silently
+/// discarding responses to requests it had already forwarded — `initialize | tools/list | close`
+/// came back empty. Unix half-closes the socket, so the control center sees the end of input and
+/// closes as soon as it is done; Windows named pipes have no half-close, so sessions that end this
+/// way wait out the bound instead. Codex ends MCP children by signal rather than by closing stdin,
+/// so only scripted clients and diagnostics ever pay it.
+async fn drain_owed_answers(
+    download: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    parent_exit: &mut (impl std::future::Future<Output = ()> + Unpin),
+) -> Result<(), String> {
+    tokio::select! {
+        biased;
+        () = parent_exit => Ok(()),
+        () = wait_for_termination_signal() => Ok(()),
+        drained = tokio::time::timeout(RESPONSE_DRAIN_TIMEOUT, download) => match drained {
+            // After EOF the control center closing the connection is the clean end of a session.
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(format!("The FastCtx control-center connection failed: {error}")),
+            Ok(Err(error)) => Err(format!("The FastCtx control-center output task failed: {error}")),
+            // A control center still busy with cancelled work does not hold a closing session open.
+            Err(_) => Ok(()),
+        },
+    }
 }
 
 type ParentExitFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
