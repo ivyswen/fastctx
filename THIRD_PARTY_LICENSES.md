@@ -9,6 +9,9 @@ The complete notices shipped by that release are preserved under
 Abseil, AGG, fast_float, FreeType, ICU, Little CMS, libjpeg-turbo, OpenJPEG,
 libpng, libtiff, LLVM libc, simdutf, and zlib.
 
-Rust dependency license metadata is available through `cargo metadata` and the
-corresponding crate packages. The project itself is available under the Apache
-License 2.0.
+Every Rust crate linked into the executable is listed in
+[`THIRD_PARTY_LICENSES_RUST.md`](./THIRD_PARTY_LICENSES_RUST.md) together with the
+full text of each license that applies. That inventory is generated from
+`Cargo.lock` and re-checked against it on every CI run.
+
+The project itself is available under the Apache License 2.0.

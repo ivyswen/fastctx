@@ -267,7 +267,14 @@ jobs:
         with:
           tool: cargo-about@0.9.0
       - run: cargo deny check
-      - run: mkdir -p target && cargo about generate --locked --format json --fail --output-file target/licenses.json
+      - run: cargo about generate --locked --fail about.hbs --output-file THIRD_PARTY_LICENSES_RUST.md
+      - name: Third-party license inventory is current
+        run: |
+          if ! git diff --quiet -- THIRD_PARTY_LICENSES_RUST.md; then
+            echo "::error::THIRD_PARTY_LICENSES_RUST.md no longer matches Cargo.lock. Regenerate it with 'cargo about generate --locked --fail about.hbs --output-file THIRD_PARTY_LICENSES_RUST.md' and commit the result."
+            git diff -- THIRD_PARTY_LICENSES_RUST.md
+            exit 1
+          fi
 
   msrv:
     name: Rust 1.88 minimum version

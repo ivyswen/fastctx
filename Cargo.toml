@@ -19,6 +19,7 @@ include = [
     "/LICENSE-APACHE",
     "/NOTICE",
     "/THIRD_PARTY_LICENSES.md",
+    "/THIRD_PARTY_LICENSES_RUST.md",
     "/third-party/**",
 ]
 

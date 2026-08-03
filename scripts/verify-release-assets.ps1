@@ -15,7 +15,15 @@ $archives = [ordered]@{
     "fastctx-aarch64-apple-darwin.tar.gz" = "fastctx"
 }
 $releaseFiles = @($archives.Keys) + @("SHA256SUMS")
-$licenseFiles = @("LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")
+# Declared independently of the staging scripts on purpose: sharing one source
+# would make this check confirm the packer against itself instead of against the
+# distribution contract.
+$licenseFiles = @(
+    "LICENSE-APACHE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.md",
+    "THIRD_PARTY_LICENSES_RUST.md"
+)
 $tarCommand = if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )) {

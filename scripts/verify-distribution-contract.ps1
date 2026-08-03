@@ -78,7 +78,12 @@ if ($privatePaths.Count -ne 0) {
     throw "Private design or agent files leaked into the public tree: $($privatePaths -join ', ')"
 }
 
-foreach ($name in @("LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")) {
+foreach ($name in @(
+    "LICENSE-APACHE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.md",
+    "THIRD_PARTY_LICENSES_RUST.md"
+)) {
     if (-not (Test-Path -LiteralPath (Join-Path $root $name) -PathType Leaf)) {
         throw "Missing release license file: $name"
     }

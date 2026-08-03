@@ -30,7 +30,12 @@ $mapping = @{
         Format = "tar.gz"
     }
 }
-$licenseFiles = @("LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")
+$licenseFiles = @(
+    "LICENSE-APACHE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.md",
+    "THIRD_PARTY_LICENSES_RUST.md"
+)
 $tarCommand = if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )) {
