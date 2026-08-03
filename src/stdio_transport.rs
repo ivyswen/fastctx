@@ -73,14 +73,67 @@ impl DetachedStdin {
     }
 }
 
+use std::io::{BufRead, BufReader, Write};
+
 fn forward_reader(
-    mut input: impl Read,
+    input: impl Read,
     sender: mpsc::Sender<std::io::Result<Vec<u8>>>,
     read_error_sender: watch::Sender<Option<String>>,
 ) {
+    let mut reader = BufReader::new(input);
+    let mut line_buf = String::new();
+
+    loop {
+        line_buf.clear();
+        match reader.read_line(&mut line_buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line_buf.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    if let Some(obj) = value.as_object() {
+                        if let Some(method) = obj.get("method").and_then(|m| m.as_str()) {
+                            if method == "initialize" {
+                                if sender.blocking_send(Ok(line_buf.as_bytes().to_vec())).is_err() {
+                                    return;
+                                }
+                                break;
+                            } else {
+                                if let Some(req_id) = obj.get("id") {
+                                    let err_resp = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": req_id,
+                                        "error": {
+                                            "code": -32601,
+                                            "message": format!("Method '{method}' not supported before initialize")
+                                        }
+                                    });
+                                    let mut stdout = std::io::stdout().lock();
+                                    let _ = writeln!(stdout, "{err_resp}");
+                                    let _ = stdout.flush();
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if sender.blocking_send(Ok(line_buf.as_bytes().to_vec())).is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                read_error_sender.send_replace(Some(format!("Cannot read MCP stdin: {error}")));
+                let _ = sender.blocking_send(Err(error));
+                return;
+            }
+        }
+    }
+
     loop {
         let mut bytes = vec![0; STDIN_CHUNK_BYTES];
-        match input.read(&mut bytes) {
+        match reader.read(&mut bytes) {
             Ok(0) => break,
             Ok(read) => {
                 bytes.truncate(read);
