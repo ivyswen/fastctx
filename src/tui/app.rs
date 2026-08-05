@@ -14,6 +14,7 @@ use crate::control::doctor::{self, DoctorReport};
 use crate::control::guard_i18n::{self, GuardMessages};
 use crate::control::i18n::{ALL_LANGUAGES, Language, Messages};
 use crate::control::job_i18n::{self, JobMessages};
+use crate::control::link::{self, LinkState};
 use crate::control::paths::ControlPaths;
 use crate::control::provider::{self, CompactionSupport, EffectiveOutput};
 use crate::control::settings::{self, FastCtxSettings};
@@ -196,6 +197,7 @@ pub(crate) struct App {
     pub(crate) detail_viewport: DetailViewport,
     pub pending_job: Option<JobSummary>,
     pub running_job_count: Option<usize>,
+    pub(crate) link_state: LinkState,
     pub status: StatusState,
     pub receipt: Option<OperationReceipt>,
     pub error: Option<String>,
@@ -233,6 +235,7 @@ impl App {
         let running_job_count = jobs::running_summaries(&paths)
             .ok()
             .map(|running| running.len());
+        let link_state = link::link_state(&paths, settings.applied.as_ref());
         let language = settings
             .language
             .as_deref()
@@ -336,6 +339,7 @@ impl App {
             detail_viewport: DetailViewport::default(),
             pending_job: None,
             running_job_count,
+            link_state,
             paths,
             settings,
             provider_detection,
@@ -1587,6 +1591,9 @@ impl App {
     }
 
     fn show_receipt(&mut self, receipt: OperationReceipt) {
+        // Apply and Unapply both reach this after refreshing the receipt, so it is the single
+        // place the menu's connection state has to be recomputed.
+        self.link_state = link::link_state(&self.paths, self.settings.applied.as_ref());
         self.receipt = Some(receipt);
         self.screen = Screen::Receipt;
         self.selected = 0;

@@ -15,7 +15,7 @@ npm install --global fastctx
 fastctx
 ```
 
-The `fastctx` command opens the control terminal. Review the proposed changes, select **Apply**, then start a new ChatGPT / Codex session.
+The `fastctx` command opens the control terminal. Review the proposed changes, select **Connect to Codex**, then start a new ChatGPT / Codex session.
 
 FastCtx currently provides first-class setup for ChatGPT App and Codex CLI. Any MCP client can also register `fastctx serve` directly.
 
@@ -56,17 +56,17 @@ The first launch opens the full-screen control terminal. The interface supports 
 4. Set current-user background-job storage, concurrency, and AI list page limits;
 5. Inspect every currently running job across FastCtx sessions, follow its output, and stop it on the **Jobs** screen;
 6. Reset all user preferences to factory defaults through a confirmation screen;
-7. Review every host configuration change on the Apply screen, apply it, and restart the ChatGPT / Codex session.
+7. Review every host configuration change on the Connect to Codex screen, confirm it, and restart the ChatGPT / Codex session.
 
-Apply copies the current binary to `~/.fastctx/bin/` and points the host configuration at that stable path. The applied setup keeps working after npm cache cleanup or upgrades.
+Connecting copies the current binary to `~/.fastctx/bin/` and points the host configuration at that stable path. The connected setup keeps working after npm cache cleanup or upgrades.
 
 On launch, FastCtx checks its launch channel for updates before the main menu opens. A brief checking screen appears and the wait is strictly bounded: if the check cannot finish — offline, timeout, rate limiting — FastCtx enters silently, and the dedicated **Update** screen still offers a manual check at any time. When a newer version is installable, the update screen opens directly and asks whether to **Update & restart** or **Continue** into the current version. Successful results are cached for 24 hours in machine-private storage outside `~/.fastctx`, so most launches skip the network entirely. npm launches query the exact launcher package through a fresh isolated cache with `--prefer-online`; direct GitHub Release executables read the stable tag from GitHub's `releases/latest` web redirect.
 
-If GitHub has published a release but npm has not exposed the matching version yet, FastCtx shows a propagation screen instead of trusting stale metadata. **Retry** always uses another isolated cache; it never clears or mutates the user's normal npm cache. Transient network or rate-limit failures stay quiet and are recorded under **Status**; malformed publication metadata produces one warning. Status also offers a manual check that bypasses the 24-hour TTL. An accepted npm update installs the exact version with lifecycle scripts disabled. A GitHub Release update downloads this repository's platform archive and aggregate `SHA256SUMS`, verifies the archive before safely extracting the binary, probes the downloaded version, replaces the executable atomically, and rolls back when restart health fails. A failed npm update restores the exact previous package version; every failed update reopens the previous TUI with a warning. After a successful restart, an owned `~/.fastctx/bin/` Apply copy is synchronized; externally changed copies are left untouched. Restart Codex after an update so existing sessions and their build-isolated control center are replaced by the new build.
+If GitHub has published a release but npm has not exposed the matching version yet, FastCtx shows a propagation screen instead of trusting stale metadata. **Retry** always uses another isolated cache; it never clears or mutates the user's normal npm cache. Transient network or rate-limit failures stay quiet and are recorded under **Status**; malformed publication metadata produces one warning. Status also offers a manual check that bypasses the 24-hour TTL. An accepted npm update installs the exact version with lifecycle scripts disabled. A GitHub Release update downloads this repository's platform archive and aggregate `SHA256SUMS`, verifies the archive before safely extracting the binary, probes the downloaded version, replaces the executable atomically, and rolls back when restart health fails. A failed npm update restores the exact previous package version; every failed update reopens the previous TUI with a warning. After a successful restart, the owned `~/.fastctx/bin/` copy is synchronized; externally changed copies are left untouched. Restart Codex after an update so existing sessions and their build-isolated control center are replaced by the new build.
 
 `cargo install` builds and the internal `~/.fastctx/bin/` runtime are not self-updated. Set `FASTCTX_DISABLE_UPDATE_CHECK=1` to disable the TUI startup check.
 
-**Unapply** stops FastCtx process images running from the managed bin directory, removes the configuration managed by FastCtx, and deletes its managed data. Shared settings changed by the user after Apply are preserved.
+**Removal** stops FastCtx process images running from the managed bin directory, removes the configuration managed by FastCtx, and deletes its managed data. Shared settings changed by the user after connecting are preserved.
 
 ### If the install returns 404
 
@@ -92,7 +92,7 @@ After installation, the **Update** screen probes the npm registry configured on 
 npx fastctx
 ```
 
-`npx` opens the same control terminal without a global installation. Apply still copies the binary to `~/.fastctx/bin/`, so the applied setup keeps working after the npx cache is cleaned; only the `fastctx` command itself requires the global installation.
+`npx` opens the same control terminal without a global installation. Connecting still copies the binary to `~/.fastctx/bin/`, so the connected setup keeps working after the npx cache is cleaned; only the `fastctx` command itself requires the global installation.
 
 ### Non-interactive use
 
@@ -115,7 +115,7 @@ fastctx unapply --yes
 
 ### Tool limits and settings reset
 
-grep/glob uses automatic parallelism by default: the operating system's available parallelism, capped at 16. In **Config → Search**, choose a preset with ←/→ or press Enter and type `auto` or any integer in the displayed `1..=maximum` range. The setting is loaded when the shared control center starts, takes effect after that control center restarts, and does not require Apply.
+grep/glob uses automatic parallelism by default: the operating system's available parallelism, capped at 16. In **Config → Search**, choose a preset with ←/→ or press Enter and type `auto` or any integer in the displayed `1..=maximum` range. The setting is loaded when the shared control center starts, takes effect after that control center restarts, and does not require reconnecting.
 
 The same setting can be written manually in `~/.fastctx/config.toml`:
 
@@ -126,7 +126,7 @@ max_cpu_cores = 4
 
 Omitting the key keeps the previous automatic behavior. Invalid types, empty values, zero, negative numbers, and values above the engine's displayed ceiling prevent a session from starting and produce a diagnostic without rewriting the file. The limit sets one request's effective search parallelism to its base lane plus shared extra workers, at most N. Across every session in the per-user control center, concurrent requests retain independent base lanes but share one pool of at most N−1 extra lanes, so the upper bound for R concurrent requests is R+N−1. This is not CPU affinity or a strict system-wide governor.
 
-replace accepts files and replacement results up to 256 MiB by default. In **Config → Editing**, choose a coarse 64 MiB–4 GiB preset with ←/→. Saving takes effect on the next replace request, including requests from an already-open Codex session, and does not require Apply. Larger limits allow replace to use more memory; values set too high may cause an out-of-memory failure.
+replace accepts files and replacement results up to 256 MiB by default. In **Config → Editing**, choose a coarse 64 MiB–4 GiB preset with ←/→. Saving takes effect on the next replace request, including requests from an already-open Codex session, and does not require reconnecting. Larger limits allow replace to use more memory; values set too high may cause an out-of-memory failure.
 
 The same limit can be written manually; 64 MiB is the minimum and 4096 MiB is the maximum:
 
@@ -135,7 +135,7 @@ The same limit can be written manually; 64 MiB is the minimum and 4096 MiB is th
 max_file_size_mib = 512
 ```
 
-**Config → Reset → Reset all settings** opens with **No** selected. Confirming restores every user preference, including language, output budgets, Bash/job limits, search CPU limit, replace file limit, and update settings. It preserves the Apply ownership receipt, installed binary, host configuration, and running jobs. Restoring the default 1024 MiB job-history quota may immediately evict the oldest finished records above that quota.
+**Config → Reset → Reset all settings** opens with **No** selected. Confirming restores every user preference, including language, output budgets, Bash/job limits, search CPU limit, replace file limit, and update settings. It preserves the connection receipt, installed binary, host configuration, and running jobs. Restoring the default 1024 MiB job-history quota may immediately evict the oldest finished records above that quota.
 
 ### Other distribution channels
 
@@ -353,7 +353,7 @@ While one MCP session has jobs that it started or queried, every successful text
 
 `job_list` defaults to `status="running"`. Use `status="finished"` to inspect retained exited or interrupted records, and `status="all"` only when both lifecycles are needed. Results are newest first within each lifecycle. `offset` continues a page; `limit` overrides the saved page size for one call.
 
-Finished records have no time-to-live. FastCtx retains them until the current user's `fastshell.job_storage_limit_mib` limit requires eviction of the oldest finished records. The default is 1024 MiB. Running jobs and their records are never evicted; `fastshell.max_running_jobs` limits concurrent jobs across all FastCtx sessions for that user and defaults to 128. `fastshell.job_list_limit` is the default page size (20, valid range 1–100). All three settings take effect immediately when saved and do not require Apply; the TUI presets for page size are 10 / 20 / 50 / 100.
+Finished records have no time-to-live. FastCtx retains them until the current user's `fastshell.job_storage_limit_mib` limit requires eviction of the oldest finished records. The default is 1024 MiB. Running jobs and their records are never evicted; `fastshell.max_running_jobs` limits concurrent jobs across all FastCtx sessions for that user and defaults to 128. `fastshell.job_list_limit` is the default page size (20, valid range 1–100). All three settings take effect immediately when saved and do not require reconnecting; the TUI presets for page size are 10 / 20 / 50 / 100.
 
 The TUI **Jobs** dashboard scans this same current-user registry but shows only jobs that are currently running, aggregated from every FastCtx session and TUI instance. A finished job disappears with a short notice that its retained output remains available to the agent through `job_output`. Jobs are grouped by a source tag with workspace and runtime-process context. Fixed list columns keep relative age and job ids aligned, while long ASCII or CJK commands end with an ellipsis at one shared edge. The detail panel shows the exact UTC start time to the second and a live `HH:MM:SS` elapsed time. Horizontal and vertical output navigation remains available; one width-aware footer row keeps the essential keys visible and adds `←/→ output`, `PgUp/PgDn scroll`, and `F follow` when space permits. ChatGPT / Codex does not expose conversation titles or ids to the MCP server, so FastCtx does not invent one.
 
@@ -388,14 +388,14 @@ default_tools_approval_mode = "writes"
 FastCtx uses or manages these paths and settings:
 
 - `~/.fastctx/bin/fastctx(.exe)`: the stable self-installed binary;
-- `~/.fastctx/config.toml`: control terminal settings and the Apply receipt;
+- `~/.fastctx/config.toml`: control terminal settings and the connection receipt;
 - `~/.fastctx/jobs/`: persistent background-job records and current-format full output logs, created on demand by `run_background`;
 - `[mcp_servers.fastctx]` in `~/.codex/config.toml`, including `tool_timeout_sec = 300`;
 - the `mcp__fastctx` entry in `direct_only_tool_namespaces`;
 - the marker-delimited FastCtx block in `~/.codex/AGENTS.md`;
 - the selected `tool_output_token_limit` value after user confirmation.
 
-FastCtx edits existing TOML with `toml_edit`, preserving comments, formatting, and unrelated configuration. Unapply removes entries according to write ownership and preserves later user changes. It stops running background jobs before removing `~/.fastctx/`.
+FastCtx edits existing TOML with `toml_edit`, preserving comments, formatting, and unrelated configuration. Removal removes entries according to write ownership and preserves later user changes. It stops running background jobs before removing `~/.fastctx/`.
 
 ## License
 

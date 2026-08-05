@@ -10,6 +10,7 @@ use super::theme;
 use crate::control::apply::{PreviewAction, PreviewItem, PreviewTarget};
 use crate::control::doctor::DoctorCheckStatus;
 use crate::control::i18n::ALL_LANGUAGES;
+use crate::control::link::LinkState;
 use crate::control::settings::{
     MAX_REPLACE_FILE_LIMIT_MIB, MIN_REPLACE_FILE_LIMIT_MIB, Tier, ToolBudgetLevel,
 };
@@ -602,18 +603,22 @@ fn render_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         chunks[0],
         &mut state,
     );
-    let mut details = vec![
-        Line::styled(
-            labels[app.selected],
-            Style::default()
-                .fg(theme::accent())
-                .add_modifier(Modifier::BOLD),
-        ),
+    // The panel reports the connection rather than echoing the highlighted entry: the cursor
+    // already names that, and the one thing the menu cannot otherwise show is whether FastCtx is
+    // still connected to the host with the guidance this build writes.
+    let mut details = vec![link_status_line(app)];
+    if app.link_state == LinkState::Stale {
+        details.push(Line::styled(
+            messages.link_state_stale_hint,
+            Style::default().fg(theme::muted()),
+        ));
+    }
+    details.extend([
         Line::raw(""),
         detail_line("FastCtx", &format!("v{}", env!("CARGO_PKG_VERSION"))),
         detail_line(messages.tier_label, app.settings.tier.display_name()),
         detail_line(messages.menu_language, app.language.native_name()),
-    ];
+    ]);
     if app.selected == 2 {
         let count = app
             .running_job_count
@@ -631,12 +636,35 @@ fn render_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             &update_state_summary(app),
         ));
     }
+    // Users have read the control terminal as the service itself and kept it open; this is the
+    // only place that says otherwise.
+    details.push(Line::raw(""));
+    details.push(Line::styled(
+        messages.terminal_role_note,
+        Style::default().fg(theme::muted()),
+    ));
     frame.render_widget(
         Paragraph::new(details)
             .block(panel(messages.app_title))
             .wrap(Wrap { trim: false }),
         chunks[1],
     );
+}
+
+/// One line naming the connection to the host, shared by the main menu and the connect page so
+/// the two can never disagree about what "connected" means. The symbol carries the state on its
+/// own because monochrome terminals have no colour to read (R-22).
+fn link_status_line(app: &App) -> Line<'static> {
+    let messages = app.messages();
+    let (symbol, text, colour) = match app.link_state {
+        LinkState::Absent => ("○", messages.link_state_absent, theme::accent()),
+        LinkState::Current => ("✓", messages.link_state_current, theme::success()),
+        LinkState::Stale => ("!", messages.link_state_stale, theme::warning()),
+    };
+    Line::styled(
+        format!("{symbol} {text}"),
+        Style::default().fg(colour).add_modifier(Modifier::BOLD),
+    )
 }
 
 fn detail_line(label: &str, value: &str) -> Line<'static> {
@@ -685,7 +713,6 @@ fn tier_color(tier: Tier) -> Color {
 
 fn render_apply_home(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let messages = app.messages();
-    let applied = app.settings.applied.is_some();
     let items = vec![
         ListItem::new(format!(" {}", messages.action_apply)),
         ListItem::new(format!(" {}", messages.action_unapply)),
@@ -707,20 +734,7 @@ fn render_apply_home(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(vec![
-            Line::styled(
-                if applied {
-                    "✓ FastCtx"
-                } else {
-                    "○ FastCtx"
-                },
-                Style::default()
-                    .fg(if applied {
-                        theme::success()
-                    } else {
-                        theme::warning()
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
+            link_status_line(app),
             Line::raw(""),
             Line::from(vec![
                 Span::styled(
@@ -3059,6 +3073,20 @@ fn render_narrow(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .fg(theme::fg())
             .add_modifier(Modifier::BOLD),
     ));
+    // A terminal too small for the panel still has to show whether the host is connected; the
+    // symbol keeps it readable after the text is truncated.
+    if matches!(app.screen, Screen::Main | Screen::ApplyHome) {
+        let status = link_status_line(app);
+        let text = status
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        lines.push(Line::styled(
+            truncate_end(&text, usize::from(area.width.saturating_sub(4))),
+            status.style,
+        ));
+    }
     if app.screen == Screen::Update {
         let detail = match &app.update_state {
             StartupUpdate::Available(plan) => format!(
@@ -3539,6 +3567,7 @@ mod tests {
     use crate::control::apply::OperationReceipt;
     use crate::control::doctor::{DoctorCheck, DoctorCheckStatus, DoctorReport};
     use crate::control::i18n::{ALL_LANGUAGES, Language};
+    use crate::control::link::LinkState;
     use crate::control::paths::ControlPaths;
     use crate::search_parallelism::SearchParallelismInputError;
     use crate::shell::jobs::{JobSourceSummary, JobSummary, JobSummaryStatus};
@@ -4949,6 +4978,64 @@ mod tests {
         }
     }
 
+    /// Upgrades replace the binary but never rewrite the host's AGENTS.md, so a stale install and
+    /// a current one are indistinguishable unless the menu says so. These three lines are the
+    /// whole remedy: the state, what to do about it, and the fact that closing this terminal does
+    /// not stop anything.
+    #[test]
+    fn the_main_menu_reports_the_connection_state_and_that_it_can_be_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ControlPaths::for_home(temp.path());
+        let executable = temp.path().join("source");
+        std::fs::write(&executable, b"binary").unwrap();
+        let mut app = App::for_test(paths, executable);
+        app.screen = Screen::Main;
+        let messages = app.messages();
+        let role_prefix = messages
+            .terminal_role_note
+            .chars()
+            .take(20)
+            .collect::<String>();
+        let hint_prefix = messages
+            .link_state_stale_hint
+            .chars()
+            .take(20)
+            .collect::<String>();
+
+        for (state, expected) in [
+            (LinkState::Absent, messages.link_state_absent),
+            (LinkState::Current, messages.link_state_current),
+            (LinkState::Stale, messages.link_state_stale),
+        ] {
+            app.link_state = state;
+            // The compact layout drops the panel, so the state has to survive there too.
+            for (width, height) in [(100, 30), (40, 10)] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|frame| render(frame, &mut app)).unwrap();
+                let text = buffer_text(&terminal);
+                assert!(
+                    contains_visible_text(&text, expected),
+                    "{state:?} missing {expected} at {width}x{height}\n{text}"
+                );
+            }
+
+            let backend = TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                contains_visible_text(&text, &role_prefix),
+                "{state:?} must keep the terminal-role note\n{text}"
+            );
+            assert_eq!(
+                contains_visible_text(&text, &hint_prefix),
+                state == LinkState::Stale,
+                "{state:?} shows the reconnect hint only when the block is stale\n{text}"
+            );
+        }
+    }
+
     #[test]
     fn reset_confirmation_keeps_default_no_and_recovery_text_visible_in_all_languages() {
         let temp = tempfile::tempdir().unwrap();
@@ -4968,7 +5055,9 @@ mod tests {
                 let mut terminal = Terminal::new(backend).unwrap();
                 terminal.draw(|frame| render(frame, &mut app)).unwrap();
                 let text = buffer_text(&terminal);
-                for expected in [messages.reset_confirm, "Apply", "jobs", "✕", "✓"] {
+                // What the reset keeps is now named in each language's own words, so `jobs` is
+                // the only literal left that every translation still shares.
+                for expected in [messages.reset_confirm, "jobs", "✕", "✓"] {
                     assert!(
                         contains_visible_text(&text, expected),
                         "{} missing {expected} at {width}x{height}\n{text}",

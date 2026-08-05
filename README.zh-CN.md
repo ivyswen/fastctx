@@ -13,7 +13,7 @@ npm install --global fastctx
 fastctx
 ```
 
-`fastctx` 命令会打开控制终端。检查变更后选择 **Apply**，再启动新的 ChatGPT / Codex 会话即可使用。
+`fastctx` 命令会打开控制终端。检查变更后选择 **接入 Codex**，再启动新的 ChatGPT / Codex 会话即可使用。
 
 当前优先支持 ChatGPT App 与 Codex CLI。任何 MCP client 也可以直接注册 `fastctx serve`。
 
@@ -54,17 +54,17 @@ fastctx
 4. 设置当前用户的后台任务存储、并发上限与 AI 列表分页条数；
 5. 在 **Jobs** 页面汇总查看所有 FastCtx 会话中正在运行的任务、跟随输出，并按需终止；
 6. 经过确认后把全部用户偏好恢复到出厂默认；
-7. 在 Apply 页面检查宿主配置变更，确认应用并重启 ChatGPT / Codex 会话。
+7. 在接入页面检查宿主配置变更，确认接入并重启 ChatGPT / Codex 会话。
 
-Apply 会把当前二进制复制到 `~/.fastctx/bin/`，并让宿主配置指向这个稳定路径。清理或升级 npm 缓存后，已经应用的配置仍然有效。
+接入会把当前二进制复制到 `~/.fastctx/bin/`，并让宿主配置指向这个稳定路径。清理或升级 npm 缓存后，已经接入的配置仍然有效。
 
 启动时，FastCtx 会先按本次启动来源检查更新，然后才进入主菜单。检查期间显示一个简短的检查画面，等待时间有严格上限：若检查无法完成——离线、超时、限流——FastCtx 会静默进入，独立的 **更新** 界面随时提供手动检查。检测到可安装的新版本时，会直接打开更新界面询问：**更新并重启**，或 **继续使用** 当前版本。成功结果会在 `~/.fastctx` 之外的机器级私有存储中缓存 24 小时，因此多数启动完全不触网。npm 启动会针对实际 launcher 包，使用全新的独立缓存和 `--prefer-online` 查询；直接下载的 GitHub Release 程序会从 GitHub 的 `releases/latest` 网页重定向读取稳定 tag。
 
-如果 GitHub 已发布新版本、但 npm 暂时还没有显示对应版本，FastCtx 会明确进入“等待 npm 同步”界面，而不是相信陈旧结果。每次 **重试** 都会再建一个独立缓存，不清理、也不修改用户原有 npm 缓存。网络、限流等瞬态失败保持安静，并记录在 **状态** 页面；发布元数据结构异常只警告一次。状态页面也提供绕过 24 小时缓存的手动检查。确认 npm 更新后只安装精确版本，并禁用生命周期脚本。GitHub Release 更新会下载本仓库对应平台的归档与汇总 `SHA256SUMS`，先校验归档，再安全解出二进制、执行版本探测并原子替换；重启健康检查失败会回滚。npm 更新失败会精确恢复先前包版本；任何更新事务失败都会重新打开旧版 TUI 并显示警告。更新成功后，由 FastCtx 拥有的 `~/.fastctx/bin/` Apply 副本会同步更新，外部改写过的副本保持不动。
+如果 GitHub 已发布新版本、但 npm 暂时还没有显示对应版本，FastCtx 会明确进入“等待 npm 同步”界面，而不是相信陈旧结果。每次 **重试** 都会再建一个独立缓存，不清理、也不修改用户原有 npm 缓存。网络、限流等瞬态失败保持安静，并记录在 **状态** 页面；发布元数据结构异常只警告一次。状态页面也提供绕过 24 小时缓存的手动检查。确认 npm 更新后只安装精确版本，并禁用生命周期脚本。GitHub Release 更新会下载本仓库对应平台的归档与汇总 `SHA256SUMS`，先校验归档，再安全解出二进制、执行版本探测并原子替换；重启健康检查失败会回滚。npm 更新失败会精确恢复先前包版本；任何更新事务失败都会重新打开旧版 TUI 并显示警告。更新成功后，由 FastCtx 拥有的 `~/.fastctx/bin/` 副本会同步更新，外部改写过的副本保持不动。
 
 `cargo install` 构建和内部 `~/.fastctx/bin/` runtime 不会自行更新。可设置 `FASTCTX_DISABLE_UPDATE_CHECK=1` 关闭 TUI 启动检查。
 
-**Unapply** 会终止从受管 bin 目录运行的 FastCtx 进程镜像，撤销 FastCtx 管理的配置并删除受管数据。用户在 Apply 之后修改的共享设置会保留。
+**移除** 会终止从受管 bin 目录运行的 FastCtx 进程镜像，撤销 FastCtx 管理的配置并删除受管数据。用户在接入之后修改的共享设置会保留。
 
 ### 安装遇到 404
 
@@ -90,7 +90,7 @@ npm config set registry https://registry.npmjs.org/ --location=user
 npx fastctx
 ```
 
-`npx` 无需全局安装即可打开同一个控制终端。Apply 仍会把二进制复制到 `~/.fastctx/bin/`，npx 缓存被清理后已应用的配置依旧有效；只有 `fastctx` 命令本身需要全局安装。
+`npx` 无需全局安装即可打开同一个控制终端。接入仍会把二进制复制到 `~/.fastctx/bin/`，npx 缓存被清理后已接入的配置依旧有效；只有 `fastctx` 命令本身需要全局安装。
 
 ### 非交互使用
 
@@ -113,7 +113,7 @@ fastctx unapply --yes
 
 ### 工具上限与设置重置
 
-grep/glob 默认使用自动并行度：操作系统报告的可用并行度，最高 16。在 **配置 → 搜索** 中，可用 ←/→ 选择预设，也可按 Enter 输入 `auto` 或界面显示的 `1..=最大值` 范围内任意整数。该设置在共享控制中心启动时读取；控制中心重启后生效，不需要 Apply。
+grep/glob 默认使用自动并行度：操作系统报告的可用并行度，最高 16。在 **配置 → 搜索** 中，可用 ←/→ 选择预设，也可按 Enter 输入 `auto` 或界面显示的 `1..=最大值` 范围内任意整数。该设置在共享控制中心启动时读取；控制中心重启后生效，不需要重新接入。
 
 也可以在 `~/.fastctx/config.toml` 中手工写入同一设置：
 
@@ -124,7 +124,7 @@ max_cpu_cores = 4
 
 省略该键时完全保留原有自动行为。类型错误、空值、零、负数和超过引擎显示上界的值都会阻止 `serve` 启动，并给出诊断；FastCtx 不会改写源文件。这个数字约束的是单个搜索请求的有效并行度：该请求的 base lane 与共享额外 worker 合计不超过 N。并发请求仍各自保留 base lane，因此它不是 CPU affinity，也不是严格的进程级或整机级 governor。
 
-replace 默认允许最大 256 MiB 的输入文件和替换结果。在 **配置 → 编辑** 中，可用 ←/→ 选择 64 MiB 至 4 GiB 的粗档位。保存后，下一个 replace 请求就会使用新值，已经打开的 Codex 会话也一样；不需要 Apply。上限越高，replace 可使用的内存越多；设置过高可能导致内存不足。
+replace 默认允许最大 256 MiB 的输入文件和替换结果。在 **配置 → 编辑** 中，可用 ←/→ 选择 64 MiB 至 4 GiB 的粗档位。保存后，下一个 replace 请求就会使用新值，已经打开的 Codex 会话也一样；不需要重新接入。上限越高，replace 可使用的内存越多；设置过高可能导致内存不足。
 
 也可以手工设置；最小值为 64 MiB，最大值为 4096 MiB：
 
@@ -133,7 +133,7 @@ replace 默认允许最大 256 MiB 的输入文件和替换结果。在 **配置
 max_file_size_mib = 512
 ```
 
-**配置 → 重置 → 重置全部设置** 的确认页默认选中 **No**。确认后，语言、输出预算、Bash/job 限制、搜索 CPU 上限、replace 文件上限和更新设置等全部用户偏好都会恢复默认；Apply 所有权回执、已安装二进制、宿主配置与运行中的 job 保留不动。恢复默认 1024 MiB 历史留存配额时，超出配额的最旧 finished 记录可能立即被正常回收。
+**配置 → 重置 → 重置全部设置** 的确认页默认选中 **No**。确认后，语言、输出预算、Bash/job 限制、搜索 CPU 上限、replace 文件上限和更新设置等全部用户偏好都会恢复默认；接入回执、已安装二进制、宿主配置与运行中的 job 保留不动。恢复默认 1024 MiB 历史留存配额时，超出配额的最旧 finished 记录可能立即被正常回收。
 
 ### 其他分发方式
 
@@ -347,7 +347,7 @@ V:/repo/Cargo.toml
 
 `job_list` 默认使用 `status="running"`，只返回运行中的任务。显式传 `status="finished"` 可查看保留的已退出或已中断记录；确实需要两种生命周期时才用 `status="all"`。每种生命周期内按时间从新到旧排序；`offset` 用于续页，`limit` 只覆盖本次调用的已保存页大小。
 
-终态记录没有 TTL。只有当前用户的 `fastshell.job_storage_limit_mib` 超限时，FastCtx 才会从最旧终态记录开始回收；默认上限为 1024 MiB。运行中的任务及其记录永不被回收。`fastshell.max_running_jobs` 限制该用户全部 FastCtx 会话合计的并发后台任务数，默认 128。`fastshell.job_list_limit` 是默认每页数量，默认 20、有效范围 1–100，TUI 预设为 10 / 20 / 50 / 100。三项设置保存后都立即生效，无需 Apply。
+终态记录没有 TTL。只有当前用户的 `fastshell.job_storage_limit_mib` 超限时，FastCtx 才会从最旧终态记录开始回收；默认上限为 1024 MiB。运行中的任务及其记录永不被回收。`fastshell.max_running_jobs` 限制该用户全部 FastCtx 会话合计的并发后台任务数，默认 128。`fastshell.job_list_limit` 是默认每页数量，默认 20、有效范围 1–100，TUI 预设为 10 / 20 / 50 / 100。三项设置保存后都立即生效，无需重新接入。
 
 TUI 的 **Jobs** dashboard 直接扫描同一份当前用户 registry，但只显示当前仍在运行的任务，并汇总所有 FastCtx server 与 TUI 实例。任务结束后会从列表消失，同时短暂提示其保留输出仍可由智能体通过 `job_output` 读取。界面按真实来源会话标签分组，并显示 workspace、server PID 与父进程信息；列表用固定列对齐相对时间和 job id，过长的 ASCII/CJK 命令会在同一右边界显示省略号。右侧详情显示精确到秒的 UTC 开始时间和实时 `HH:MM:SS` 已运行时长。输出仍支持水平和纵向移动；页脚固定为一行，优先保留关键按键，并在宽度允许时补充 `←/→ 输出`、`PgUp/PgDn 滚动` 与 `F 跟随`。ChatGPT / Codex 没有向 MCP server 暴露对话标题或 id，因此 FastCtx 不会伪造一个对话名。
 
@@ -382,14 +382,14 @@ default_tools_approval_mode = "writes"
 FastCtx 使用或管理以下内容：
 
 - `~/.fastctx/bin/fastctx(.exe)`：稳定的自安装二进制；
-- `~/.fastctx/config.toml`：控制终端配置与 Apply 回执；
+- `~/.fastctx/config.toml`：控制终端配置与接入回执；
 - `~/.fastctx/jobs/`：由 `run_background` 按需创建的持久后台任务记录与当前格式完整输出日志；
 - `~/.codex/config.toml` 中的 `[mcp_servers.fastctx]`，其中包括 `tool_timeout_sec = 300`；
 - `direct_only_tool_namespaces` 中的 `mcp__fastctx` 元素；
 - `~/.codex/AGENTS.md` 中带边界标记的 FastCtx 段；
 - 用户确认后的 `tool_output_token_limit` 档位值。
 
-FastCtx 使用 `toml_edit` 修改已有 TOML，保留注释、格式和其他配置。Unapply 按写入所有权逐项撤销，用户后续改动会保留；删除 `~/.fastctx/` 前会先终止所有运行中的后台任务。
+FastCtx 使用 `toml_edit` 修改已有 TOML，保留注释、格式和其他配置。移除按写入所有权逐项撤销，用户后续改动会保留；删除 `~/.fastctx/` 前会先终止所有运行中的后台任务。
 
 ## License
 
