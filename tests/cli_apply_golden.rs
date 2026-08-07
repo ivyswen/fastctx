@@ -64,31 +64,7 @@ fn micro_edit_golden_preserves_every_unowned_byte_and_writes_the_exact_private_s
 #[test]
 fn agents_golden_appends_the_exact_contract_after_one_blank_line() {
     let original = "# User rules\n\nKeep exact.\n";
-    let expected = concat!(
-        "# User rules\n",
-        "\n",
-        "Keep exact.\n",
-        "\n",
-        "<!-- fastctx:begin -->\n",
-        "## Local file inspection\n",
-        "\n",
-        "For reading, searching, and finding local files, prefer the FastCtx MCP\n",
-        "tools — `mcp__fastctx__read`, `mcp__fastctx__grep`, `mcp__fastctx__glob` —\n",
-        "over `cat`/`Get-Content`, `rg`/`findstr`/`Select-String`, and `dir`/`ls -R`.\n",
-        "Read only what the task needs. When you need several files, pass them to\n",
-        "one read call as files=[{\"path\": ...}, ...] instead of one call per file.\n",
-        "Pass absolute paths. The last line of every result says `Complete` or\n",
-        "`Partial` — continue only with the exact parameters a `Partial` note\n",
-        "provides.\n",
-        "\n",
-        "### Batch replacement\n",
-        "\n",
-        "Use `mcp__fastctx__replace` for mechanical find-and-replace across files.\n",
-        "It preserves each file's encoding and line endings, supports dry-run previews,\n",
-        "and rejects concurrent changes before writing. Use apply_patch for generated\n",
-        "content, semantic rewrites, or small local edits.\n",
-        "<!-- fastctx:end -->\n",
-    );
+    let expected = format!("{original}\n{}\n", agents::section(false));
     assert_eq!(
         agents::apply_section(original.as_bytes()).unwrap(),
         expected.as_bytes()

@@ -743,9 +743,10 @@ fn build_glob(pattern: Option<&str>) -> Result<Option<GlobSet>, String> {
 }
 
 fn resolve_root(input: &str) -> Result<PathBuf, String> {
-    let parsed = crate::paths::parse_input_path(input);
+    let parsed = crate::paths::parse_local_path_input(input)?;
+    let input_display = crate::paths::display_path(&parsed);
     if !parsed.is_absolute() || !parsed.exists() {
-        return Err(crate::paths::missing_search_path_message(input));
+        return Err(crate::paths::missing_search_path_message(&input_display));
     }
     fs::metadata(&parsed).map_err(|error| crate::paths::io_error_message(&parsed, &error))?;
     Ok(crate::paths::canonical_existing(&parsed).unwrap_or(parsed))

@@ -1,10 +1,9 @@
 //! Whether FastCtx is currently connected to the host, as the control terminal reports it.
 //!
 //! Apply writes three things: the stable binary, the `mcp_servers` entry, and the marker block in
-//! the host's `AGENTS.md`. Only the last one changes between releases without the user doing
-//! anything, because upgrades replace the binary but never rewrite shared host files. This module
-//! answers the one question the main menu needs from that: does the connection still match the
-//! build the user is running?
+//! the host's `AGENTS.md`. Product updates may refresh one byte-frozen legacy block, but that
+//! deliberately does not complete a new Apply. This module keeps the main menu aligned with the
+//! more detailed Status diagnosis without hiding that remaining action.
 
 use std::fs;
 
@@ -19,8 +18,25 @@ pub enum LinkState {
     Absent,
     /// The managed guidance block matches what this build writes.
     Current,
-    /// A connection was recorded, but its guidance block no longer matches this build.
-    Stale,
+    /// Current bytes were found, but the receipt does not record the current Apply contract.
+    ApplyRequired,
+    /// The exact known-bad 0.2.2/0.2.3 guidance block remains on disk.
+    KnownLegacy,
+    /// An Apply receipt exists, but the managed block or file is absent.
+    Missing,
+    /// The marker pair is valid, but the managed bytes were changed or use another shell shape.
+    Drifted,
+    /// The file is not UTF-8 or its managed markers are structurally damaged.
+    Malformed,
+    /// The AGENTS file exists but could not be read.
+    Unreadable,
+}
+
+impl LinkState {
+    /// Whether the visible connection still needs an explicit Apply before a Codex restart.
+    pub(crate) const fn requires_apply(self) -> bool {
+        !matches!(self, Self::Absent | Self::Current)
+    }
 }
 
 /// Classifies the recorded connection against the guidance this build would write.
@@ -32,14 +48,22 @@ pub fn link_state(paths: &ControlPaths, applied: Option<&AppliedRecord>) -> Link
     let Some(record) = applied else {
         return LinkState::Absent;
     };
-    // An outdated block, a damaged one, and an unreadable file all call for the same user action,
-    // so they share one state instead of adding a fourth nobody could act on differently.
     match fs::read(&paths.codex_agents) {
-        Ok(bytes) => match agents::has_exact_section_for(&bytes, record.fastshell_enabled) {
-            Ok(true) => LinkState::Current,
-            _ => LinkState::Stale,
+        Ok(bytes) => match agents::classify_managed_section(&bytes, record.fastshell_enabled) {
+            agents::ManagedSectionState::Current
+                if record.agents_contract_id.as_deref()
+                    == Some(agents::MANAGED_SECTION_CONTRACT_ID) =>
+            {
+                LinkState::Current
+            }
+            agents::ManagedSectionState::Current => LinkState::ApplyRequired,
+            agents::ManagedSectionState::KnownLegacy => LinkState::KnownLegacy,
+            agents::ManagedSectionState::Missing => LinkState::Missing,
+            agents::ManagedSectionState::Drifted => LinkState::Drifted,
+            agents::ManagedSectionState::Malformed(_) => LinkState::Malformed,
         },
-        Err(_) => LinkState::Stale,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => LinkState::Missing,
+        Err(_) => LinkState::Unreadable,
     }
 }
 
@@ -79,6 +103,7 @@ mod tests {
             codex_dir_created: false,
             codex_config: managed("config.toml"),
             codex_agents: managed("AGENTS.md"),
+            agents_contract_id: Some(agents::MANAGED_SECTION_CONTRACT_ID.to_string()),
             codex_agents_inserted_separator: None,
             binary_sha256: "binary-hash".to_string(),
         }
@@ -101,34 +126,65 @@ mod tests {
         );
     }
 
-    /// The upgrade path users actually hit: the binary advances while the host file keeps the
-    /// guidance an older release wrote, and nothing in the update flow rewrites it.
     #[test]
-    fn a_block_that_no_longer_matches_this_build_reads_as_stale() {
-        let home = tempfile::tempdir().unwrap();
-        let stale = agents::section(false).replace("Read only what the task needs.", "Old text.");
-        let paths = paths_with_agents(home.path(), Some(&stale));
-        assert_eq!(link_state(&paths, Some(&receipt(false))), LinkState::Stale);
-    }
-
-    #[test]
-    fn a_shell_state_that_disagrees_with_the_receipt_reads_as_stale() {
+    fn an_automatically_refreshed_block_still_requires_an_explicit_apply() {
         let home = tempfile::tempdir().unwrap();
         let paths = paths_with_agents(home.path(), Some(&agents::section(false)));
-        assert_eq!(link_state(&paths, Some(&receipt(true))), LinkState::Stale);
+        let mut old_receipt = receipt(false);
+        old_receipt.agents_contract_id = None;
+        assert_eq!(
+            link_state(&paths, Some(&old_receipt)),
+            LinkState::ApplyRequired
+        );
     }
 
-    /// Damage and absence both resolve to Stale so the menu never shows a state whose only
-    /// remedy is the one Stale already names.
     #[test]
-    fn damaged_markers_and_a_missing_file_both_read_as_stale() {
+    fn every_owned_noncurrent_shape_keeps_its_diagnostic_state() {
         let home = tempfile::tempdir().unwrap();
+        let paths = paths_with_agents(home.path(), Some(&agents::section(false)));
+        assert_eq!(link_state(&paths, Some(&receipt(true))), LinkState::Drifted);
+
+        std::fs::write(&paths.codex_agents, agents::known_legacy_section(false)).unwrap();
+        assert_eq!(
+            link_state(&paths, Some(&receipt(false))),
+            LinkState::KnownLegacy
+        );
+
+        let drifted = "<!-- fastctx:begin -->\nuser-owned drift\n<!-- fastctx:end -->";
+        std::fs::write(&paths.codex_agents, drifted).unwrap();
+        assert_eq!(
+            link_state(&paths, Some(&receipt(false))),
+            LinkState::Drifted
+        );
+
         let damaged = format!("{}\n{}", agents::section(false), agents::section(false));
-        let paths = paths_with_agents(home.path(), Some(&damaged));
-        assert_eq!(link_state(&paths, Some(&receipt(false))), LinkState::Stale);
+        std::fs::write(&paths.codex_agents, damaged).unwrap();
+        assert_eq!(
+            link_state(&paths, Some(&receipt(false))),
+            LinkState::Malformed
+        );
 
         let empty_home = tempfile::tempdir().unwrap();
         let empty = paths_with_agents(empty_home.path(), None);
-        assert_eq!(link_state(&empty, Some(&receipt(false))), LinkState::Stale);
+        assert_eq!(
+            link_state(&empty, Some(&receipt(false))),
+            LinkState::Missing
+        );
+    }
+
+    #[test]
+    fn only_absent_and_current_are_complete_connection_states() {
+        assert!(!LinkState::Absent.requires_apply());
+        assert!(!LinkState::Current.requires_apply());
+        for state in [
+            LinkState::ApplyRequired,
+            LinkState::KnownLegacy,
+            LinkState::Missing,
+            LinkState::Drifted,
+            LinkState::Malformed,
+            LinkState::Unreadable,
+        ] {
+            assert!(state.requires_apply(), "{state:?}");
+        }
     }
 }

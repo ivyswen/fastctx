@@ -142,6 +142,58 @@ pub(crate) struct Toast {
     pub(crate) warning: bool,
 }
 
+fn finalize_notice_toast(
+    messages: &UpdateMessages,
+    notice: crate::update::FinalizeNotice,
+) -> Toast {
+    let (base, mut warning) = match notice.outcome {
+        crate::update::FinalizeOutcome::Updated => (
+            messages.updated.replace("{version}", &notice.version),
+            false,
+        ),
+        crate::update::FinalizeOutcome::RuntimeUpdated => (
+            messages
+                .updated_runtime
+                .replace("{version}", &notice.version),
+            false,
+        ),
+        crate::update::FinalizeOutcome::RuntimeUnchanged(detail) => (
+            format!(
+                "{}: {detail}",
+                messages
+                    .runtime_unchanged
+                    .replace("{version}", &notice.version)
+            ),
+            true,
+        ),
+    };
+    let mut lines = vec![base];
+    match notice.guidance {
+        crate::update::FinalizeGuidanceOutcome::NotApplied
+        | crate::update::FinalizeGuidanceOutcome::Current => {}
+        crate::update::FinalizeGuidanceOutcome::Refreshed => {
+            lines.push(messages.guidance_apply_required.to_string());
+            lines.push(messages.guidance_refreshed.to_string());
+            warning = true;
+        }
+        crate::update::FinalizeGuidanceOutcome::ApplyRequired => {
+            lines.push(messages.guidance_apply_required.to_string());
+            warning = true;
+        }
+        crate::update::FinalizeGuidanceOutcome::Unchanged(detail) => {
+            lines.push(messages.guidance_apply_required.to_string());
+            lines.push(messages.guidance_unchanged.replace("{detail}", &detail));
+            warning = true;
+        }
+    }
+    // Apply must precede the restart when guidance still needs an explicit ownership receipt.
+    lines.push(messages.restart_codex.to_string());
+    Toast {
+        message: lines.join("\n"),
+        warning,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Effect {
     RetryUpdate,
@@ -259,39 +311,8 @@ impl App {
         } else {
             Language::En
         };
-        let startup_notice = startup_notice.map(|notice| {
-            let messages = update_copy::messages(notice_language);
-            match notice.outcome {
-                crate::update::FinalizeOutcome::Updated => Toast {
-                    message: format!(
-                        "{}\n{}",
-                        messages.updated.replace("{version}", &notice.version),
-                        messages.restart_codex
-                    ),
-                    warning: false,
-                },
-                crate::update::FinalizeOutcome::RuntimeUpdated => Toast {
-                    message: format!(
-                        "{}\n{}",
-                        messages
-                            .updated_runtime
-                            .replace("{version}", &notice.version),
-                        messages.restart_codex
-                    ),
-                    warning: false,
-                },
-                crate::update::FinalizeOutcome::RuntimeUnchanged(detail) => Toast {
-                    message: format!(
-                        "{}: {detail}\n{}",
-                        messages
-                            .runtime_unchanged
-                            .replace("{version}", &notice.version),
-                        messages.restart_codex
-                    ),
-                    warning: true,
-                },
-            }
-        });
+        let startup_notice = startup_notice
+            .map(|notice| finalize_notice_toast(update_copy::messages(notice_language), notice));
         let startup_failure = match &startup_update {
             StartupUpdate::Failed(error) if error.kind == CheckFailureKind::Structural => {
                 Some(Toast {
@@ -1743,7 +1764,7 @@ fn language_index(language: Language) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Effect, Screen, config};
+    use super::{App, Effect, Screen, config, finalize_notice_toast};
     use crate::control::i18n::Language;
     use crate::control::paths::ControlPaths;
     use crate::control::settings::{
@@ -1754,8 +1775,8 @@ mod tests {
     use crate::tui::config::{ConfigCursor, ConfigDraft, ConfigItemId, ConfigValue};
     use crate::tui::jobs::{JobsDetail, JobsState};
     use crate::update::{
-        CheckFailure, CheckFailureKind, NpmDiscovery, NpmRegistryProbe, NpmVersionAuthority,
-        StartupUpdate, UpdatePlan,
+        CheckFailure, CheckFailureKind, FinalizeGuidanceOutcome, FinalizeNotice, FinalizeOutcome,
+        NpmDiscovery, NpmRegistryProbe, NpmVersionAuthority, StartupUpdate, UpdatePlan,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::{Duration, Instant};
@@ -1804,6 +1825,7 @@ mod tests {
             codex_dir_created: true,
             codex_config: managed("config.toml"),
             codex_agents: managed("AGENTS.md"),
+            agents_contract_id: None,
             codex_agents_inserted_separator: None,
             binary_sha256: "binary-hash".to_string(),
         }
@@ -2806,6 +2828,64 @@ mod tests {
         assert_eq!(app.update_state, StartupUpdate::Available(Box::new(plan)));
         assert_eq!(app.selected, 0);
         assert!(app.toast.is_none());
+    }
+
+    #[test]
+    fn finalized_update_notice_keeps_guidance_refresh_best_effort_and_apply_explicit() {
+        let messages = crate::tui::update::messages(Language::En);
+        let toast_for = |guidance| {
+            finalize_notice_toast(
+                messages,
+                FinalizeNotice {
+                    version: "9.8.7".to_string(),
+                    outcome: FinalizeOutcome::Updated,
+                    guidance,
+                },
+            )
+        };
+
+        let current = toast_for(FinalizeGuidanceOutcome::Current);
+        assert!(!current.warning);
+        assert!(!current.message.contains("fastctx apply"));
+
+        let refreshed = toast_for(FinalizeGuidanceOutcome::Refreshed);
+        assert!(refreshed.warning);
+        assert!(refreshed.message.contains(messages.guidance_refreshed));
+        assert!(refreshed.message.contains(messages.guidance_apply_required));
+        assert!(
+            refreshed
+                .message
+                .find(messages.guidance_apply_required)
+                .unwrap()
+                < refreshed.message.find(messages.restart_codex).unwrap(),
+            "{refreshed:?}"
+        );
+
+        let pending = toast_for(FinalizeGuidanceOutcome::ApplyRequired);
+        assert!(pending.warning);
+        assert!(pending.message.contains("fastctx apply"));
+        assert!(!pending.message.contains(messages.guidance_refreshed));
+
+        let unchanged = toast_for(FinalizeGuidanceOutcome::Unchanged(
+            "injected guidance error".to_string(),
+        ));
+        assert!(unchanged.warning);
+        assert!(unchanged.message.contains("injected guidance error"));
+        assert!(unchanged.message.contains("fastctx apply"));
+
+        let runtime = finalize_notice_toast(
+            messages,
+            FinalizeNotice {
+                version: "9.8.7".to_string(),
+                outcome: FinalizeOutcome::RuntimeUnchanged(
+                    "runtime ownership mismatch".to_string(),
+                ),
+                guidance: FinalizeGuidanceOutcome::Current,
+            },
+        );
+        assert!(runtime.warning);
+        assert!(runtime.message.contains("runtime ownership mismatch"));
+        assert!(!runtime.message.contains("fastctx apply"));
     }
 
     #[test]

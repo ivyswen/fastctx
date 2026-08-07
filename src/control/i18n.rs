@@ -571,7 +571,7 @@ const EN: Messages = messages!(
     "Not connected to Codex",
     "Connected to Codex",
     "Reconnection needed",
-    "The guidance block changed in this version. Reconnect, then restart Codex.",
+    "fastctx apply completes the connection; then restart Codex.",
     "ChatGPT/Codex starts FastCtx on its own. This terminal only configures it and can be closed at any time."
 );
 const ZH_CN: Messages = messages!(
@@ -648,7 +648,7 @@ const ZH_CN: Messages = messages!(
     "尚未接入 Codex",
     "已接入 Codex",
     "需要重新接入",
-    "本版本的引导内容已更新。请重新接入，然后重启 Codex。",
+    "fastctx apply 可完成接入；随后请重启 Codex。",
     "ChatGPT/Codex 会自行启动 FastCtx。这个终端只用于配置，随时可以关闭。"
 );
 const ZH_TW: Messages = messages!(
@@ -725,7 +725,7 @@ const ZH_TW: Messages = messages!(
     "尚未接入 Codex",
     "已接入 Codex",
     "需要重新接入",
-    "本版本的引導內容已更新。請重新接入，然後重新啟動 Codex。",
+    "fastctx apply 可完成接入；接著請重新啟動 Codex。",
     "ChatGPT/Codex 會自行啟動 FastCtx。這個終端只用於設定，隨時可以關閉。"
 );
 const JA: Messages = messages!(
@@ -802,7 +802,7 @@ const JA: Messages = messages!(
     "Codex に未接続",
     "Codex に接続済み",
     "再接続が必要です",
-    "このバージョンでガイダンス内容が変わりました。再接続してから Codex を再起動してください。",
+    "fastctx apply で接続を完了し、その後 Codex を再起動してください。",
     "ChatGPT/Codex が FastCtx を自動的に起動します。この端末は設定専用で、いつでも閉じられます。"
 );
 const KO: Messages = messages!(
@@ -879,7 +879,7 @@ const KO: Messages = messages!(
     "Codex에 연결되지 않음",
     "Codex에 연결됨",
     "다시 연결해야 합니다",
-    "이 버전에서 안내 내용이 변경되었습니다. 다시 연결한 뒤 Codex를 재시작하세요.",
+    "fastctx apply로 연결을 완료한 뒤 Codex를 다시 시작하세요.",
     "ChatGPT/Codex가 FastCtx를 자동으로 시작합니다. 이 터미널은 설정 전용이며 언제든지 닫아도 됩니다."
 );
 const ES: Messages = messages!(
@@ -956,7 +956,7 @@ const ES: Messages = messages!(
     "Sin conectar a Codex",
     "Conectado a Codex",
     "Hay que volver a conectar",
-    "El bloque de guía cambió en esta versión. Vuelve a conectar y reinicia Codex.",
+    "fastctx apply completa la conexión; después, reinicia Codex.",
     "ChatGPT/Codex inicia FastCtx por su cuenta. Esta terminal solo sirve para configurarlo y puedes cerrarla cuando quieras."
 );
 const FR: Messages = messages!(
@@ -1033,7 +1033,7 @@ const FR: Messages = messages!(
     "Non connecté à Codex",
     "Connecté à Codex",
     "Reconnexion nécessaire",
-    "Le bloc de consignes a changé dans cette version. Reconnectez, puis redémarrez Codex.",
+    "fastctx apply termine la connexion ; redémarrez ensuite Codex.",
     "ChatGPT/Codex démarre FastCtx tout seul. Ce terminal sert uniquement à le configurer et peut être fermé à tout moment."
 );
 const DE: Messages = messages!(
@@ -1110,7 +1110,7 @@ const DE: Messages = messages!(
     "Nicht mit Codex verbunden",
     "Mit Codex verbunden",
     "Neu verbinden erforderlich",
-    "Der Hinweisblock hat sich in dieser Version geändert. Neu verbinden und dann Codex neu starten.",
+    "fastctx apply schließt die Verbindung ab; starten Sie danach Codex neu.",
     "ChatGPT/Codex startet FastCtx selbst. Dieses Terminal dient nur zur Konfiguration und kann jederzeit geschlossen werden."
 );
 const PT_BR: Messages = messages!(
@@ -1187,7 +1187,7 @@ const PT_BR: Messages = messages!(
     "Não conectado ao Codex",
     "Conectado ao Codex",
     "É preciso reconectar",
-    "O bloco de orientação mudou nesta versão. Reconecte e reinicie o Codex.",
+    "fastctx apply conclui a conexão; depois, reinicie o Codex.",
     "O ChatGPT/Codex inicia o FastCtx sozinho. Este terminal serve apenas para configurá-lo e pode ser fechado a qualquer momento."
 );
 const RU: Messages = messages!(
@@ -1264,7 +1264,7 @@ const RU: Messages = messages!(
     "Не подключено к Codex",
     "Подключено к Codex",
     "Нужно подключить заново",
-    "В этой версии изменился блок подсказок. Подключите заново, затем перезапустите Codex.",
+    "fastctx apply завершает подключение; затем перезапустите Codex.",
     "ChatGPT/Codex запускает FastCtx самостоятельно. Этот терминал нужен только для настройки, его можно закрыть в любой момент."
 );
 const IT: Messages = messages!(
@@ -1341,7 +1341,7 @@ const IT: Messages = messages!(
     "Non collegato a Codex",
     "Collegato a Codex",
     "Serve ricollegare",
-    "Il blocco di indicazioni è cambiato in questa versione. Ricollega, poi riavvia Codex.",
+    "fastctx apply completa il collegamento; poi riavvia Codex.",
     "ChatGPT/Codex avvia FastCtx da sé. Questo terminale serve solo a configurarlo e puoi chiuderlo quando vuoi."
 );
 const TR: Messages = messages!(
@@ -1418,7 +1418,7 @@ const TR: Messages = messages!(
     "Codex’e bağlı değil",
     "Codex’e bağlı",
     "Yeniden bağlanmak gerekiyor",
-    "Bu sürümde yönlendirme bloğu değişti. Yeniden bağlanın, sonra Codex’i yeniden başlatın.",
+    "fastctx apply bağlantıyı tamamlar; ardından Codex’i yeniden başlatın.",
     "ChatGPT/Codex, FastCtx’i kendisi başlatır. Bu terminal yalnızca yapılandırma içindir ve istediğiniz zaman kapatabilirsiniz."
 );
 const PL: Messages = messages!(
@@ -1495,7 +1495,7 @@ const PL: Messages = messages!(
     "Brak połączenia z Codex",
     "Połączono z Codex",
     "Trzeba połączyć ponownie",
-    "W tej wersji zmienił się blok wskazówek. Połącz ponownie, a następnie zrestartuj Codex.",
+    "fastctx apply kończy łączenie; następnie uruchom ponownie Codex.",
     "ChatGPT/Codex sam uruchamia FastCtx. Ten terminal służy tylko do konfiguracji i można go zamknąć w każdej chwili."
 );
 const NL: Messages = messages!(
@@ -1572,7 +1572,7 @@ const NL: Messages = messages!(
     "Niet verbonden met Codex",
     "Verbonden met Codex",
     "Opnieuw verbinden nodig",
-    "Het instructieblok is in deze versie gewijzigd. Verbind opnieuw en start Codex daarna opnieuw.",
+    "fastctx apply voltooit de verbinding; start Codex daarna opnieuw.",
     "ChatGPT/Codex start FastCtx zelf. Deze terminal is alleen voor configuratie en kan altijd worden gesloten."
 );
 const VI: Messages = messages!(
@@ -1649,7 +1649,7 @@ const VI: Messages = messages!(
     "Chưa kết nối với Codex",
     "Đã kết nối với Codex",
     "Cần kết nối lại",
-    "Khối hướng dẫn đã thay đổi ở phiên bản này. Hãy kết nối lại rồi khởi động lại Codex.",
+    "fastctx apply hoàn tất kết nối; sau đó hãy khởi động lại Codex.",
     "ChatGPT/Codex tự khởi chạy FastCtx. Bảng điều khiển này chỉ để cấu hình và có thể đóng bất cứ lúc nào."
 );
 const ID: Messages = messages!(
@@ -1726,7 +1726,7 @@ const ID: Messages = messages!(
     "Belum terhubung ke Codex",
     "Terhubung ke Codex",
     "Perlu hubungkan ulang",
-    "Blok panduan berubah di versi ini. Hubungkan ulang, lalu mulai ulang Codex.",
+    "fastctx apply menyelesaikan koneksi; setelah itu mulai ulang Codex.",
     "ChatGPT/Codex menjalankan FastCtx sendiri. Terminal ini hanya untuk konfigurasi dan bisa ditutup kapan saja."
 );
 const UK: Messages = messages!(
@@ -1803,7 +1803,7 @@ const UK: Messages = messages!(
     "Не підключено до Codex",
     "Підключено до Codex",
     "Потрібно підключити знову",
-    "У цій версії змінився блок підказок. Підключіть знову, потім перезапустіть Codex.",
+    "fastctx apply завершує підключення; потім перезапустіть Codex.",
     "ChatGPT/Codex запускає FastCtx самостійно. Цей термінал потрібен лише для налаштування, його можна закрити будь-коли."
 );
 
@@ -1984,6 +1984,12 @@ mod tests {
             let messages = language.messages();
             assert!(messages.narrow_terminal.contains("{width}"));
             assert!(messages.narrow_terminal.contains("{height}"));
+            assert!(
+                messages.link_state_stale_hint.starts_with("fastctx apply"),
+                "{} does not name the explicit connection command: {}",
+                language.code(),
+                messages.link_state_stale_hint
+            );
             assert!(messages.config_more_above.starts_with('↑'));
             assert!(messages.config_more_below.starts_with('↓'));
         }

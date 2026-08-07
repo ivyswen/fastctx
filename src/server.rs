@@ -120,6 +120,14 @@ impl FastCtxServer {
         let mut tool_router = Self::file_tool_router();
         tool_router.merge(Self::shell_tool_router());
         tool_router.merge(Self::edit_tool_router());
+        // rmcp's attribute accepts only a literal. Replace its inert placeholder before the router
+        // is observable so the positive route still has one production source.
+        tool_router
+            .map
+            .get_mut("read")
+            .expect("the compiled file router must contain read")
+            .attr
+            .description = Some(crate::model_guidance::read_tool_description().into());
         for entry in ToolManifest::entries() {
             if !entry.group.enabled(options.enable_shell) {
                 tool_router.remove_route(entry.name);
@@ -169,20 +177,7 @@ impl Default for FastCtxServer {
 impl FastCtxServer {
     #[tool(
         name = "read",
-        description = "Read one file (text, image, or PDF) or a batch of text files from the local
-filesystem. Paths must be absolute. Text returns 1-based `N<tab>content`
-lines, as much of the file as the output budget holds. For several text
-files in one call, pass files=[{\"path\": ...}, ...] instead of file_path:
-one token budget, per-file problems reported inline without failing the
-batch, and a Partial note returns the exact files array for the next call.
-Images (PNG/JPG/GIF/WebP/BMP) are shown to you visually. PDFs return the
-selected pages' text layer or those pages rendered as images; image mode
-defaults to 4 pages. view=\"hex\" dumps any file's raw bytes. PDFs, images,
-and hex view are single-file only. Text output is always UTF-8; when
-auto-detection is not confident it returns an error listing candidate
-encodings instead of guessed text, so pass encoding only then. Text, PDF,
-and hex responses end with a Complete or Partial status — continue only
-with the exact parameters a Partial note provides.",
+        description = "Read local files.",
         annotations(
             title = "Read local file",
             read_only_hint = true,
@@ -286,11 +281,9 @@ impl ServerHandler for FastCtxServer {
             // blurb and may keep only its first line and first 250 characters, so this text
             // has to introduce the toolset within that budget. Behavioural rules belong in
             // the host guidance file, which has no such limit.
-            .with_instructions(if self.options.enable_shell {
-                "Local-file tools: read (one file or a batch), grep (content search), glob (find paths), replace (mechanical find-and-replace), plus POSIX-bash shell tools. Pass absolute paths."
-            } else {
-                "Local-file tools: read (one file or a batch), grep (content search), glob (find paths), and replace (mechanical find-and-replace). Pass absolute paths."
-            })
+            .with_instructions(crate::model_guidance::server_instructions(
+                self.options.enable_shell,
+            ))
     }
 
     // The three `resources/*` methods stay on the rmcp defaults on purpose: both list methods

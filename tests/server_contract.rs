@@ -61,25 +61,21 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
         assert!(tool.input_schema.get("type").is_some());
     }
     let read = tools.iter().find(|tool| tool.name == "read").unwrap();
-    assert_eq!(
-        read.description.as_deref(),
-        Some(concat!(
-            "Read one file (text, image, or PDF) or a batch of text files from the local\n",
-            "filesystem. Paths must be absolute. Text returns 1-based `N<tab>content`\n",
-            "lines, as much of the file as the output budget holds. For several text\n",
-            "files in one call, pass files=[{\"path\": ...}, ...] instead of file_path:\n",
-            "one token budget, per-file problems reported inline without failing the\n",
-            "batch, and a Partial note returns the exact files array for the next call.\n",
-            "Images (PNG/JPG/GIF/WebP/BMP) are shown to you visually. PDFs return the\n",
-            "selected pages' text layer or those pages rendered as images; image mode\n",
-            "defaults to 4 pages. view=\"hex\" dumps any file's raw bytes. PDFs, images,\n",
-            "and hex view are single-file only. Text output is always UTF-8; when\n",
-            "auto-detection is not confident it returns an error listing candidate\n",
-            "encodings instead of guessed text, so pass encoding only then. Text, PDF,\n",
-            "and hex responses end with a Complete or Partial status — continue only\n",
-            "with the exact parameters a Partial note provides."
-        ))
-    );
+    let read_description = read.description.as_deref().expect("read description");
+    for required in [
+        "directly for local-file operations",
+        "URI-shaped",
+        "plain absolute filesystem path",
+        "batch of text files",
+        "files=[{\"path\": ...}, ...]",
+        "Complete or Partial",
+    ] {
+        assert!(
+            read_description.contains(required),
+            "{required}: {read_description}"
+        );
+    }
+    assert_ne!(read_description, "Read local files.");
     assert!(
         read.input_schema
             .get("required")
@@ -105,6 +101,12 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
     );
     assert_eq!(read.input_schema["properties"]["offset"]["minimum"], 1);
     assert_eq!(read.input_schema["properties"]["limit"]["minimum"], 1);
+    for schema in [
+        &read.input_schema["properties"]["file_path"],
+        &read.input_schema["$defs"]["BatchReadEntry"]["properties"]["path"],
+    ] {
+        assert_positive_local_path_schema(schema);
+    }
     let pdf_mode_schema = read.input_schema["properties"]["pdf_mode"].to_string();
     assert!(pdf_mode_schema.contains("text"));
     assert!(pdf_mode_schema.contains("image"));
@@ -141,6 +143,7 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
     );
     assert!(grep.input_schema["properties"].get("type").is_some());
     assert!(grep.input_schema["properties"].get("file_type").is_none());
+    assert_positive_local_path_schema(&grep.input_schema["properties"]["path"]);
     assert_eq!(
         grep.input_schema["properties"]["encoding"]["description"],
         "Single-file target only: decode that file with this WHATWG encoding label (e.g. \"gbk\"), same semantics as read's encoding. On a directory target use fallback_encoding instead."
@@ -178,6 +181,7 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
     }
     assert_eq!(glob.input_schema["properties"]["limit"]["minimum"], 1);
     assert_eq!(glob.input_schema["properties"]["limit"]["maximum"], 1_000);
+    assert_positive_local_path_schema(&glob.input_schema["properties"]["path"]);
     let descriptions = tools
         .iter()
         .map(|tool| tool.description.as_deref().unwrap_or_default())
@@ -199,6 +203,16 @@ fn server_instructions_follow_the_optional_shell_group() {
             "{instructions}"
         );
         assert!(instructions.contains("replace"), "{instructions}");
+        for required in [
+            "directly for local-file operations",
+            "URI-shaped",
+            "plain absolute filesystem path",
+        ] {
+            assert!(
+                instructions.contains(required),
+                "{required}: {instructions}"
+            );
+        }
         // Hosts render these instructions as the tool namespace's one-line blurb and may keep
         // only the first line and first 250 characters, so anything past that budget is
         // silently dropped. Behavioural rules live in the guidance file instead (2026-07-24).
@@ -485,6 +499,33 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
         assert!(
             replace.input_schema["properties"].get(property).is_some(),
             "{property}"
+        );
+    }
+    assert_positive_local_path_schema(&replace.input_schema["properties"]["path"]);
+}
+
+fn assert_positive_local_path_schema(schema: &Value) {
+    let description = schema["description"]
+        .as_str()
+        .expect("path schema should describe the accepted local path shape");
+    for required in [
+        "Plain absolute local filesystem path",
+        "URI-shaped",
+        "equivalent local absolute path",
+    ] {
+        assert!(description.contains(required), "{required}: {description}");
+    }
+    for forbidden in [
+        "read_mcp_resource",
+        "list_mcp_resources",
+        "list_mcp_resource_templates",
+        "MCP resources",
+        "file://",
+        "FastCtx is not",
+    ] {
+        assert!(
+            !description.contains(forbidden),
+            "{forbidden}: {description}"
         );
     }
 }

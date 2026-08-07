@@ -178,12 +178,10 @@ pub fn run(paths: &ControlPaths) -> DoctorReport {
     });
     checks.push(check_binary(paths, all_applied));
     checks.push(check_running_instances(paths));
-    checks.push(check_mcp(&paths.installed_binary, profile_applied));
-    checks.push(check_agents(
-        paths,
-        profile_applied.is_some(),
-        profile_applied.is_some_and(|record| record.fastshell_enabled),
-    ));
+    let mcp_contract = check_mcp(&paths.installed_binary, profile_applied);
+    checks.push(mcp_contract.clone());
+    checks.push(check_model_tool_surface(&mcp_contract));
+    checks.push(check_agents(paths, profile_applied));
     let fastshell_desired = saved_settings.is_some_and(|settings| settings.fastshell.enabled);
     let fastshell_applied = profile_applied.is_some_and(|record| record.fastshell_enabled);
     checks.push(check_extension_state(
@@ -694,7 +692,7 @@ fn check_recorded_path(
 fn check_mcp(executable: &Path, applied: Option<&settings::AppliedRecord>) -> DoctorCheck {
     if !executable.is_file() && applied.is_none() {
         return DoctorCheck::info(
-            "MCP handshake",
+            "MCP server contract",
             "Not run before Apply installs the stable fastctx binary.",
         );
     }
@@ -703,18 +701,33 @@ fn check_mcp(executable: &Path, applied: Option<&settings::AppliedRecord>) -> Do
     });
     match probe_mcp(executable, options) {
         Ok(()) => DoctorCheck::pass(
-            "MCP handshake",
+            "MCP server contract",
             format!(
-                "initialize and tools/list returned {} tools with matching contract hashes.",
+                "FastCtx initialize and tools/list returned {} tools with matching contract hashes. This proves the server contract only, not model-side tool exposure.",
                 ToolManifest::expected_names(options.enable_shell).len()
             ),
         ),
         Err(error) => DoctorCheck::fail(
-            "MCP handshake",
+            "MCP server contract",
             error,
             "Run fastctx apply, then retry status. If it still fails, run the configured fastctx serve command from a terminal to inspect the error.",
         ),
     }
+}
+
+fn check_model_tool_surface(server_contract: &DoctorCheck) -> DoctorCheck {
+    let detail = match server_contract.status {
+        DoctorCheckStatus::Pass => {
+            "Unverified: FastCtx can validate its own MCP server contract, but cannot observe whether Codex or the configured provider exposed those tools to the model. Start a new Codex session and verify one direct FastCtx tool call."
+        }
+        DoctorCheckStatus::Info => {
+            "Unverified: the MCP server contract was not probed, and FastCtx cannot observe model-side tool exposure. Run fastctx apply, start a new Codex session, and verify one direct FastCtx tool call."
+        }
+        DoctorCheckStatus::Fail => {
+            "Unverified: the MCP server contract failed, and even a passing server contract would not prove model-side tool exposure. Repair the server contract, start a new Codex session, and verify one direct FastCtx tool call."
+        }
+    };
+    DoctorCheck::info("Model tool surface", detail)
 }
 
 fn check_extension_state(name: &'static str, desired: bool, applied: bool) -> DoctorCheck {
@@ -737,51 +750,115 @@ fn check_extension_state(name: &'static str, desired: bool, applied: bool) -> Do
     }
 }
 
-fn check_agents(paths: &ControlPaths, applied: bool, fastshell_enabled: bool) -> DoctorCheck {
+fn check_agents(paths: &ControlPaths, applied: Option<&settings::AppliedRecord>) -> DoctorCheck {
     match std::fs::read(&paths.codex_agents) {
-        Ok(bytes) => match agents::has_exact_section_for(&bytes, fastshell_enabled) {
-            Ok(true) if applied => DoctorCheck::pass(
-                "AGENTS guidance",
-                "The fastctx guidance block matches the current contract.",
-            ),
-            Ok(true) => DoctorCheck::info(
-                "AGENTS guidance",
-                "A current fastctx guidance block exists without an Apply receipt; Apply will adopt and record it.",
-            ),
-            Ok(false) if applied => DoctorCheck::fail(
-                "AGENTS guidance",
-                "The fastctx guidance block is missing or outdated.",
-                "Run fastctx apply to refresh only the private marker block.",
-            ),
-            Ok(false) => DoctorCheck::info(
-                "AGENTS guidance",
-                format!(
-                    "No managed guidance block is present in {}; Apply will add one without changing other content.",
-                    crate::paths::display_path(&paths.codex_agents)
-                ),
-            ),
-            Err(error) => DoctorCheck::fail(
-                "AGENTS guidance",
-                error,
-                "Repair AGENTS.md as UTF-8 with one fastctx marker block, then re-apply.",
-            ),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !applied => {
-            DoctorCheck::info(
-                "AGENTS guidance",
-                format!(
-                    "{} does not exist yet; Apply will create it.",
-                    crate::paths::display_path(&paths.codex_agents)
-                ),
-            )
+        Ok(bytes) => {
+            let state = applied.map_or_else(
+                || classify_unowned_agents(&bytes),
+                |record| agents::classify_managed_section(&bytes, record.fastshell_enabled),
+            );
+            check_agents_state(paths, applied, state)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            check_agents_state(paths, applied, agents::ManagedSectionState::Missing)
         }
         Err(error) => DoctorCheck::fail(
             "AGENTS guidance",
             format!(
-                "Cannot read {}: {error}",
+                "State: unreadable. Cannot read {}: {error}",
                 crate::paths::display_path(&paths.codex_agents)
             ),
-            "Run fastctx apply to create the private guidance block.",
+            "Fix the path or permissions, run fastctx apply, then restart Codex.",
+        ),
+    }
+}
+
+fn classify_unowned_agents(bytes: &[u8]) -> agents::ManagedSectionState {
+    let file_only = agents::classify_managed_section(bytes, false);
+    if !matches!(file_only, agents::ManagedSectionState::Drifted) {
+        return file_only;
+    }
+    match agents::classify_managed_section(bytes, true) {
+        state @ (agents::ManagedSectionState::Current
+        | agents::ManagedSectionState::KnownLegacy) => state,
+        _ => file_only,
+    }
+}
+
+fn check_agents_state(
+    paths: &ControlPaths,
+    applied: Option<&settings::AppliedRecord>,
+    state: agents::ManagedSectionState,
+) -> DoctorCheck {
+    let has_receipt = applied.is_some();
+    match state {
+        agents::ManagedSectionState::Current
+            if applied.is_some_and(|record| {
+                record.agents_contract_id.as_deref() == Some(agents::MANAGED_SECTION_CONTRACT_ID)
+            }) =>
+        {
+            DoctorCheck::pass(
+                "AGENTS guidance",
+                "State: current. The managed block and explicit Apply receipt match the current contract.",
+            )
+        }
+        agents::ManagedSectionState::Current if has_receipt => DoctorCheck::fail(
+            "AGENTS guidance",
+            "State: current, Apply required. The managed bytes are current, but the receipt does not record this contract; a safe automatic refresh never impersonates a complete Apply.",
+            "Run fastctx apply to record the complete connection, then restart Codex.",
+        ),
+        agents::ManagedSectionState::Current => DoctorCheck::info(
+            "AGENTS guidance",
+            "State: current without an Apply receipt. Automatic updates will not claim ownership; run fastctx apply to record the connection, then restart Codex.",
+        ),
+        agents::ManagedSectionState::KnownLegacy
+            if applied.is_some_and(|record| record.agents_contract_id.is_some()) =>
+        {
+            DoctorCheck::fail(
+                "AGENTS guidance",
+                "State: known-bad legacy after Apply. The receipt already records a guidance contract, so these bytes are post-Apply drift and automatic updates preserve them.",
+                "Run fastctx apply to replace the managed block and record the complete connection, then restart Codex.",
+            )
+        }
+        agents::ManagedSectionState::KnownLegacy if has_receipt => DoctorCheck::fail(
+            "AGENTS guidance",
+            "State: known-bad legacy. The exact 0.2.2/0.2.3 block remains. A managed product update may safely refresh this exact block, but that refresh never completes Apply.",
+            "Run fastctx apply to replace the managed block and record the complete connection, then restart Codex.",
+        ),
+        agents::ManagedSectionState::KnownLegacy => DoctorCheck::fail(
+            "AGENTS guidance",
+            "State: known-bad legacy without an Apply receipt. Automatic updates will not rewrite it because FastCtx cannot prove ownership.",
+            "Run fastctx apply to adopt and replace the managed block, then restart Codex.",
+        ),
+        agents::ManagedSectionState::Missing if has_receipt => DoctorCheck::fail(
+            "AGENTS guidance",
+            format!(
+                "State: missing. An Apply receipt exists, but {} has no managed guidance block. Automatic updates never recreate a missing block.",
+                crate::paths::display_path(&paths.codex_agents)
+            ),
+            "Run fastctx apply to recreate only the managed block, then restart Codex.",
+        ),
+        agents::ManagedSectionState::Missing => DoctorCheck::info(
+            "AGENTS guidance",
+            format!(
+                "State: missing. No Apply receipt owns a block in {}; fastctx apply will add one without changing other content.",
+                crate::paths::display_path(&paths.codex_agents)
+            ),
+        ),
+        agents::ManagedSectionState::Drifted if has_receipt => DoctorCheck::fail(
+            "AGENTS guidance",
+            "State: drifted. The marker pair is valid, but its managed bytes do not match a current or known legacy contract. Automatic updates preserve these changed bytes.",
+            "Review the managed block, run fastctx apply to replace it, then restart Codex.",
+        ),
+        agents::ManagedSectionState::Drifted => DoctorCheck::fail(
+            "AGENTS guidance",
+            "State: drifted without an Apply receipt. Automatic updates preserve the unowned marker block.",
+            "Review the managed block, run fastctx apply to adopt and replace it, then restart Codex.",
+        ),
+        agents::ManagedSectionState::Malformed(error) => DoctorCheck::fail(
+            "AGENTS guidance",
+            format!("State: malformed. {error} Automatic updates never rewrite malformed markers."),
+            "Repair AGENTS.md as UTF-8 with at most one fastctx marker pair, run fastctx apply, then restart Codex.",
         ),
     }
 }
@@ -1130,8 +1207,8 @@ fn sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        DoctorCheckStatus, MCP_INITIALIZE_TIMEOUT, check_drift, check_extension_state,
-        check_output_guard, receipt_drift, run,
+        DoctorCheck, DoctorCheckStatus, MCP_INITIALIZE_TIMEOUT, check_agents, check_drift,
+        check_extension_state, check_model_tool_surface, check_output_guard, receipt_drift, run,
     };
     use crate::control::codex_config::{self, ExpectedConfig};
     use crate::control::paths::ControlPaths;
@@ -1179,8 +1256,133 @@ mod tests {
             codex_dir_created: false,
             codex_config: managed.clone(),
             codex_agents: managed,
+            agents_contract_id: Some(
+                crate::control::agents::MANAGED_SECTION_CONTRACT_ID.to_string(),
+            ),
             codex_agents_inserted_separator: None,
             binary_sha256: "hash".to_string(),
+        }
+    }
+
+    #[test]
+    fn agents_guidance_reports_every_managed_state_and_never_hides_apply_after_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ControlPaths::for_home(temp.path());
+        std::fs::create_dir_all(&paths.codex_dir).unwrap();
+        let mut record = provider_record(
+            Tier::Standard,
+            Tier::Standard.host_limit(),
+            Tier::Standard.fastctx_budget(),
+            Tier::Standard.default_budgets(),
+        );
+
+        std::fs::write(&paths.codex_agents, crate::control::agents::section(false)).unwrap();
+        let current = check_agents(&paths, Some(&record));
+        assert_eq!(current.status, DoctorCheckStatus::Pass, "{current:?}");
+        assert!(current.detail.contains("State: current"), "{current:?}");
+
+        record.agents_contract_id = None;
+        let refreshed = check_agents(&paths, Some(&record));
+        assert_eq!(refreshed.status, DoctorCheckStatus::Fail, "{refreshed:?}");
+        assert!(refreshed.detail.contains("Apply required"), "{refreshed:?}");
+        assert!(
+            refreshed
+                .remedy
+                .as_deref()
+                .is_some_and(|remedy| remedy.contains("fastctx apply")),
+            "{refreshed:?}"
+        );
+        record.agents_contract_id =
+            Some(crate::control::agents::MANAGED_SECTION_CONTRACT_ID.to_string());
+
+        for (bytes, state, automatic) in [
+            (
+                crate::control::agents::known_legacy_section(false).into_bytes(),
+                "known-bad legacy",
+                "post-Apply drift",
+            ),
+            (
+                b"<!-- fastctx:begin -->\nuser-owned drift\n<!-- fastctx:end -->".to_vec(),
+                "drifted",
+                "Automatic updates preserve",
+            ),
+            (
+                b"<!-- fastctx:begin -->\n<!-- fastctx:begin -->\n<!-- fastctx:end -->".to_vec(),
+                "malformed",
+                "never rewrite malformed",
+            ),
+        ] {
+            std::fs::write(&paths.codex_agents, bytes).unwrap();
+            let check = check_agents(&paths, Some(&record));
+            assert_eq!(check.status, DoctorCheckStatus::Fail, "{check:?}");
+            assert!(check.detail.contains(state), "{state}: {check:?}");
+            assert!(check.detail.contains(automatic), "{automatic}: {check:?}");
+            assert!(
+                check
+                    .remedy
+                    .as_deref()
+                    .is_some_and(|remedy| remedy.contains("fastctx apply")),
+                "{check:?}"
+            );
+        }
+
+        record.agents_contract_id = None;
+        std::fs::write(
+            &paths.codex_agents,
+            crate::control::agents::known_legacy_section(false),
+        )
+        .unwrap();
+        let upgrade_legacy = check_agents(&paths, Some(&record));
+        assert_eq!(
+            upgrade_legacy.status,
+            DoctorCheckStatus::Fail,
+            "{upgrade_legacy:?}"
+        );
+        assert!(
+            upgrade_legacy.detail.contains("managed product update"),
+            "{upgrade_legacy:?}"
+        );
+        record.agents_contract_id =
+            Some(crate::control::agents::MANAGED_SECTION_CONTRACT_ID.to_string());
+
+        std::fs::remove_file(&paths.codex_agents).unwrap();
+        let missing = check_agents(&paths, Some(&record));
+        assert_eq!(missing.status, DoctorCheckStatus::Fail, "{missing:?}");
+        assert!(missing.detail.contains("State: missing"), "{missing:?}");
+        assert!(missing.detail.contains("never recreate"), "{missing:?}");
+
+        let fresh = check_agents(&paths, None);
+        assert_eq!(fresh.status, DoctorCheckStatus::Info, "{fresh:?}");
+        assert!(fresh.detail.contains("State: missing"), "{fresh:?}");
+
+        std::fs::write(&paths.codex_agents, crate::control::agents::section(true)).unwrap();
+        let unowned_shell = check_agents(&paths, None);
+        assert_eq!(
+            unowned_shell.status,
+            DoctorCheckStatus::Info,
+            "{unowned_shell:?}"
+        );
+        assert!(
+            unowned_shell.detail.contains("State: current"),
+            "{unowned_shell:?}"
+        );
+    }
+
+    #[test]
+    fn model_tool_surface_is_always_unverified_independently_of_the_server_contract() {
+        for contract in [
+            DoctorCheck::pass("MCP server contract", "server passed"),
+            DoctorCheck::info("MCP server contract", "not probed"),
+            DoctorCheck::fail("MCP server contract", "server failed", "repair server"),
+        ] {
+            let surface = check_model_tool_surface(&contract);
+            assert_eq!(surface.status, DoctorCheckStatus::Info, "{surface:?}");
+            assert!(surface.detail.starts_with("Unverified:"), "{surface:?}");
+            assert!(surface.detail.contains("model"), "{surface:?}");
+            assert!(
+                surface.detail.contains("direct FastCtx tool call"),
+                "{surface:?}"
+            );
         }
     }
 
@@ -1265,6 +1467,9 @@ mod tests {
             codex_dir_created: false,
             codex_config: managed(&paths.codex_config, config),
             codex_agents: managed(&paths.codex_agents, agents),
+            agents_contract_id: Some(
+                crate::control::agents::MANAGED_SECTION_CONTRACT_ID.to_string(),
+            ),
             codex_agents_inserted_separator: None,
             binary_sha256: super::sha256(binary),
         };
@@ -1337,6 +1542,9 @@ mod tests {
             codex_dir_created: false,
             codex_config: managed(&paths.codex_config, &applied_config),
             codex_agents: managed(&paths.codex_agents, agents),
+            agents_contract_id: Some(
+                crate::control::agents::MANAGED_SECTION_CONTRACT_ID.to_string(),
+            ),
             codex_agents_inserted_separator: None,
             binary_sha256: super::sha256(binary),
         };
@@ -1461,6 +1669,7 @@ mod tests {
             codex_dir_created: false,
             codex_config: managed(&paths.codex_config, &legacy_config),
             codex_agents: managed(&paths.codex_agents, agents),
+            agents_contract_id: None,
             codex_agents_inserted_separator: None,
             binary_sha256: super::sha256(binary),
         };

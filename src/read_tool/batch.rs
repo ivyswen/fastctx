@@ -6,7 +6,8 @@ use crate::budget::{READ_TOKEN_BUDGET_ENV, TokenBudget, estimate_tokens, tool_to
 use crate::encoding::canonical_encoding_label;
 use crate::model::ToolResponse;
 use crate::paths::{
-    canonical_existing, display_path, io_error_message, missing_read_file_message, parse_input_path,
+    canonical_existing, display_path, io_error_message, is_local_file_uri_input,
+    missing_read_file_message, parse_input_path, parse_local_path_input,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -69,9 +70,10 @@ pub(super) fn read_text_files(mut request: ReadRequest) -> ToolResponse {
             ));
         }
     }
-    if let Err(error) = validate_entries(&entries) {
-        return ToolResponse::error(error);
-    }
+    let entries = match validate_entries(entries) {
+        Ok(entries) => entries,
+        Err(error) => return ToolResponse::error(error),
+    };
     let budget = match tool_token_budget(READ_TOKEN_BUDGET_ENV) {
         Ok(budget) => budget,
         Err(error) => return ToolResponse::error(error),
@@ -79,16 +81,17 @@ pub(super) fn read_text_files(mut request: ReadRequest) -> ToolResponse {
     pack_entries(entries, budget)
 }
 
-fn validate_entries(entries: &[BatchReadEntry]) -> Result<(), String> {
+fn validate_entries(mut entries: Vec<BatchReadEntry>) -> Result<Vec<BatchReadEntry>, String> {
     let mut seen = HashSet::with_capacity(entries.len());
-    for entry in entries {
+    for entry in &mut entries {
         if entry.offset == Some(0) {
             return Err("Invalid offset value: 0. Expected an integer >= 1.".to_string());
         }
         if entry.limit == Some(0) {
             return Err("Invalid limit value: 0. Expected an integer >= 1.".to_string());
         }
-        let parsed = parse_input_path(&entry.path);
+        let from_uri = is_local_file_uri_input(&entry.path);
+        let parsed = parse_local_path_input(&entry.path)?;
         if let Some(encoding) = entry.encoding.as_deref()
             && let Err(rejection) = canonical_encoding_label(encoding)
         {
@@ -97,22 +100,36 @@ fn validate_entries(entries: &[BatchReadEntry]) -> Result<(), String> {
         // A relative entry is an existence problem, not a request-shape one, so it is
         // reported in its own segment and never discards its neighbors. Keeping it out
         // of canonicalization also stops it from resolving into a false duplicate.
-        let key_path = if parsed.is_absolute() {
-            canonical_existing(&parsed).unwrap_or(parsed)
+        // The URL crate may spell a Windows file URI with an 8.3 component even when the
+        // equivalent native input used its long name. Canonicalization expands that platform
+        // alias; Unix keeps the URI's lexical symlink spelling so it matches the plain input.
+        let normalized_input_path = if cfg!(windows) && parsed.is_absolute() {
+            canonical_existing(&parsed).unwrap_or_else(|_| parsed.clone())
         } else {
-            parsed
+            parsed.clone()
+        };
+        let normalized_input = display_path(&normalized_input_path);
+        let key_path = if parsed.is_absolute() {
+            canonical_existing(&parsed).unwrap_or_else(|_| parsed.clone())
+        } else {
+            parsed.clone()
         };
         let key = display_path(&key_path);
+        entry.path = if from_uri {
+            normalized_input
+        } else {
+            continuation_path(&entry.path)
+        };
         #[cfg(windows)]
         let key = key.to_ascii_lowercase();
         if !seen.insert(key) {
             return Err(format!(
                 "Duplicate path in files: {}. List each file once.",
-                continuation_path(&entry.path)
+                entry.path
             ));
         }
     }
-    Ok(())
+    Ok(entries)
 }
 
 fn pack_entries(entries: Vec<BatchReadEntry>, budget: TokenBudget) -> ToolResponse {
@@ -314,7 +331,7 @@ fn progress_after(
         return None;
     }
     Some(ContinuationEntry {
-        path: continuation_path(&entry.path),
+        path: entry.path.clone(),
         offset: Some(last.saturating_add(1)),
         limit: entry
             .limit
@@ -386,17 +403,17 @@ fn budget_too_small(budget: TokenBudget) -> ToolResponse {
     ))
 }
 
-fn continuation_path(input: &str) -> String {
-    display_path(&parse_input_path(input))
-}
-
 impl ContinuationEntry {
     fn from_request(entry: &BatchReadEntry) -> Self {
         Self {
-            path: continuation_path(&entry.path),
+            path: entry.path.clone(),
             offset: entry.offset,
             limit: entry.limit,
             encoding: entry.encoding.clone(),
         }
     }
+}
+
+fn continuation_path(input: &str) -> String {
+    display_path(&parse_input_path(input))
 }

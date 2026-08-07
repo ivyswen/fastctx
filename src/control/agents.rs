@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 const BEGIN_MARKER: &str = "<!-- fastctx:begin -->";
 const END_MARKER: &str = "<!-- fastctx:end -->";
+pub(crate) const MANAGED_SECTION_CONTRACT_ID: &str = "guidance-v3";
 const LEGACY_BEGIN_MARKER: &str = "<!-- fastread:begin -->";
 const LEGACY_END_MARKER: &str = "<!-- fastread:end -->";
 const LEGACY_FASTREAD_SECTION: &str = concat!(
@@ -18,15 +19,17 @@ const LEGACY_FASTREAD_SECTION: &str = concat!(
     "the exact parameters a `Partial` note provides.\n",
     "<!-- fastread:end -->"
 );
-const FILE_GUIDANCE: &str = concat!(
+const FILE_GUIDANCE_PREFIX: &str = concat!(
     "## Local file inspection\n",
     "\n",
     "For reading, searching, and finding local files, prefer the FastCtx MCP\n",
     "tools — `mcp__fastctx__read`, `mcp__fastctx__grep`, `mcp__fastctx__glob` —\n",
     "over `cat`/`Get-Content`, `rg`/`findstr`/`Select-String`, and `dir`/`ls -R`.\n",
+);
+const FILE_GUIDANCE_SUFFIX: &str = concat!(
     "Read only what the task needs. When you need several files, pass them to\n",
     "one read call as files=[{\"path\": ...}, ...] instead of one call per file.\n",
-    "Pass absolute paths. The last line of every result says `Complete` or\n",
+    "The last line of every result says `Complete` or\n",
     "`Partial` — continue only with the exact parameters a `Partial` note\n",
     "provides.\n",
     "\n",
@@ -38,6 +41,53 @@ const FILE_GUIDANCE: &str = concat!(
     "content, semantic rewrites, or small local edits.\n"
 );
 const SHELL_GUIDANCE: &str = concat!(
+    "### Shell commands\n",
+    "\n",
+    "Prefer `mcp__fastctx__run` over the built-in shell for terminal work: it\n",
+    "executes with bash (Git Bash on Windows), so always write POSIX bash —\n",
+    "never PowerShell syntax.\n",
+    "\n",
+    "Never pass `apply_patch` to `mcp__fastctx__run`: it is not a program and\n",
+    "no shell can run it. Reach it through Codex itself — as its own tool\n",
+    "call, or in Codex's built-in shell — never through the FastCtx tools.\n",
+    "\n",
+    "Commands must be non-interactive (no TTY): use flags like -y\n",
+    "or --no-edit, and expect editors/pagers to be disabled. For anything\n",
+    "that may outlast run's four-minute maximum, use\n",
+    "`mcp__fastctx__run_background`, check on it with\n",
+    "`mcp__fastctx__job_output`, and stop it with `mcp__fastctx__job_kill`.\n",
+    "Background jobs run independently of this session and survive restarts;\n",
+    "rediscover an earlier job with `mcp__fastctx__job_list` and read its\n",
+    "output by job_id. A non-zero exit code is a normal result. The last line\n",
+    "of every result says `Complete` or `Partial`.\n"
+);
+// Byte-frozen 0.2.2/0.2.3 guidance. This is comparison data only: it must never be
+// emitted except when replacing an exact on-disk match with the current section.
+const KNOWN_BAD_RESOURCE_ROUTING_FILE_GUIDANCE: &str = concat!(
+    "## Local file inspection\n",
+    "\n",
+    "For reading, searching, and finding local files, prefer the FastCtx MCP\n",
+    "tools — `mcp__fastctx__read`, `mcp__fastctx__grep`, `mcp__fastctx__glob` —\n",
+    "over `cat`/`Get-Content`, `rg`/`findstr`/`Select-String`, and `dir`/`ls -R`.\n",
+    "Read only what the task needs. When you need several files, pass them to\n",
+    "one read call as files=[{\"path\": ...}, ...] instead of one call per file.\n",
+    "Pass absolute paths. The last line of every result says `Complete` or\n",
+    "`Partial` — continue only with the exact parameters a `Partial` note\n",
+    "provides.\n",
+    "\n",
+    "Never point `read_mcp_resource`, `list_mcp_resources`, or\n",
+    "`list_mcp_resource_templates` at the `fastctx` server: FastCtx publishes\n",
+    "tools, not MCP resources, so those calls always fail. Read a local file\n",
+    "with `mcp__fastctx__read` and an absolute path — never a `file://` URI.\n",
+    "\n",
+    "### Batch replacement\n",
+    "\n",
+    "Use `mcp__fastctx__replace` for mechanical find-and-replace across files.\n",
+    "It preserves each file's encoding and line endings, supports dry-run previews,\n",
+    "and rejects concurrent changes before writing. Use apply_patch for generated\n",
+    "content, semantic rewrites, or small local edits.\n"
+);
+const KNOWN_BAD_RESOURCE_ROUTING_SHELL_GUIDANCE: &str = concat!(
     "### Shell commands\n",
     "\n",
     "Prefer `mcp__fastctx__run` over the built-in shell for terminal work: it\n",
@@ -85,33 +135,24 @@ pub(crate) struct SectionEdit {
     pub inserted_separator: Option<InsertedSeparator>,
 }
 
-/// Frozen guidance block written verbatim into the host's AGENTS.md so the
-/// model prefers these tools. Delimited by markers for idempotent replacement.
-pub const AGENTS_SECTION: &str = concat!(
-    "<!-- fastctx:begin -->\n",
-    "## Local file inspection\n",
-    "\n",
-    "For reading, searching, and finding local files, prefer the FastCtx MCP\n",
-    "tools — `mcp__fastctx__read`, `mcp__fastctx__grep`, `mcp__fastctx__glob` —\n",
-    "over `cat`/`Get-Content`, `rg`/`findstr`/`Select-String`, and `dir`/`ls -R`.\n",
-    "Read only what the task needs. When you need several files, pass them to\n",
-    "one read call as files=[{\"path\": ...}, ...] instead of one call per file.\n",
-    "Pass absolute paths. The last line of every result says `Complete` or\n",
-    "`Partial` — continue only with the exact parameters a `Partial` note\n",
-    "provides.\n\n",
-    "### Batch replacement\n\n",
-    "Use `mcp__fastctx__replace` for mechanical find-and-replace across files.\n",
-    "It preserves each file's encoding and line endings, supports dry-run previews,\n",
-    "and rejects concurrent changes before writing. Use apply_patch for generated\n",
-    "content, semantic rewrites, or small local edits.\n",
-    "<!-- fastctx:end -->"
-);
+/// Semantic state of the one managed section relative to the receipt's shell mode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedSectionState {
+    Current,
+    KnownLegacy,
+    Missing,
+    Drifted,
+    Malformed(String),
+}
 
 /// Builds the exact managed block for the optional shell group.
 pub fn section(fastshell_enabled: bool) -> String {
     let mut output = String::from(BEGIN_MARKER);
     output.push('\n');
-    output.push_str(FILE_GUIDANCE);
+    output.push_str(FILE_GUIDANCE_PREFIX);
+    output.push_str(crate::model_guidance::LOCAL_FILE_ROUTE_GUIDANCE);
+    output.push('\n');
+    output.push_str(FILE_GUIDANCE_SUFFIX);
     if fastshell_enabled {
         output.push('\n');
         output.push_str(SHELL_GUIDANCE);
@@ -227,6 +268,63 @@ pub fn has_exact_section_for(bytes: &[u8], fastshell_enabled: bool) -> Result<bo
         .unwrap_or(false))
 }
 
+pub(crate) fn classify_managed_section(
+    bytes: &[u8],
+    fastshell_enabled: bool,
+) -> ManagedSectionState {
+    let source = match std::str::from_utf8(bytes) {
+        Ok(source) => source,
+        Err(error) => {
+            return ManagedSectionState::Malformed(format!(
+                "AGENTS.md is not valid UTF-8: {error}"
+            ));
+        }
+    };
+    let Some((start, end)) = (match section_range(source) {
+        Ok(range) => range,
+        Err(error) => return ManagedSectionState::Malformed(error),
+    }) else {
+        return ManagedSectionState::Missing;
+    };
+    let managed = &source[start..end];
+    if managed == section(fastshell_enabled) {
+        ManagedSectionState::Current
+    } else if managed == known_legacy_section(fastshell_enabled) {
+        ManagedSectionState::KnownLegacy
+    } else {
+        ManagedSectionState::Drifted
+    }
+}
+
+pub(crate) fn refresh_known_legacy_section(
+    bytes: &[u8],
+    fastshell_enabled: bool,
+) -> Option<Vec<u8>> {
+    if classify_managed_section(bytes, fastshell_enabled) != ManagedSectionState::KnownLegacy {
+        return None;
+    }
+    let source = std::str::from_utf8(bytes).ok()?;
+    let (start, end) = section_range(source).ok()??;
+    let current = section(fastshell_enabled);
+    let mut output = Vec::with_capacity(bytes.len() + current.len() - (end - start));
+    output.extend_from_slice(&bytes[..start]);
+    output.extend_from_slice(current.as_bytes());
+    output.extend_from_slice(&bytes[end..]);
+    Some(output)
+}
+
+pub(crate) fn known_legacy_section(fastshell_enabled: bool) -> String {
+    let mut output = String::from(BEGIN_MARKER);
+    output.push('\n');
+    output.push_str(KNOWN_BAD_RESOURCE_ROUTING_FILE_GUIDANCE);
+    if fastshell_enabled {
+        output.push('\n');
+        output.push_str(KNOWN_BAD_RESOURCE_ROUTING_SHELL_GUIDANCE);
+    }
+    output.push_str(END_MARKER);
+    output
+}
+
 fn section_range(source: &str) -> Result<Option<(usize, usize)>, String> {
     marker_range(
         source,
@@ -296,9 +394,10 @@ fn marker_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENTS_SECTION, BEGIN_MARKER, END_MARKER, InsertedSeparator, LEGACY_FASTREAD_SECTION,
-        apply_section, apply_section_with_ownership, has_exact_section, remove_applied_section,
-        remove_section, section,
+        BEGIN_MARKER, END_MARKER, InsertedSeparator, LEGACY_FASTREAD_SECTION, ManagedSectionState,
+        apply_section, apply_section_with_ownership, classify_managed_section, has_exact_section,
+        known_legacy_section, refresh_known_legacy_section, remove_applied_section, remove_section,
+        section,
     };
     use crate::server_manifest::ToolManifest;
     use std::collections::BTreeSet;
@@ -313,7 +412,7 @@ mod tests {
         assert!(
             std::str::from_utf8(&applied)
                 .unwrap()
-                .contains(AGENTS_SECTION)
+                .contains(&section(false))
         );
     }
 
@@ -355,7 +454,7 @@ mod tests {
 
     #[test]
     fn remove_only_takes_the_marked_section() {
-        let applied = format!("before\n{AGENTS_SECTION}\nafter\n");
+        let applied = format!("before\n{}\nafter\n", section(false));
         assert_eq!(
             remove_section(applied.as_bytes()).unwrap(),
             b"before\nafter\n"
@@ -399,48 +498,18 @@ mod tests {
 
     #[test]
     fn shell_combinations_have_one_marker_pair_and_manifest_complete_guidance() {
-        let file = concat!(
-            "<!-- fastctx:begin -->\n",
-            "## Local file inspection\n\n",
-            "For reading, searching, and finding local files, prefer the FastCtx MCP\n",
-            "tools — `mcp__fastctx__read`, `mcp__fastctx__grep`, `mcp__fastctx__glob` —\n",
-            "over `cat`/`Get-Content`, `rg`/`findstr`/`Select-String`, and `dir`/`ls -R`.\n",
-            "Read only what the task needs. When you need several files, pass them to\n",
-            "one read call as files=[{\"path\": ...}, ...] instead of one call per file.\n",
-            "Pass absolute paths. The last line of every result says `Complete` or\n",
-            "`Partial` — continue only with the exact parameters a `Partial` note\n",
-            "provides.\n\n",
-            "### Batch replacement\n\n",
-            "Use `mcp__fastctx__replace` for mechanical find-and-replace across files.\n",
-            "It preserves each file's encoding and line endings, supports dry-run previews,\n",
-            "and rejects concurrent changes before writing. Use apply_patch for generated\n",
-            "content, semantic rewrites, or small local edits.\n",
+        let file_only = section(false);
+        let with_shell = section(true);
+        assert!(!file_only.contains("### Shell commands"));
+        assert!(with_shell.contains("### Shell commands"));
+        let file_guidance = file_only.strip_suffix(END_MARKER).unwrap();
+        assert!(with_shell.starts_with(file_guidance));
+        assert!(with_shell.ends_with(END_MARKER));
+        assert_eq!(
+            &with_shell[file_guidance.len()..][.."\n### Shell commands".len()],
+            "\n### Shell commands"
         );
-        let shell = concat!(
-            "\n### Shell commands\n\n",
-            "Prefer `mcp__fastctx__run` over the built-in shell for terminal work: it\n",
-            "executes with bash (Git Bash on Windows), so always write POSIX bash —\n",
-            "never PowerShell syntax.\n\n",
-            "Never pass `apply_patch` to `mcp__fastctx__run`: it is not a program and\n",
-            "no shell can run it. Reach it through Codex itself — as its own tool\n",
-            "call, or in Codex's built-in shell — never through the FastCtx tools.\n\n",
-            "Commands must be non-interactive (no TTY): use flags like -y\n",
-            "or --no-edit, and expect editors/pagers to be disabled. For anything\n",
-            "that may outlast run's four-minute maximum, use\n",
-            "`mcp__fastctx__run_background`, check on it with\n",
-            "`mcp__fastctx__job_output`, and stop it with `mcp__fastctx__job_kill`.\n",
-            "Background jobs run independently of this session and survive restarts;\n",
-            "rediscover an earlier job with `mcp__fastctx__job_list` and read its\n",
-            "output by job_id. A non-zero exit code is a normal result. The last line\n",
-            "of every result says `Complete` or `Partial`.\n",
-        );
-        let end = "<!-- fastctx:end -->";
-        for (fastshell, expected) in [
-            (false, format!("{file}{end}")),
-            (true, format!("{file}{shell}{end}")),
-        ] {
-            let actual = section(fastshell);
-            assert_eq!(actual, expected);
+        for (fastshell, actual) in [(false, file_only), (true, with_shell)] {
             assert_eq!(actual.matches(BEGIN_MARKER).count(), 1);
             assert_eq!(actual.matches(END_MARKER).count(), 1);
             let referenced = actual
@@ -454,6 +523,7 @@ mod tests {
                 .collect::<BTreeSet<_>>();
             assert_eq!(referenced, published);
             assert!(actual.contains("mcp__fastctx__replace"));
+            assert!(actual.contains(crate::model_guidance::LOCAL_FILE_ROUTE_GUIDANCE));
             for forbidden in [
                 "will be told",
                 "will be notified",
@@ -516,7 +586,77 @@ mod tests {
             }
             assert!(guidance.contains("prefer the FastCtx MCP"), "{guidance}");
             assert!(guidance.contains("`mcp__fastctx__read`"), "{guidance}");
+            for required in [
+                "directly for local-file operations",
+                "URI-shaped",
+                "plain absolute filesystem path",
+            ] {
+                assert!(guidance.contains(required), "{required}\n{guidance}");
+            }
         }
+    }
+
+    #[test]
+    fn v022_and_v023_resource_routing_blocks_are_frozen_and_only_exact_matches_migrate() {
+        use sha2::{Digest, Sha256};
+
+        for (fastshell, expected_len, expected_hash) in [
+            (
+                false,
+                1177,
+                "17da1a91024e98008f7979937e9c6b423c8b77556854082fc985922dfbf248a3",
+            ),
+            (
+                true,
+                2145,
+                "cf0ac5d64b9b9d615617a2d390a41625007bb0cf3ef1b968596585b8376f5b19",
+            ),
+        ] {
+            let legacy = known_legacy_section(fastshell);
+            assert_eq!(legacy.len(), expected_len);
+            assert_eq!(
+                hex::encode(Sha256::digest(legacy.as_bytes())),
+                expected_hash
+            );
+            assert_eq!(
+                classify_managed_section(legacy.as_bytes(), fastshell),
+                ManagedSectionState::KnownLegacy
+            );
+            assert_eq!(
+                classify_managed_section(section(fastshell).as_bytes(), fastshell),
+                ManagedSectionState::Current
+            );
+            assert_eq!(
+                classify_managed_section(legacy.as_bytes(), !fastshell),
+                ManagedSectionState::Drifted
+            );
+
+            let wrapped = format!("user prefix\n{legacy}\nuser suffix");
+            let refreshed = refresh_known_legacy_section(wrapped.as_bytes(), fastshell).unwrap();
+            assert_eq!(
+                refreshed,
+                format!("user prefix\n{}\nuser suffix", section(fastshell)).as_bytes()
+            );
+
+            let edited = legacy.replace("Never point", "User changed");
+            assert_eq!(
+                classify_managed_section(edited.as_bytes(), fastshell),
+                ManagedSectionState::Drifted
+            );
+            assert!(refresh_known_legacy_section(edited.as_bytes(), fastshell).is_none());
+        }
+
+        assert_eq!(
+            classify_managed_section(b"# user rules\n", false),
+            ManagedSectionState::Missing
+        );
+        assert!(matches!(
+            classify_managed_section(
+                b"<!-- fastctx:begin -->\n<!-- fastctx:begin -->\n<!-- fastctx:end -->",
+                false
+            ),
+            ManagedSectionState::Malformed(_)
+        ));
     }
 
     #[test]

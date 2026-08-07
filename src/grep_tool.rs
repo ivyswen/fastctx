@@ -68,7 +68,10 @@ pub enum OutputMode {
 pub struct GrepRequest {
     /// The regular expression to search for (Rust regex syntax; escape literal braces like `interface\{\}`).
     pub pattern: String,
-    /// Absolute path of the file or directory to search in. Omit for the session working directory.
+    /// File or directory to search; omit for the session working directory.
+    #[schemars(description = crate::model_guidance::local_path_description(
+        "File or directory to search. Omit for the session working directory."
+    ))]
     pub path: Option<String>,
     /// Glob pattern to filter files, e.g. "*.rs", "**/*.{ts,tsx}" (equivalent to rg --glob).
     pub glob: Option<String>,

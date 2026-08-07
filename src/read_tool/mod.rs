@@ -16,7 +16,8 @@ use crate::binary::detect_binary_type;
 use crate::budget::{READ_TOKEN_BUDGET_ENV, tool_token_budget};
 use crate::model::ToolResponse;
 use crate::paths::{
-    canonical_existing, display_path, io_error_message, missing_read_file_message, parse_input_path,
+    canonical_existing, display_path, io_error_message, missing_read_file_message,
+    parse_local_path_input,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -56,7 +57,10 @@ enum ViewMode {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadRequest {
-    /// The absolute path to the file to read. Both / and \ are accepted. Mutually exclusive with files.
+    /// File to read; mutually exclusive with files.
+    #[schemars(description = crate::model_guidance::local_path_description(
+        "File to read; both / and \\\\ are accepted. Mutually exclusive with files."
+    ))]
     pub file_path: Option<String>,
     /// Batch form: an array of {"path", "offset"?, "limit"?, "encoding"?} objects for
     /// reading 1-32 text files in one call. Each entry behaves like a single-file text read;
@@ -86,7 +90,10 @@ pub struct ReadRequest {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BatchReadEntry {
-    /// Absolute path of the text file. Both / and \ are accepted.
+    /// Text file to read.
+    #[schemars(description = crate::model_guidance::local_path_description(
+        "Text file to read; both / and \\\\ are accepted."
+    ))]
     pub path: String,
     /// The 1-based line number to start reading from.
     #[schemars(range(min = 1))]
@@ -111,14 +118,18 @@ pub fn read_file(request: ReadRequest) -> ToolResponse {
         .file_path
         .as_deref()
         .expect("single-file shape was validated");
-    let parsed = parse_input_path(file_path);
+    let parsed = match parse_local_path_input(file_path) {
+        Ok(path) => path,
+        Err(message) => return ToolResponse::error(message),
+    };
+    let input_display = display_path(&parsed);
     if !parsed.is_absolute() {
-        return ToolResponse::error(missing_read_file_message(file_path));
+        return ToolResponse::error(missing_read_file_message(&input_display));
     }
     let metadata = match fs::metadata(&parsed) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ToolResponse::error(missing_read_file_message(file_path));
+            return ToolResponse::error(missing_read_file_message(&input_display));
         }
         Err(error) => return ToolResponse::error(io_error_message(&parsed, &error)),
     };

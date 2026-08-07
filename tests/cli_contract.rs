@@ -590,7 +590,11 @@ fn noninteractive_apply_is_idempotent_and_unapply_restores_user_files() {
     assert!(drift_text.contains("Next:"), "{drift_text}");
     std::fs::write(codex.join("config.toml"), applied_bytes).unwrap();
     assert!(
-        status_text.contains("[PASS] MCP handshake"),
+        status_text.contains("[PASS] MCP server contract"),
+        "{status_text}"
+    );
+    assert!(
+        status_text.contains("[INFO] Model tool surface") && status_text.contains("Unverified:"),
         "{status_text}"
     );
 
@@ -977,7 +981,9 @@ fn apply_status_and_unapply_cover_both_shell_states() {
             .unwrap();
         assert_success(&status);
         let status = String::from_utf8_lossy(&status.stdout);
-        assert!(status.contains("[PASS] MCP handshake"), "{status}");
+        assert!(status.contains("[PASS] MCP server contract"), "{status}");
+        assert!(status.contains("[INFO] Model tool surface"), "{status}");
+        assert!(status.contains("Unverified:"), "{status}");
         let prefix = if fastshell { "[PASS]" } else { "[INFO]" };
         assert!(status.contains(&format!("{prefix} fastshell")), "{status}");
         assert!(!status.contains("fastshell bash"), "{status}");

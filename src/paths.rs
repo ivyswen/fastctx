@@ -13,6 +13,101 @@ pub fn parse_input_path(input: &str) -> PathBuf {
     }
 }
 
+/// Accepts either a plain path or a strictly local file URI and returns a native path.
+///
+/// URI normalization is deliberately limited to the `file` scheme. Other schemes and
+/// ambiguous file-URI shapes fail before filesystem lookup so callers never guess a path.
+pub(crate) fn parse_local_path_input(input: &str) -> Result<PathBuf, String> {
+    let Some(scheme) = uri_scheme(input) else {
+        return Ok(parse_input_path(input));
+    };
+    if scheme.len() == 1
+        && input
+            .as_bytes()
+            .get(scheme.len() + 1)
+            .is_some_and(|byte| matches!(*byte, b'/' | b'\\'))
+    {
+        return Ok(parse_input_path(input));
+    }
+    if !scheme.eq_ignore_ascii_case("file") {
+        return Err(format!(
+            "Unsupported URI scheme \"{}\" for a local filesystem path.",
+            scheme.to_ascii_lowercase()
+        ));
+    }
+    if !input[scheme.len() + 1..].starts_with("//") {
+        return Err(
+            "Invalid local file URI: expected an absolute URI with a local authority.".to_string(),
+        );
+    }
+    if !has_valid_percent_escapes(input) {
+        return Err("Invalid local file URI: malformed percent escape.".to_string());
+    }
+
+    let uri =
+        url::Url::parse(input).map_err(|error| format!("Invalid local file URI: {error}."))?;
+    if !uri.username().is_empty() || uri.password().is_some() || uri.port().is_some() {
+        return Err(
+            "Invalid local file URI: user information and ports are not supported.".to_string(),
+        );
+    }
+    if uri.query().is_some() || uri.fragment().is_some() {
+        return Err(
+            "Invalid local file URI: query and fragment components are not supported.".to_string(),
+        );
+    }
+    if uri
+        .host_str()
+        .is_some_and(|host| !host.eq_ignore_ascii_case("localhost"))
+    {
+        return Err("Invalid local file URI: remote authorities are not supported.".to_string());
+    }
+
+    let path = uri.to_file_path().map_err(|_| {
+        "Invalid local file URI: it cannot be represented as a local filesystem path.".to_string()
+    })?;
+    if path.as_os_str().to_string_lossy().contains('\0') {
+        return Err("Invalid local file URI: the decoded path contains a NUL byte.".to_string());
+    }
+    if !path.is_absolute() {
+        return Err("Invalid local file URI: the decoded path is not absolute.".to_string());
+    }
+    Ok(path)
+}
+
+pub(crate) fn is_local_file_uri_input(input: &str) -> bool {
+    uri_scheme(input).is_some_and(|scheme| scheme.eq_ignore_ascii_case("file"))
+}
+
+fn uri_scheme(input: &str) -> Option<&str> {
+    let end = input.find(':')?;
+    let scheme = &input[..end];
+    let mut bytes = scheme.bytes();
+    bytes.next()?.is_ascii_alphabetic().then_some(())?;
+    bytes
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        .then_some(scheme)
+}
+
+fn has_valid_percent_escapes(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        let Some(pair) = bytes.get(index + 1..index + 3) else {
+            return false;
+        };
+        if !pair.iter().all(u8::is_ascii_hexdigit) {
+            return false;
+        }
+        index += 3;
+    }
+    true
+}
+
 /// Returns an absolute display path that never depends on platform backslashes.
 pub fn display_path(path: &Path) -> String {
     let mut value = path.to_string_lossy().replace('\\', "/");
@@ -201,7 +296,79 @@ pub fn missing_search_path_message(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_url_note, missing_file_message, missing_search_path_message};
+    use super::{
+        display_path, file_url_note, missing_file_message, missing_search_path_message,
+        parse_input_path, parse_local_path_input,
+    };
+
+    #[test]
+    fn local_file_uri_input_round_trips_and_rejects_every_ambiguous_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("space 中文.txt");
+        let plain = display_path(&path);
+        assert_eq!(
+            parse_local_path_input(&plain).unwrap(),
+            parse_input_path(&plain)
+        );
+
+        let uri = url::Url::from_file_path(&path).unwrap().to_string();
+        assert!(uri.contains("%20"), "{uri}");
+        assert_eq!(parse_local_path_input(&uri).unwrap(), path);
+        let mut uppercase = uri.clone();
+        uppercase.replace_range(..4, "FILE");
+        assert_eq!(parse_local_path_input(&uppercase).unwrap(), path);
+        let localhost = uri.replacen("file:///", "file://LOCALHOST/", 1);
+        assert_eq!(parse_local_path_input(&localhost).unwrap(), path);
+
+        for (input, expected) in [
+            (
+                "https://example.invalid/file.txt",
+                "Unsupported URI scheme \"https\" for a local filesystem path.",
+            ),
+            (
+                "app://connector/file.txt",
+                "Unsupported URI scheme \"app\" for a local filesystem path.",
+            ),
+            (
+                "file:relative.txt",
+                "Invalid local file URI: expected an absolute URI with a local authority.",
+            ),
+            (
+                "file:///tmp/bad%ZZ.txt",
+                "Invalid local file URI: malformed percent escape.",
+            ),
+            (
+                "file://server/share/file.txt",
+                "Invalid local file URI: remote authorities are not supported.",
+            ),
+            (
+                "file:///tmp/file.txt?query",
+                "Invalid local file URI: query and fragment components are not supported.",
+            ),
+            (
+                "file:///tmp/file.txt#fragment",
+                "Invalid local file URI: query and fragment components are not supported.",
+            ),
+        ] {
+            assert_eq!(
+                parse_local_path_input(input).unwrap_err(),
+                expected,
+                "{input}"
+            );
+        }
+        for input in [
+            "file://user@localhost/tmp/file.txt",
+            "file://localhost:80/tmp/file.txt",
+            "file:///tmp/nul%00.txt",
+        ] {
+            let error = parse_local_path_input(input).unwrap_err();
+            assert!(
+                error.starts_with("Invalid local file URI:"),
+                "{input}: {error}"
+            );
+            assert!(!error.contains(input), "the raw URI leaked into: {error}");
+        }
+    }
 
     #[test]
     fn file_urls_are_translated_to_the_plain_path() {

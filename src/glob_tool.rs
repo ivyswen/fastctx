@@ -53,7 +53,10 @@ pub enum SortMode {
 pub struct GlobRequest {
     /// The glob pattern to match files against, e.g. "**/*.rs".
     pub pattern: String,
-    /// Absolute path of the directory to search in. Omit for the session working directory. Must be a valid directory if provided.
+    /// Directory to search; omit for the session working directory.
+    #[schemars(description = crate::model_guidance::local_path_description(
+        "Directory to search. Omit for the session working directory; when provided, it must name an existing directory."
+    ))]
     pub path: Option<String>,
     /// "project" respects .gitignore/.ignore, includes hidden files, excludes .git (same traversal as grep). "all" disables all filtering.
     pub filter_mode: Option<FilterMode>,

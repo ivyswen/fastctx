@@ -85,6 +85,13 @@ fn literal_canonical_token_is_outer_encoded_and_decoded_once() {
         text(grep_files(grep_request(outer.clone()))),
         format!("{outer}\n\n(Complete: all 1 file shown.)")
     );
+    let uri = url::Url::from_file_path(&canonical_literal)
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        text(grep_files(grep_request(uri))),
+        format!("{outer}\n\n(Complete: all 1 file shown.)")
+    );
 }
 
 #[test]

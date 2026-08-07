@@ -607,7 +607,7 @@ fn render_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // already names that, and the one thing the menu cannot otherwise show is whether FastCtx is
     // still connected to the host with the guidance this build writes.
     let mut details = vec![link_status_line(app)];
-    if app.link_state == LinkState::Stale {
+    if app.link_state.requires_apply() {
         details.push(Line::styled(
             messages.link_state_stale_hint,
             Style::default().fg(theme::muted()),
@@ -659,7 +659,12 @@ fn link_status_line(app: &App) -> Line<'static> {
     let (symbol, text, colour) = match app.link_state {
         LinkState::Absent => ("○", messages.link_state_absent, theme::accent()),
         LinkState::Current => ("✓", messages.link_state_current, theme::success()),
-        LinkState::Stale => ("!", messages.link_state_stale, theme::warning()),
+        LinkState::ApplyRequired
+        | LinkState::KnownLegacy
+        | LinkState::Missing
+        | LinkState::Drifted
+        | LinkState::Malformed
+        | LinkState::Unreadable => ("!", messages.link_state_stale, theme::warning()),
     };
     Line::styled(
         format!("{symbol} {text}"),
@@ -732,40 +737,46 @@ fn render_apply_home(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         chunks[0],
         &mut state,
     );
-    frame.render_widget(
-        Paragraph::new(vec![
-            link_status_line(app),
-            Line::raw(""),
-            Line::from(vec![
-                Span::styled(
-                    format!("{}  ", messages.tier_label),
-                    Style::default().fg(theme::muted()),
-                ),
-                Span::styled(
-                    app.settings.tier.display_name(),
-                    Style::default()
-                        .fg(tier_color(app.settings.tier))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(
-                        "  {} / {}",
-                        app.settings.tier.host_limit(),
-                        app.settings.tier.fastctx_budget()
-                    ),
-                    Style::default().fg(theme::muted()),
-                ),
-            ]),
-            detail_line("read", &budget_summary(saved_budgets.read, saved_global)),
-            detail_line("grep", &budget_summary(saved_budgets.grep, saved_global)),
-            detail_line("glob", &budget_summary(saved_budgets.glob, saved_global)),
-            detail_line("run", &budget_summary(saved_budgets.run, saved_global)),
-            detail_line(
-                "job_output",
-                &budget_summary(saved_budgets.job_output, saved_global),
+    let mut details = vec![link_status_line(app)];
+    if app.link_state.requires_apply() {
+        details.push(Line::styled(
+            messages.link_state_stale_hint,
+            Style::default().fg(theme::muted()),
+        ));
+    }
+    details.extend([
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                format!("{}  ", messages.tier_label),
+                Style::default().fg(theme::muted()),
             ),
-        ])
-        .block(panel(messages.config_title)),
+            Span::styled(
+                app.settings.tier.display_name(),
+                Style::default()
+                    .fg(tier_color(app.settings.tier))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  {} / {}",
+                    app.settings.tier.host_limit(),
+                    app.settings.tier.fastctx_budget()
+                ),
+                Style::default().fg(theme::muted()),
+            ),
+        ]),
+        detail_line("read", &budget_summary(saved_budgets.read, saved_global)),
+        detail_line("grep", &budget_summary(saved_budgets.grep, saved_global)),
+        detail_line("glob", &budget_summary(saved_budgets.glob, saved_global)),
+        detail_line("run", &budget_summary(saved_budgets.run, saved_global)),
+        detail_line(
+            "job_output",
+            &budget_summary(saved_budgets.job_output, saved_global),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(details).block(panel(messages.config_title)),
         chunks[1],
     );
 }
@@ -3086,6 +3097,15 @@ fn render_narrow(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             truncate_end(&text, usize::from(area.width.saturating_sub(4))),
             status.style,
         ));
+        if app.link_state.requires_apply() {
+            lines.push(Line::styled(
+                truncate_end(
+                    app.messages().link_state_stale_hint,
+                    usize::from(area.width.saturating_sub(4)),
+                ),
+                Style::default().fg(theme::warning()),
+            ));
+        }
     }
     if app.screen == Screen::Update {
         let detail = match &app.update_state {
@@ -3424,7 +3444,8 @@ fn localized_check_name<'a>(app: &'a App, name: &'a str) -> &'a str {
         "Applied state" => app.messages().menu_apply,
         "Provider output guard" => app.guard_messages().label,
         "Installed binary" => "FastCtx",
-        "MCP handshake" => "MCP",
+        "MCP server contract" => "FastCtx MCP",
+        "Model tool surface" => "Codex ↔ FastCtx",
         "AGENTS guidance" => "AGENTS.md",
         "Search CPU limit" => app.config_messages().cpu_limit_label,
         "fastshell" => app.messages().fastshell_label,
@@ -3576,8 +3597,8 @@ mod tests {
     use crate::tui::jobs::{JobsDetail, JobsState};
     use crate::tui::theme::{self, ColorMode, Theme};
     use crate::update::{
-        CheckFailure, CheckFailureKind, NpmDiscovery, NpmRegistryProbe, NpmVersionAuthority,
-        StartupUpdate, UpdatePlan,
+        CheckFailure, CheckFailureKind, FinalizeGuidanceOutcome, FinalizeNotice, FinalizeOutcome,
+        NpmDiscovery, NpmRegistryProbe, NpmVersionAuthority, StartupUpdate, UpdatePlan,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
@@ -3758,6 +3779,33 @@ mod tests {
                     "{width}x{height} missing {expected}\n{text}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn finalized_guidance_refresh_keeps_the_apply_action_visible_in_narrow_toasts() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ControlPaths::for_home(temp.path());
+        let mut app = App::load_with_startup(
+            paths,
+            StartupUpdate::None,
+            Some(FinalizeNotice {
+                version: "9.8.7".to_string(),
+                outcome: FinalizeOutcome::Updated,
+                guidance: FinalizeGuidanceOutcome::Refreshed,
+            }),
+        )
+        .unwrap();
+
+        for (width, height) in [(100, 24), (40, 9)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                contains_visible_text(&text, "fastctx apply"),
+                "{width}x{height} hid the remaining Apply action\n{text}"
+            );
         }
     }
 
@@ -4978,10 +5026,9 @@ mod tests {
         }
     }
 
-    /// Upgrades replace the binary but never rewrite the host's AGENTS.md, so a stale install and
-    /// a current one are indistinguishable unless the menu says so. These three lines are the
-    /// whole remedy: the state, what to do about it, and the fact that closing this terminal does
-    /// not stop anything.
+    /// The menu collapses detailed guidance failures into one action, while Status keeps their
+    /// individual causes. Every incomplete owned state must still name the command that finishes
+    /// the connection, including in the minimum-width layout.
     #[test]
     fn the_main_menu_reports_the_connection_state_and_that_it_can_be_closed() {
         let temp = tempfile::tempdir().unwrap();
@@ -5002,10 +5049,15 @@ mod tests {
             .take(20)
             .collect::<String>();
 
-        for (state, expected) in [
-            (LinkState::Absent, messages.link_state_absent),
-            (LinkState::Current, messages.link_state_current),
-            (LinkState::Stale, messages.link_state_stale),
+        for (state, expected, requires_apply) in [
+            (LinkState::Absent, messages.link_state_absent, false),
+            (LinkState::Current, messages.link_state_current, false),
+            (LinkState::ApplyRequired, messages.link_state_stale, true),
+            (LinkState::KnownLegacy, messages.link_state_stale, true),
+            (LinkState::Missing, messages.link_state_stale, true),
+            (LinkState::Drifted, messages.link_state_stale, true),
+            (LinkState::Malformed, messages.link_state_stale, true),
+            (LinkState::Unreadable, messages.link_state_stale, true),
         ] {
             app.link_state = state;
             // The compact layout drops the panel, so the state has to survive there too.
@@ -5017,6 +5069,11 @@ mod tests {
                 assert!(
                     contains_visible_text(&text, expected),
                     "{state:?} missing {expected} at {width}x{height}\n{text}"
+                );
+                assert_eq!(
+                    contains_visible_text(&text, "fastctx apply"),
+                    requires_apply,
+                    "{state:?} action at {width}x{height}\n{text}"
                 );
             }
 
@@ -5030,8 +5087,8 @@ mod tests {
             );
             assert_eq!(
                 contains_visible_text(&text, &hint_prefix),
-                state == LinkState::Stale,
-                "{state:?} shows the reconnect hint only when the block is stale\n{text}"
+                requires_apply,
+                "{state:?} shows the reconnect hint exactly when Apply remains\n{text}"
             );
         }
     }
@@ -5349,6 +5406,47 @@ mod tests {
         assert_eq!(symbol_color(&terminal, "✓"), palette.success);
         assert_eq!(symbol_color(&terminal, "○"), palette.muted);
         assert_eq!(symbol_color(&terminal, "×"), palette.danger);
+    }
+
+    #[test]
+    fn status_separates_the_fastctx_server_contract_from_model_tool_exposure() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = ControlPaths::for_home(temp.path());
+        let executable = temp.path().join("source");
+        std::fs::write(&executable, b"binary").unwrap();
+        let mut app = App::for_test(paths, executable);
+        app.settings.language = Some("en".to_string());
+        app.language = Language::En;
+        app.screen = Screen::Status;
+        app.status = crate::tui::app::StatusState::Ready(DoctorReport {
+            checks: vec![
+                DoctorCheck {
+                    name: "MCP server contract",
+                    status: DoctorCheckStatus::Pass,
+                    detail: "Server contract passed; model exposure is not proven.".to_string(),
+                    remedy: None,
+                },
+                DoctorCheck {
+                    name: "Model tool surface",
+                    status: DoctorCheckStatus::Info,
+                    detail: "Unverified: make one direct FastCtx tool call.".to_string(),
+                    remedy: None,
+                },
+            ],
+        });
+
+        for (width, height) in [(100, 24), (40, 10)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            for expected in ["FastCtx MCP", "Codex ↔ FastCtx", "Unverified"] {
+                assert!(
+                    contains_visible_text(&text, expected),
+                    "{width}x{height} merged or hid {expected}\n{text}"
+                );
+            }
+        }
     }
 
     #[test]

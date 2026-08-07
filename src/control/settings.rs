@@ -668,6 +668,9 @@ pub struct AppliedRecord {
     pub codex_config: ManagedFileRecord,
     /// Ownership receipt for Codex AGENTS.md.
     pub codex_agents: ManagedFileRecord,
+    /// Managed-section contract recorded by an explicit Apply; absent in older receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents_contract_id: Option<String>,
     /// Leading AGENTS separator inserted by the first Apply, used as reverse-operation ownership evidence only without drift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_agents_inserted_separator: Option<InsertedSeparator>,
@@ -1960,6 +1963,7 @@ mod tests {
             codex_dir_created: true,
             codex_config: managed("config.toml"),
             codex_agents: managed("AGENTS.md"),
+            agents_contract_id: None,
             codex_agents_inserted_separator: None,
             binary_sha256: "binary-hash".to_string(),
         };
@@ -2072,6 +2076,11 @@ mod tests {
         let settings = load_from(&path).unwrap();
         assert!(settings.fastedit.enabled);
         assert!(settings.applied.as_ref().unwrap().fastedit_enabled);
+        assert_eq!(
+            settings.applied.as_ref().unwrap().agents_contract_id,
+            None,
+            "an older receipt without the optional guidance contract must remain readable"
+        );
         let encoded = String::from_utf8(encode(&settings).unwrap()).unwrap();
         assert!(!encoded.contains("fastedit"), "{encoded}");
     }

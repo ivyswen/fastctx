@@ -15,6 +15,7 @@ pub mod glob_tool;
 pub(crate) mod grep_sink;
 pub mod grep_tool;
 pub mod model;
+pub(crate) mod model_guidance;
 pub(crate) mod operation;
 pub(crate) mod ordered_window;
 pub(crate) mod path_codec;

@@ -20,7 +20,10 @@ pub struct ReplaceRequest {
     pub pattern: String,
     /// Replacement text; $1/${name} reference groups, $$ is a literal $, empty deletes the match.
     pub replacement: String,
-    /// Absolute path of the file or directory to edit.
+    /// File or directory to edit.
+    #[schemars(description = crate::model_guidance::local_path_description(
+        "File or directory to edit."
+    ))]
     pub path: String,
     /// Glob filter for directory targets, e.g. "*.rs", "**/*.{ts,tsx}".
     pub glob: Option<String>,

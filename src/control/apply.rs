@@ -206,6 +206,15 @@ pub(crate) enum AppliedBinarySync {
     Updated,
 }
 
+/// Result of the independent best-effort AGENTS refresh performed after a product update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AppliedGuidanceSync {
+    NotApplied,
+    Current,
+    Refreshed,
+    ApplyRequired(agents::ManagedSectionState),
+}
+
 /// Advances an owned stable binary and its receipt without changing shared Codex files.
 pub(crate) fn synchronize_applied_binary(
     paths: &ControlPaths,
@@ -262,6 +271,59 @@ pub(crate) fn synchronize_applied_binary(
     ];
     transaction::commit(&changes)?;
     Ok(AppliedBinarySync::Updated)
+}
+
+/// Replaces only an exact 0.2.2/0.2.3 managed block, without changing the Apply receipt.
+pub(crate) fn synchronize_applied_guidance(
+    paths: &ControlPaths,
+) -> Result<AppliedGuidanceSync, String> {
+    let settings = settings::load(paths)?;
+    let Some(record) = settings.applied.as_ref() else {
+        return Ok(AppliedGuidanceSync::NotApplied);
+    };
+    if !record.targets_codex_profile(paths) {
+        return Err(receipt_profile_mismatch(paths, record));
+    }
+    let Some(original) = transaction::read_snapshot(&paths.codex_agents)? else {
+        return Ok(AppliedGuidanceSync::ApplyRequired(
+            agents::ManagedSectionState::Missing,
+        ));
+    };
+    let state = agents::classify_managed_section(&original, record.fastshell_enabled);
+    match state {
+        agents::ManagedSectionState::Current
+            if record.agents_contract_id.as_deref()
+                == Some(agents::MANAGED_SECTION_CONTRACT_ID) =>
+        {
+            Ok(AppliedGuidanceSync::Current)
+        }
+        agents::ManagedSectionState::Current => Ok(AppliedGuidanceSync::ApplyRequired(
+            agents::ManagedSectionState::Current,
+        )),
+        agents::ManagedSectionState::KnownLegacy if record.agents_contract_id.is_some() => {
+            // Released legacy receipts predate this field. Any stamped receipt paired with legacy
+            // bytes is post-Apply drift, so preserve it and keep the required action visible.
+            Ok(AppliedGuidanceSync::ApplyRequired(
+                agents::ManagedSectionState::KnownLegacy,
+            ))
+        }
+        agents::ManagedSectionState::KnownLegacy => {
+            let refreshed =
+                agents::refresh_known_legacy_section(&original, record.fastshell_enabled).expect(
+                    "an exact known legacy classification must produce its current replacement",
+                );
+            let change = file_write(
+                paths.codex_agents.clone(),
+                Some(original),
+                refreshed,
+                transaction::existing_unix_mode(&paths.codex_agents).or(Some(0o600)),
+                false,
+            );
+            transaction::commit(&[change])?;
+            Ok(AppliedGuidanceSync::Refreshed)
+        }
+        state => Ok(AppliedGuidanceSync::ApplyRequired(state)),
+    }
 }
 
 /// Computes the complete immutable Apply plan without writing to disk.
@@ -421,6 +483,7 @@ pub fn plan_apply(paths: &ControlPaths, options: ApplyOptions) -> Result<ApplyPl
                 &agents_bytes,
                 previous_applied.as_ref().map(|record| &record.codex_agents),
             ),
+            agents_contract_id: Some(agents::MANAGED_SECTION_CONTRACT_ID.to_string()),
             codex_agents_inserted_separator: agents_inserted_separator,
             binary_sha256: binary_hash,
         });
@@ -917,6 +980,7 @@ fn record_matches(record: &AppliedRecord, context: &RecordMatchContext<'_>) -> b
         && record.codex_agents.path == crate::paths::display_path(&paths.codex_agents)
         && record.binary_sha256 == *binary_hash
         && record.codex_agents.applied_sha256 == sha256(agents_bytes)
+        && record.agents_contract_id.as_deref() == Some(agents::MANAGED_SECTION_CONTRACT_ID)
         && record.codex_agents_inserted_separator == *agents_inserted_separator
 }
 
@@ -1308,10 +1372,10 @@ fn find_stale_binaries(
 #[cfg(test)]
 mod tests {
     use super::{
-        AppliedBinarySync, ApplyOptions, PreviewAction, PreviewTarget, UnapplyOptions,
-        commit_apply, commit_unapply, plan_apply, plan_unapply, synchronize_applied_binary,
+        AppliedBinarySync, AppliedGuidanceSync, ApplyOptions, PreviewAction, PreviewTarget,
+        UnapplyOptions, commit_apply, commit_unapply, plan_apply, plan_unapply,
+        synchronize_applied_binary, synchronize_applied_guidance,
     };
-    use crate::control::agents::AGENTS_SECTION;
     use crate::control::paths::ControlPaths;
     use crate::control::settings::{Tier, ToolBudgetLevel, ToolBudgetPreferences};
     use std::path::Path;
@@ -1598,6 +1662,152 @@ mod tests {
             std::fs::read(&paths.installed_binary).unwrap(),
             b"user replacement"
         );
+    }
+
+    #[test]
+    fn product_update_refreshes_only_the_known_bad_managed_block_and_keeps_apply_pending() {
+        for fastshell_enabled in [false, true] {
+            let (_temp, paths, executable) = fixture();
+            std::fs::write(&paths.codex_agents, b"user prefix\n").unwrap();
+            let mut apply_options = options(executable.clone());
+            apply_options.fastshell_enabled = fastshell_enabled;
+            commit_apply(plan_apply(&paths, apply_options).unwrap(), true).unwrap();
+
+            let current = crate::control::agents::section(fastshell_enabled);
+            let legacy = crate::control::agents::known_legacy_section(fastshell_enabled);
+            let applied = std::fs::read_to_string(&paths.codex_agents).unwrap();
+            assert!(applied.contains(&current));
+            let legacy_bytes = format!(
+                "{}\nuser suffix\n",
+                applied
+                    .replacen(&current, &legacy, 1)
+                    .trim_end_matches('\n')
+            )
+            .into_bytes();
+            std::fs::write(&paths.codex_agents, &legacy_bytes).unwrap();
+
+            let mut settings = crate::control::settings::load(&paths).unwrap();
+            let record = settings.applied.as_mut().unwrap();
+            record.agents_contract_id = None;
+            record.codex_agents.applied_sha256 = super::sha256(&legacy_bytes);
+            let settings_bytes = crate::control::settings::encode(&settings).unwrap();
+            std::fs::write(&paths.fastctx_config, &settings_bytes).unwrap();
+
+            assert_eq!(
+                synchronize_applied_guidance(&paths).unwrap(),
+                AppliedGuidanceSync::Refreshed
+            );
+            let expected = legacy_bytes
+                .windows(legacy.len())
+                .position(|window| window == legacy.as_bytes())
+                .map(|start| {
+                    let mut bytes = Vec::new();
+                    bytes.extend_from_slice(&legacy_bytes[..start]);
+                    bytes.extend_from_slice(current.as_bytes());
+                    bytes.extend_from_slice(&legacy_bytes[start + legacy.len()..]);
+                    bytes
+                })
+                .unwrap();
+            assert_eq!(std::fs::read(&paths.codex_agents).unwrap(), expected);
+            assert_eq!(
+                std::fs::read(&paths.fastctx_config).unwrap(),
+                settings_bytes
+            );
+            assert_eq!(
+                crate::control::settings::load(&paths)
+                    .unwrap()
+                    .applied
+                    .unwrap()
+                    .agents_contract_id,
+                None,
+                "an automatic block refresh must not impersonate a complete Apply"
+            );
+            assert_eq!(
+                synchronize_applied_guidance(&paths).unwrap(),
+                AppliedGuidanceSync::ApplyRequired(
+                    crate::control::agents::ManagedSectionState::Current
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn product_update_never_reclaims_unowned_or_post_apply_guidance_drift() {
+        let (_temp, paths, executable) = fixture();
+        let legacy = crate::control::agents::known_legacy_section(false);
+        std::fs::create_dir_all(&paths.codex_dir).unwrap();
+        std::fs::write(&paths.codex_agents, &legacy).unwrap();
+        assert_eq!(
+            synchronize_applied_guidance(&paths).unwrap(),
+            AppliedGuidanceSync::NotApplied
+        );
+        assert_eq!(
+            std::fs::read(&paths.codex_agents).unwrap(),
+            legacy.as_bytes()
+        );
+
+        commit_apply(plan_apply(&paths, options(executable)).unwrap(), true).unwrap();
+        for (bytes, expected) in [
+            (
+                legacy.as_bytes().to_vec(),
+                crate::control::agents::ManagedSectionState::KnownLegacy,
+            ),
+            (
+                b"# user removed the managed block\n".to_vec(),
+                crate::control::agents::ManagedSectionState::Missing,
+            ),
+            (
+                legacy.replace("Never point", "User changed").into_bytes(),
+                crate::control::agents::ManagedSectionState::Drifted,
+            ),
+            (
+                b"<!-- fastctx:begin -->\n<!-- fastctx:begin -->\n<!-- fastctx:end -->"
+                    .to_vec(),
+                crate::control::agents::ManagedSectionState::Malformed(
+                    "AGENTS.md contains duplicate or unmatched fastctx markers. Repair the marker block manually and retry.".to_string(),
+                ),
+            ),
+        ] {
+            std::fs::write(&paths.codex_agents, &bytes).unwrap();
+            assert_eq!(
+                synchronize_applied_guidance(&paths).unwrap(),
+                AppliedGuidanceSync::ApplyRequired(expected)
+            );
+            assert_eq!(std::fs::read(&paths.codex_agents).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn product_update_guidance_write_failure_is_explicit_and_leaves_bytes_unchanged() {
+        let (_temp, paths, executable) = fixture();
+        commit_apply(plan_apply(&paths, options(executable)).unwrap(), true).unwrap();
+        let current = crate::control::agents::section(false);
+        let legacy = crate::control::agents::known_legacy_section(false);
+        let bytes = std::fs::read_to_string(&paths.codex_agents)
+            .unwrap()
+            .replacen(&current, &legacy, 1)
+            .into_bytes();
+        std::fs::write(&paths.codex_agents, &bytes).unwrap();
+        let mut settings = crate::control::settings::load(&paths).unwrap();
+        settings.applied.as_mut().unwrap().agents_contract_id = None;
+        std::fs::write(
+            &paths.fastctx_config,
+            crate::control::settings::encode(&settings).unwrap(),
+        )
+        .unwrap();
+        let original_permissions = std::fs::metadata(&paths.codex_agents)
+            .unwrap()
+            .permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&paths.codex_agents, readonly).unwrap();
+
+        let result = synchronize_applied_guidance(&paths);
+
+        std::fs::set_permissions(&paths.codex_agents, original_permissions).unwrap();
+        let error = result.unwrap_err();
+        assert!(error.contains("read-only file"), "{error}");
+        assert_eq!(std::fs::read(&paths.codex_agents).unwrap(), bytes);
     }
 
     #[test]
@@ -2029,7 +2239,7 @@ mod tests {
 
         commit_apply(plan_apply(&paths, options(executable)).unwrap(), true).unwrap();
 
-        let mut expected = AGENTS_SECTION.as_bytes().to_vec();
+        let mut expected = crate::control::agents::section(false).into_bytes();
         expected.push(b'\n');
         assert_eq!(std::fs::read(&paths.codex_agents).unwrap(), expected);
     }

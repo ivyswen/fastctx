@@ -4,7 +4,10 @@ use super::model::{
     NPMMIRROR_REGISTRY, NpmDriver, NpmMode, NpmProvenance, NpmVersionAuthority,
     OFFICIAL_NPM_REGISTRY, UpdatePlan, UpdateRequest,
 };
-use crate::control::apply::{AppliedBinarySync, synchronize_applied_binary};
+use crate::control::apply::{
+    AppliedBinarySync, AppliedGuidanceSync, synchronize_applied_binary,
+    synchronize_applied_guidance,
+};
 use crate::control::paths::ControlPaths;
 use crate::control::settings::UpdateSource;
 use crate::control::transaction;
@@ -50,6 +53,17 @@ pub(crate) struct FinalizeNotice {
     pub(crate) version: String,
     /// Whether the separately owned Apply runtime was synchronized.
     pub(crate) outcome: FinalizeOutcome,
+    /// Best-effort state of the independently managed host guidance block.
+    pub(crate) guidance: FinalizeGuidanceOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FinalizeGuidanceOutcome {
+    NotApplied,
+    Current,
+    Refreshed,
+    ApplyRequired,
+    Unchanged(String),
 }
 
 /// Stable Apply-copy result attached to a successful product update.
@@ -410,9 +424,17 @@ pub(crate) fn finalize_update(
         }
         Err(error) => FinalizeOutcome::RuntimeUnchanged(error),
     };
+    let guidance = match synchronize_applied_guidance(paths) {
+        Ok(AppliedGuidanceSync::NotApplied) => FinalizeGuidanceOutcome::NotApplied,
+        Ok(AppliedGuidanceSync::Current) => FinalizeGuidanceOutcome::Current,
+        Ok(AppliedGuidanceSync::Refreshed) => FinalizeGuidanceOutcome::Refreshed,
+        Ok(AppliedGuidanceSync::ApplyRequired(_)) => FinalizeGuidanceOutcome::ApplyRequired,
+        Err(error) => FinalizeGuidanceOutcome::Unchanged(error),
+    };
     Ok(FinalizeNotice {
         version: request.plan.target_version().to_string(),
         outcome,
+        guidance,
     })
 }
 
