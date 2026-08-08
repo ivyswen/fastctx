@@ -323,6 +323,21 @@ V:/repo/Cargo.toml
 
 输出使用有界内存缓冲。响应容量不足时，终态会说明截断范围，并给出完整输出的处理方式：将命令输出重定向到文件，再用 `read` 分页查看。
 
+#### 命令环境
+
+stdio MCP server 拿不到用户配置的环境：宿主会清空子进程环境，只补回一份固定的核心变量名单，因此 `JAVA_HOME`、`GOPATH`、`CUDA_PATH` 这类变量根本到不了 FastCtx，也就到不了它执行的命令。
+
+在 Windows 上，FastCtx 会把操作系统为该用户持久保存的环境恢复回来——即 Windows **环境变量**对话框里的系统变量与用户变量——再把宿主实际提供的那份覆盖在上面，宿主值始终优先。`PATH` 是唯一的例外，按并集处理：传入的搜索路径原样保留在前，只把它尚未包含的持久化目录追加在后。macOS 和 Linux 上，登录 shell 本就会加载用户环境所在的 profile，因此不做任何重建。
+
+`run` 与 `run_background` 默认使用登录 shell（`bash -lc`），以便 nvm、pyenv、rustup 这类由 profile 管理的工具链能被解析；传 `login_shell: false` 可使用干净的 `--noprofile --norc` shell。Windows 上，登录 shell 会拿到完整的 Windows 搜索路径，除非 `MSYS2_PATH_TYPE` 已被显式设置——那种情况下尊重该选择。
+
+有两个环境变量用于配置这套行为。两者都既可从持久化环境读取，也可写在宿主 MCP server 配置中 FastCtx 条目的 `env` 表里：
+
+| 变量 | 作用 |
+| --- | --- |
+| `FASTCTX_INHERIT_ENVIRONMENT=0` | 跳过恢复，命令使用宿主提供的环境。 |
+| `FASTCTX_BASH` | 指定所用 Bash 的绝对路径。FastCtx 要求 GNU Bash，且绝不接受 `System32\bash.exe` 这个 WSL 启动器。 |
+
 ### `run_background`
 
 `run_background` 启动后台 Bash 任务并立即返回 job id，适合构建、测试、开发服务器和其他长时间运行的命令。

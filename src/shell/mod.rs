@@ -183,7 +183,8 @@ impl FastShell {
             Ok(cwd) => cwd,
             Err(error) => return ToolResponse::error(error),
         };
-        let bash = match self.bash.resolve(&self.session.environment) {
+        let environment = &self.session.command_environment;
+        let bash = match self.bash.resolve(environment) {
             Ok(bash) => bash,
             Err(error) => return ToolResponse::error(error),
         };
@@ -195,8 +196,8 @@ impl FastShell {
                 timeout_ms,
                 login_shell: request.login_shell,
                 encoding,
-                environment: &self.session.environment,
-                utf8_locale: self.bash.utf8_locale(&self.session.environment, &bash),
+                environment,
+                utf8_locale: self.bash.utf8_locale(environment, &bash),
             },
             cancelled,
         )
@@ -220,7 +221,8 @@ impl FastShell {
             Ok(cwd) => cwd,
             Err(error) => return ToolResponse::error(error),
         };
-        let bash = match self.bash.resolve(&self.session.environment) {
+        let environment = &self.session.command_environment;
+        let bash = match self.bash.resolve(environment) {
             Ok(bash) => bash,
             Err(error) => return ToolResponse::error(error),
         };
@@ -230,8 +232,8 @@ impl FastShell {
             cwd: &cwd,
             login_shell: request.login_shell,
             encoding,
-            environment: &self.session.environment,
-            utf8_locale: self.bash.utf8_locale(&self.session.environment, &bash),
+            environment,
+            utf8_locale: self.bash.utf8_locale(environment, &bash),
         })
     }
 

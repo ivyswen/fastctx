@@ -329,6 +329,21 @@ On Windows, every FastCtx-owned non-interactive child process is created without
 
 Output uses bounded memory. When output exceeds the response capacity, the final status line reports the truncated range and gives a path to the complete result: redirect the command output to a file, then page through it with `read`.
 
+#### Command environment
+
+A stdio MCP server does not receive the environment its user configured. The host clears the child environment and re-adds only a fixed core list of names, so variables such as `JAVA_HOME`, `GOPATH`, or `CUDA_PATH` never reach FastCtx and would otherwise never reach the commands it runs.
+
+On Windows, FastCtx restores the environment the operating system persists for the user — the system and user entries of the Windows **Environment Variables** dialog — and lays whatever the host did provide on top of it, so host values always win. `PATH` is the single exception and is a union: the search path that arrived stays exactly as it is, and only persisted directories it does not already contain are appended after it. On macOS and Linux the login shell already sources the profile where a user's environment lives, so nothing is reconstructed.
+
+`run` and `run_background` use a login shell (`bash -lc`) by default so profile-managed toolchains such as nvm, pyenv, and rustup resolve; pass `login_shell: false` for a clean `--noprofile --norc` shell. On Windows a login shell is given the complete Windows search path unless `MSYS2_PATH_TYPE` is already set, in which case that choice is respected.
+
+Two environment variables configure this. Both are read from either the persisted environment or the `env` table of the FastCtx entry in the host's MCP server configuration:
+
+| Variable | Effect |
+| --- | --- |
+| `FASTCTX_INHERIT_ENVIRONMENT=0` | Skip the restore, leaving commands with the environment the host provided. |
+| `FASTCTX_BASH` | Absolute path to the Bash to use. FastCtx requires GNU Bash and never accepts the `System32\bash.exe` WSL launcher. |
+
 ### `run_background`
 
 `run_background` starts a background Bash job and returns a job id immediately. It is useful for builds, tests, development servers, and other long-running commands.

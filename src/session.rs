@@ -241,9 +241,14 @@ impl SessionEnvironment {
 #[derive(Clone, Debug)]
 pub struct SessionContext {
     /// Exact native cwd/env captured by this connection's stdio proxy.
+    ///
+    /// This stays the sole basis for FastCtx's own identity — control paths, endpoint, budgets —
+    /// so restoring the machine's persisted environment can never relocate a user's state.
     pub environment: Arc<SessionEnvironment>,
     /// Session state used only by FastCtx's internal path and response-budget helpers.
     tool_environment: Arc<SessionEnvironment>,
+    /// Environment handed to commands the user runs, with the machine's persisted values restored.
+    pub command_environment: Arc<SessionEnvironment>,
     /// Per-user paths resolved exclusively from the connection environment.
     pub control_paths: ControlPaths,
     /// Saved FastCtx preferences visible to this connection.
@@ -272,10 +277,13 @@ impl SessionContext {
             &provider,
         );
         let tool_environment = Arc::new(environment.with_guarded_output(effective_output));
+        let command_environment =
+            Arc::new(crate::os_environment::command_environment(&environment));
         let environment = Arc::new(environment);
         Ok(Arc::new(Self {
             environment,
             tool_environment,
+            command_environment,
             control_paths,
             settings,
             provider,
@@ -309,8 +317,11 @@ impl SessionContext {
                 &provider,
             );
             let tool_environment = Arc::new(environment.with_guarded_output(effective_output));
+            let command_environment =
+                Arc::new(crate::os_environment::command_environment(&environment));
             Arc::new(Self {
                 tool_environment,
+                command_environment,
                 environment: Arc::new(environment),
                 control_paths,
                 settings,
@@ -474,15 +485,23 @@ fn is_budget_variable(name: &OsStr) -> bool {
 }
 
 #[cfg(windows)]
-fn environment_name_eq(candidate: &OsStr, expected: &str) -> bool {
+pub(crate) fn environment_name_eq(candidate: &OsStr, expected: &str) -> bool {
     candidate
         .to_str()
         .is_some_and(|candidate| candidate.eq_ignore_ascii_case(expected))
 }
 
 #[cfg(not(windows))]
-fn environment_name_eq(candidate: &OsStr, expected: &str) -> bool {
+pub(crate) fn environment_name_eq(candidate: &OsStr, expected: &str) -> bool {
     candidate == OsStr::new(expected)
+}
+
+/// Compares two native variable names under the same rules `environment_name_eq` applies.
+pub(crate) fn environment_name_eq_os(candidate: &OsStr, expected: &OsStr) -> bool {
+    match expected.to_str() {
+        Some(expected) => environment_name_eq(candidate, expected),
+        None => candidate == expected,
+    }
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ pub mod model;
 pub(crate) mod model_guidance;
 pub(crate) mod operation;
 pub(crate) mod ordered_window;
+pub(crate) mod os_environment;
 pub(crate) mod path_codec;
 pub mod paths;
 pub(crate) mod process_identity;

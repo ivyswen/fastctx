@@ -330,7 +330,11 @@ fn shell_process_environment_forces_only_python_standard_streams_to_utf8() {
     command
         .env_remove("PYTHONIOENCODING")
         .env_remove("PYTHONUTF8")
-        .env_remove("JAVA_TOOL_OPTIONS");
+        .env_remove("JAVA_TOOL_OPTIONS")
+        // The claim under test is what FastCtx itself overlays, so the machine's own persisted
+        // environment is kept out: a developer who has JAVA_TOOL_OPTIONS set would otherwise see
+        // this fail while CI stays green.
+        .env("FASTCTX_INHERIT_ENVIRONMENT", "0");
     let mut session = McpSession::start(command);
     let response = session.call(
         "run",

@@ -127,6 +127,10 @@ pub(crate) fn spawn_bash(
     if !login_shell {
         prepend_windows_toolset(&mut command, bash, environment);
     }
+    #[cfg(windows)]
+    if login_shell && environment.var_os(MSYS_PATH_TYPE).is_none() {
+        command.env(MSYS_PATH_TYPE, "inherit");
+    }
 
     let mut wrapped = CommandWrap::from(command);
     #[cfg(unix)]
@@ -343,6 +347,17 @@ fn terminate_job(job: &OwnedHandle) -> std::io::Result<()> {
         Ok(())
     }
 }
+
+/// Selects how the msys `/etc/profile` composes PATH out of the Windows PATH it inherits.
+///
+/// Git for Windows defaults this to `inherit`, but an msys2 installation defaults to `minimal`,
+/// whose profile *replaces* the inherited PATH with four Windows system directories — so a login
+/// shell there resolves none of the user's own tools. `prepend_windows_toolset` is the non-login
+/// counterpart; a login shell needs this instead, because profile runs after we hand over the
+/// environment. An explicit value is always left alone: choosing `minimal` or `strict` is a
+/// deliberate isolation choice that belongs to whoever made it.
+#[cfg(windows)]
+const MSYS_PATH_TYPE: &str = "MSYS2_PATH_TYPE";
 
 /// Gives a non-login Windows bash the Git-for-Windows Unix toolset on PATH.
 ///
