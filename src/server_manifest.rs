@@ -329,16 +329,27 @@ mod tests {
             .iter()
             .map(|entry| entry.name.to_string())
             .collect();
-        vocabulary.extend(DOCUMENTED_PROSE_LITERALS.iter().map(|literal| literal.to_string()));
+        vocabulary.extend(
+            DOCUMENTED_PROSE_LITERALS
+                .iter()
+                .map(|literal| literal.to_string()),
+        );
         let mut prose = vec![(
             "server instructions".to_string(),
             crate::model_guidance::server_instructions(true),
         )];
         for tool in all_published_tools() {
             if let Some(description) = tool.description.as_deref() {
-                prose.push((format!("{} description", tool.name), description.to_string()));
+                prose.push((
+                    format!("{} description", tool.name),
+                    description.to_string(),
+                ));
             }
-            if let Some(title) = tool.annotations.as_ref().and_then(|entry| entry.title.clone()) {
+            if let Some(title) = tool
+                .annotations
+                .as_ref()
+                .and_then(|entry| entry.title.clone())
+            {
                 prose.push((format!("{} title", tool.name), title));
             }
             let schema = serde_json::Value::Object((*tool.input_schema).clone());

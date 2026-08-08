@@ -23,7 +23,7 @@ use crate::shell::output::{
     budget_too_small_message, compose_response_with_tail, global_token_budget,
     job_output_token_budget, plural, terminal_response,
 };
-use model::{JobRecord, JobStatus, LaunchSpec, StoredLine, TerminationKind};
+use model::{JobRecord, JobStatus, LaunchSpec, StoredLine};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
