@@ -20,7 +20,7 @@ pub enum LinkState {
     Current,
     /// Current bytes were found, but the receipt does not record the current Apply contract.
     ApplyRequired,
-    /// The exact known-bad 0.2.2/0.2.3 guidance block remains on disk.
+    /// An exact managed block from a superseded release remains on disk.
     KnownLegacy,
     /// An Apply receipt exists, but the managed block or file is absent.
     Missing,
@@ -144,7 +144,11 @@ mod tests {
         let paths = paths_with_agents(home.path(), Some(&agents::section(false)));
         assert_eq!(link_state(&paths, Some(&receipt(true))), LinkState::Drifted);
 
-        std::fs::write(&paths.codex_agents, agents::known_legacy_section(false)).unwrap();
+        std::fs::write(
+            &paths.codex_agents,
+            agents::KnownLegacyGuidance::ResourceRouting.section(false),
+        )
+        .unwrap();
         assert_eq!(
             link_state(&paths, Some(&receipt(false))),
             LinkState::KnownLegacy

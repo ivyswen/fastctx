@@ -45,7 +45,7 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
             .iter()
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>(),
-        ["glob", "grep", "read", "replace"]
+        ["glob", "grep", "inspect_local_file", "replace"]
     );
     for tool in &tools {
         let annotations = tool.annotations.as_ref().expect("annotations");
@@ -60,7 +60,10 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
         assert!(tool.output_schema.is_none());
         assert!(tool.input_schema.get("type").is_some());
     }
-    let read = tools.iter().find(|tool| tool.name == "read").unwrap();
+    let read = tools
+        .iter()
+        .find(|tool| tool.name == "inspect_local_file")
+        .unwrap();
     let read_description = read.description.as_deref().expect("read description");
     for required in [
         "directly for local-file operations",
@@ -75,7 +78,7 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
             "{required}: {read_description}"
         );
     }
-    assert_ne!(read_description, "Read local files.");
+    assert_ne!(read_description, "Inspect local files.");
     assert!(
         read.input_schema
             .get("required")
@@ -187,7 +190,7 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
         .map(|tool| tool.description.as_deref().unwrap_or_default())
         .collect::<Vec<_>>()
         .join(" ");
-    for keyword in ["file", "read", "grep", "search", "glob", "replace"] {
+    for keyword in ["file", "inspect", "grep", "search", "glob", "replace"] {
         assert!(descriptions.to_ascii_lowercase().contains(keyword));
     }
 }
@@ -251,7 +254,13 @@ fn all_nine_tools_publish_explicit_three_hint_annotations() {
         assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name);
         assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
     }
-    for name in ["glob", "grep", "job_list", "job_output", "read"] {
+    for name in [
+        "glob",
+        "grep",
+        "job_list",
+        "job_output",
+        "inspect_local_file",
+    ] {
         let tool = tools.iter().find(|tool| tool.name == name).unwrap();
         assert_eq!(
             tool.annotations.as_ref().unwrap().read_only_hint,
@@ -625,7 +634,7 @@ fn non_pdf_stdio_calls_do_not_extract_the_bundled_engine() {
             "jsonrpc":"2.0",
             "id":2,
             "method":"tools/call",
-            "params":{"name":"read","arguments":{"file_path":normalized(&file)}}
+            "params":{"name":"inspect_local_file","arguments":{"file_path":normalized(&file)}}
         }),
     );
     let response = read_response(&mut stdout);
@@ -692,7 +701,7 @@ fn stdio_pdf_call_extracts_one_hashed_engine_and_preserves_image_meta() {
             "jsonrpc":"2.0",
             "id":2,
             "method":"tools/call",
-            "params":{"name":"read","arguments":{"file_path":normalized(&pdf),"pdf_mode":"image"}}
+            "params":{"name":"inspect_local_file","arguments":{"file_path":normalized(&pdf),"pdf_mode":"image"}}
         }),
     );
     let response = read_response(&mut stdout);
@@ -785,7 +794,7 @@ fn stdio_mcp_is_tool_only_lists_tools_and_never_returns_structured_content() {
             "jsonrpc":"2.0",
             "id":3,
             "method":"tools/call",
-            "params":{"name":"read","arguments":{"file_path":"Z:/definitely/missing.txt"}}
+            "params":{"name":"inspect_local_file","arguments":{"file_path":"Z:/definitely/missing.txt"}}
         }),
     );
     let called = read_response(&mut stdout);
@@ -851,16 +860,19 @@ fn stdio_mcp_is_tool_only_lists_tools_and_never_returns_structured_content() {
 #[test]
 fn stdio_serve_flags_publish_exact_four_and_nine_tool_sets() {
     let cases: [(&[&str], &[&str]); 4] = [
-        (&["serve"], &["glob", "grep", "read", "replace"]),
+        (
+            &["serve"],
+            &["glob", "grep", "inspect_local_file", "replace"],
+        ),
         (
             &["serve", "--enable-shell"],
             &[
                 "glob",
                 "grep",
+                "inspect_local_file",
                 "job_kill",
                 "job_list",
                 "job_output",
-                "read",
                 "replace",
                 "run",
                 "run_background",
@@ -868,17 +880,17 @@ fn stdio_serve_flags_publish_exact_four_and_nine_tool_sets() {
         ),
         (
             &["serve", "--enable-edit"],
-            &["glob", "grep", "read", "replace"],
+            &["glob", "grep", "inspect_local_file", "replace"],
         ),
         (
             &["serve", "--enable-shell", "--enable-edit"],
             &[
                 "glob",
                 "grep",
+                "inspect_local_file",
                 "job_kill",
                 "job_list",
                 "job_output",
-                "read",
                 "replace",
                 "run",
                 "run_background",
@@ -927,7 +939,7 @@ fn stdio_preserves_utf8_text_without_host_codepage_transcoding() {
     write(&file, "alpha\n中文 sentinel\n".as_bytes());
     let response = call_tool(
         fastctx_command(),
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&file)}),
     );
     assert_eq!(response["result"]["isError"], false);
@@ -946,7 +958,7 @@ fn stdio_invalid_token_budget_is_an_exact_tool_error() {
     command.env("FASTCTX_TOKEN_BUDGET", "0");
     let response = call_tool(
         command,
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&file)}),
     );
     assert_eq!(response["result"]["isError"], true);
@@ -967,7 +979,7 @@ fn stdio_batch_read_requires_room_for_one_line_and_its_exact_continuation() {
         .env("FASTCTX_READ_TOKEN_BUDGET", "1");
     let response = call_tool(
         command,
-        "read",
+        "inspect_local_file",
         serde_json::json!({"files": [{"path": normalized(&file)}]}),
     );
     assert_eq!(response["result"]["isError"], true);
@@ -984,7 +996,7 @@ fn stdio_per_tool_budgets_must_not_exceed_the_global_budget() {
     write(&file, b"plain");
     let cases = [
         (
-            "read",
+            "inspect_local_file",
             "FASTCTX_READ_TOKEN_BUDGET",
             serde_json::json!({"file_path": normalized(&file)}),
         ),
@@ -1023,7 +1035,7 @@ fn stdio_per_tool_budgets_reject_non_positive_values() {
     write(&file, b"plain");
     let cases = [
         (
-            "read",
+            "inspect_local_file",
             "FASTCTX_READ_TOKEN_BUDGET",
             serde_json::json!({"file_path": normalized(&file)}),
         ),
@@ -1062,7 +1074,7 @@ fn stdio_pdf_text_mode_uses_the_read_specific_page_budget() {
     command.env("FASTCTX_READ_TOKEN_BUDGET", "34");
     let response = call_tool(
         command,
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&pdf), "pages": "1-2"}),
     );
     assert_eq!(response["result"]["isError"], false);
@@ -1093,7 +1105,7 @@ fn stdio_pdf_call_repairs_a_corrupted_cached_engine() {
     let engine_dir = configure_isolated_cache(&mut first_command, &cache_root);
     let first = call_tool(
         first_command,
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&pdf)}),
     );
     assert_eq!(first["result"]["isError"], false);
@@ -1122,7 +1134,7 @@ fn stdio_pdf_call_repairs_a_corrupted_cached_engine() {
     configure_isolated_cache(&mut second_command, &cache_root);
     let second = call_tool(
         second_command,
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&pdf)}),
     );
     assert_eq!(second["result"]["isError"], false);
@@ -1147,7 +1159,7 @@ fn stdio_pdf_initialization_uses_the_request_session_cache_environment() {
     let bootstrap_engine = configure_isolated_cache(&mut bootstrap, &bootstrap_cache);
     let first = call_tool(
         bootstrap,
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&text)}),
     );
     assert_eq!(first["result"]["isError"], false);
@@ -1156,7 +1168,7 @@ fn stdio_pdf_initialization_uses_the_request_session_cache_environment() {
     let request_engine = configure_isolated_cache(&mut request, &request_cache);
     let second = call_tool(
         request,
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&pdf)}),
     );
     assert_eq!(second["result"]["isError"], false);
@@ -1189,7 +1201,7 @@ fn no_pdf_build_rejects_pdf_without_affecting_the_public_read_schema() {
     write(&pdf, b"%PDF-1.4\n");
     let response = call_tool(
         fastctx_command(),
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&pdf)}),
     );
     assert_eq!(response["result"]["isError"], true);

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 const BEGIN_MARKER: &str = "<!-- fastctx:begin -->";
 const END_MARKER: &str = "<!-- fastctx:end -->";
-pub(crate) const MANAGED_SECTION_CONTRACT_ID: &str = "guidance-v3";
+pub(crate) const MANAGED_SECTION_CONTRACT_ID: &str = "guidance-v4";
 const LEGACY_BEGIN_MARKER: &str = "<!-- fastread:begin -->";
 const LEGACY_END_MARKER: &str = "<!-- fastread:end -->";
 const LEGACY_FASTREAD_SECTION: &str = concat!(
@@ -19,23 +19,29 @@ const LEGACY_FASTREAD_SECTION: &str = concat!(
     "the exact parameters a `Partial` note provides.\n",
     "<!-- fastread:end -->"
 );
+// Tools are named as the server plus a bare tool name rather than as one mangled
+// identifier. Hosts differ in how they spell an MCP tool — some flatten the server and
+// the tool into a single name, others expose the server as a namespace whose members are
+// the bare tool names — so any single mangled spelling names something at least one host
+// has no entry for, while the server-plus-name form resolves under both (2026-08-08).
 const FILE_GUIDANCE_PREFIX: &str = concat!(
     "## Local file inspection\n",
     "\n",
     "For reading, searching, and finding local files, prefer the FastCtx MCP\n",
-    "tools — `mcp__fastctx__read`, `mcp__fastctx__grep`, `mcp__fastctx__glob` —\n",
-    "over `cat`/`Get-Content`, `rg`/`findstr`/`Select-String`, and `dir`/`ls -R`.\n",
+    "server's own tools — `inspect_local_file`, `grep`, and `glob` — over shell\n",
+    "equivalents such as `cat`/`Get-Content`, `rg`/`findstr`/`Select-String`,\n",
+    "and `dir`/`ls -R`.\n",
 );
 const FILE_GUIDANCE_SUFFIX: &str = concat!(
     "Read only what the task needs. When you need several files, pass them to\n",
-    "one read call as files=[{\"path\": ...}, ...] instead of one call per file.\n",
-    "The last line of every result says `Complete` or\n",
+    "one `inspect_local_file` call as files=[{\"path\": ...}, ...] instead of one\n",
+    "call per file. The last line of every result says `Complete` or\n",
     "`Partial` — continue only with the exact parameters a `Partial` note\n",
     "provides.\n",
     "\n",
     "### Batch replacement\n",
     "\n",
-    "Use `mcp__fastctx__replace` for mechanical find-and-replace across files.\n",
+    "Use FastCtx's `replace` for mechanical find-and-replace across files.\n",
     "It preserves each file's encoding and line endings, supports dry-run previews,\n",
     "and rejects concurrent changes before writing. Use apply_patch for generated\n",
     "content, semantic rewrites, or small local edits.\n"
@@ -43,27 +49,31 @@ const FILE_GUIDANCE_SUFFIX: &str = concat!(
 const SHELL_GUIDANCE: &str = concat!(
     "### Shell commands\n",
     "\n",
-    "Prefer `mcp__fastctx__run` over the built-in shell for terminal work: it\n",
+    "Prefer FastCtx's `run` over the built-in shell for terminal work: it\n",
     "executes with bash (Git Bash on Windows), so always write POSIX bash —\n",
     "never PowerShell syntax.\n",
     "\n",
-    "Never pass `apply_patch` to `mcp__fastctx__run`: it is not a program and\n",
+    "Never pass `apply_patch` to FastCtx's `run`: it is not a program and\n",
     "no shell can run it. Reach it through Codex itself — as its own tool\n",
     "call, or in Codex's built-in shell — never through the FastCtx tools.\n",
     "\n",
     "Commands must be non-interactive (no TTY): use flags like -y\n",
     "or --no-edit, and expect editors/pagers to be disabled. For anything\n",
-    "that may outlast run's four-minute maximum, use\n",
-    "`mcp__fastctx__run_background`, check on it with\n",
-    "`mcp__fastctx__job_output`, and stop it with `mcp__fastctx__job_kill`.\n",
-    "Background jobs run independently of this session and survive restarts;\n",
-    "rediscover an earlier job with `mcp__fastctx__job_list` and read its\n",
-    "output by job_id. A non-zero exit code is a normal result. The last line\n",
-    "of every result says `Complete` or `Partial`.\n"
+    "that may outlast run's four-minute maximum, use `run_background`, check\n",
+    "on it with `job_output`, and stop it with `job_kill`. Background jobs run\n",
+    "independently of this session and survive restarts; rediscover an earlier\n",
+    "job with `job_list` and read its output by job_id. A non-zero exit code is\n",
+    "a normal result. The last line of every result says `Complete` or\n",
+    "`Partial`.\n"
 );
-// Byte-frozen 0.2.2/0.2.3 guidance. This is comparison data only: it must never be
-// emitted except when replacing an exact on-disk match with the current section.
-const KNOWN_BAD_RESOURCE_ROUTING_FILE_GUIDANCE: &str = concat!(
+// Byte-frozen guidance from superseded releases. This is comparison data only: it must
+// never be emitted except when replacing an exact on-disk match with the current section.
+//
+// Every contract that ships has to land here when it is superseded. A product update
+// refreshes the managed block only on an exact match against one of these, so a release
+// that is left out strands its users with a block naming tools this build no longer
+// publishes — and only `fastctx apply` would ever repair it.
+const V022_RESOURCE_ROUTING_FILE_GUIDANCE: &str = concat!(
     "## Local file inspection\n",
     "\n",
     "For reading, searching, and finding local files, prefer the FastCtx MCP\n",
@@ -87,7 +97,7 @@ const KNOWN_BAD_RESOURCE_ROUTING_FILE_GUIDANCE: &str = concat!(
     "and rejects concurrent changes before writing. Use apply_patch for generated\n",
     "content, semantic rewrites, or small local edits.\n"
 );
-const KNOWN_BAD_RESOURCE_ROUTING_SHELL_GUIDANCE: &str = concat!(
+const V022_RESOURCE_ROUTING_SHELL_GUIDANCE: &str = concat!(
     "### Shell commands\n",
     "\n",
     "Prefer `mcp__fastctx__run` over the built-in shell for terminal work: it\n",
@@ -108,6 +118,73 @@ const KNOWN_BAD_RESOURCE_ROUTING_SHELL_GUIDANCE: &str = concat!(
     "output by job_id. A non-zero exit code is a normal result. The last line\n",
     "of every result says `Complete` or `Partial`.\n"
 );
+const V024_READ_TOOL_NAME_FILE_GUIDANCE: &str = concat!(
+    "## Local file inspection\n",
+    "\n",
+    "For reading, searching, and finding local files, prefer the FastCtx MCP\n",
+    "tools — `mcp__fastctx__read`, `mcp__fastctx__grep`, `mcp__fastctx__glob` —\n",
+    "over `cat`/`Get-Content`, `rg`/`findstr`/`Select-String`, and `dir`/`ls -R`.\n",
+    "Use FastCtx file tools directly for local-file operations, including when a\n",
+    "local reference is URI-shaped; pass the equivalent plain absolute filesystem path.\n",
+    "Read only what the task needs. When you need several files, pass them to\n",
+    "one read call as files=[{\"path\": ...}, ...] instead of one call per file.\n",
+    "The last line of every result says `Complete` or\n",
+    "`Partial` — continue only with the exact parameters a `Partial` note\n",
+    "provides.\n",
+    "\n",
+    "### Batch replacement\n",
+    "\n",
+    "Use `mcp__fastctx__replace` for mechanical find-and-replace across files.\n",
+    "It preserves each file's encoding and line endings, supports dry-run previews,\n",
+    "and rejects concurrent changes before writing. Use apply_patch for generated\n",
+    "content, semantic rewrites, or small local edits.\n"
+);
+// 0.2.4 shipped the shell section unchanged from 0.2.2, so the two releases share these exact
+// bytes. Keep the alias rather than a second copy: the frozen hashes below cover both names, and
+// a copy would let one drift while the other stayed put.
+const V024_READ_TOOL_NAME_SHELL_GUIDANCE: &str = V022_RESOURCE_ROUTING_SHELL_GUIDANCE;
+
+/// One byte-frozen managed block from a superseded release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KnownLegacyGuidance {
+    /// 0.2.2/0.2.3, whose prohibition named the very resource tools it steered away from.
+    ResourceRouting,
+    /// 0.2.4, superseded when the file-inspection tool was renamed away from `read`.
+    ReadToolName,
+}
+
+impl KnownLegacyGuidance {
+    /// Every superseded release this build still recognises, newest first.
+    pub(crate) const ALL: [Self; 2] = [Self::ReadToolName, Self::ResourceRouting];
+
+    fn guidance(self) -> (&'static str, &'static str) {
+        match self {
+            Self::ResourceRouting => (
+                V022_RESOURCE_ROUTING_FILE_GUIDANCE,
+                V022_RESOURCE_ROUTING_SHELL_GUIDANCE,
+            ),
+            Self::ReadToolName => (
+                V024_READ_TOOL_NAME_FILE_GUIDANCE,
+                V024_READ_TOOL_NAME_SHELL_GUIDANCE,
+            ),
+        }
+    }
+
+    /// Rebuilds this release's exact managed block for the optional shell group.
+    pub(crate) fn section(self, fastshell_enabled: bool) -> String {
+        let (file_guidance, shell_guidance) = self.guidance();
+        let mut output = String::from(BEGIN_MARKER);
+        output.push('\n');
+        output.push_str(file_guidance);
+        if fastshell_enabled {
+            output.push('\n');
+            output.push_str(shell_guidance);
+        }
+        output.push_str(END_MARKER);
+        output
+    }
+}
+
 /// Separator bytes inserted and therefore owned by Apply between user content and the private section.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -289,7 +366,10 @@ pub(crate) fn classify_managed_section(
     let managed = &source[start..end];
     if managed == section(fastshell_enabled) {
         ManagedSectionState::Current
-    } else if managed == known_legacy_section(fastshell_enabled) {
+    } else if KnownLegacyGuidance::ALL
+        .iter()
+        .any(|legacy| managed == legacy.section(fastshell_enabled))
+    {
         ManagedSectionState::KnownLegacy
     } else {
         ManagedSectionState::Drifted
@@ -311,18 +391,6 @@ pub(crate) fn refresh_known_legacy_section(
     output.extend_from_slice(current.as_bytes());
     output.extend_from_slice(&bytes[end..]);
     Some(output)
-}
-
-pub(crate) fn known_legacy_section(fastshell_enabled: bool) -> String {
-    let mut output = String::from(BEGIN_MARKER);
-    output.push('\n');
-    output.push_str(KNOWN_BAD_RESOURCE_ROUTING_FILE_GUIDANCE);
-    if fastshell_enabled {
-        output.push('\n');
-        output.push_str(KNOWN_BAD_RESOURCE_ROUTING_SHELL_GUIDANCE);
-    }
-    output.push_str(END_MARKER);
-    output
 }
 
 fn section_range(source: &str) -> Result<Option<(usize, usize)>, String> {
@@ -394,13 +462,12 @@ fn marker_range(
 #[cfg(test)]
 mod tests {
     use super::{
-        BEGIN_MARKER, END_MARKER, InsertedSeparator, LEGACY_FASTREAD_SECTION, ManagedSectionState,
-        apply_section, apply_section_with_ownership, classify_managed_section, has_exact_section,
-        known_legacy_section, refresh_known_legacy_section, remove_applied_section, remove_section,
+        BEGIN_MARKER, END_MARKER, InsertedSeparator, KnownLegacyGuidance, LEGACY_FASTREAD_SECTION,
+        ManagedSectionState, apply_section, apply_section_with_ownership, classify_managed_section,
+        has_exact_section, refresh_known_legacy_section, remove_applied_section, remove_section,
         section,
     };
     use crate::server_manifest::ToolManifest;
-    use std::collections::BTreeSet;
 
     #[test]
     fn apply_is_idempotent_and_preserves_bytes_outside_the_private_block() {
@@ -512,17 +579,22 @@ mod tests {
         for (fastshell, actual) in [(false, file_only), (true, with_shell)] {
             assert_eq!(actual.matches(BEGIN_MARKER).count(), 1);
             assert_eq!(actual.matches(END_MARKER).count(), 1);
-            let referenced = actual
-                .split('`')
-                .filter(|part| part.starts_with("mcp__fastctx__"))
-                .map(str::to_string)
-                .collect::<BTreeSet<_>>();
-            let published = ToolManifest::expected_names(fastshell)
+            let published = ToolManifest::expected_names(fastshell);
+            for name in &published {
+                assert!(actual.contains(&format!("`{name}`")), "{name}\n{actual}");
+            }
+            for withheld in ToolManifest::expected_names(true)
                 .into_iter()
-                .map(|name| format!("mcp__fastctx__{name}"))
-                .collect::<BTreeSet<_>>();
-            assert_eq!(referenced, published);
-            assert!(actual.contains("mcp__fastctx__replace"));
+                .filter(|name| !published.contains(name))
+            {
+                assert!(
+                    !actual.contains(&format!("`{withheld}`")),
+                    "{withheld}\n{actual}"
+                );
+            }
+            // A host-mangled spelling names an entry at least one host does not have; the
+            // server-plus-bare-name form in this block resolves under every spelling.
+            assert!(!actual.contains("mcp__fastctx"), "{actual}");
             assert!(actual.contains(crate::model_guidance::LOCAL_FILE_ROUTE_GUIDANCE));
             for forbidden in [
                 "will be told",
@@ -532,7 +604,7 @@ mod tests {
                 assert!(!actual.to_ascii_lowercase().contains(forbidden));
             }
             for removed in ["copy", "cut", "paste", "clips", "drop"] {
-                assert!(!actual.contains(&format!("mcp__fastctx__{removed}")));
+                assert!(!actual.contains(&format!("`{removed}`")));
             }
         }
     }
@@ -547,7 +619,7 @@ mod tests {
     fn shell_guidance_carves_apply_patch_out_of_the_run_tool() {
         let with_shell = section(true).replace('\n', " ");
         assert!(
-            with_shell.contains("Never pass `apply_patch` to `mcp__fastctx__run`"),
+            with_shell.contains("Never pass `apply_patch` to FastCtx's `run`"),
             "{with_shell}"
         );
         assert!(
@@ -585,7 +657,7 @@ mod tests {
                 assert!(!guidance.contains(helper), "{helper}\n{guidance}");
             }
             assert!(guidance.contains("prefer the FastCtx MCP"), "{guidance}");
-            assert!(guidance.contains("`mcp__fastctx__read`"), "{guidance}");
+            assert!(guidance.contains("`inspect_local_file`"), "{guidance}");
             for required in [
                 "directly for local-file operations",
                 "URI-shaped",
@@ -596,27 +668,50 @@ mod tests {
         }
     }
 
+    /// Superseded blocks are frozen bytes, not regenerated text: a product update rewrites a
+    /// user's block only on an exact match, so any drift here silently strands that release's
+    /// users on tool names this build no longer publishes. The hashes are what make an
+    /// accidental edit — including one reached through a shared constant — fail loudly.
     #[test]
-    fn v022_and_v023_resource_routing_blocks_are_frozen_and_only_exact_matches_migrate() {
+    fn every_superseded_block_is_frozen_and_only_exact_matches_migrate() {
         use sha2::{Digest, Sha256};
 
-        for (fastshell, expected_len, expected_hash) in [
+        for (guidance, fastshell, expected_len, expected_hash, edit_anchor) in [
             (
+                KnownLegacyGuidance::ResourceRouting,
                 false,
                 1177,
                 "17da1a91024e98008f7979937e9c6b423c8b77556854082fc985922dfbf248a3",
+                "Never point",
             ),
             (
+                KnownLegacyGuidance::ResourceRouting,
                 true,
                 2145,
                 "cf0ac5d64b9b9d615617a2d390a41625007bb0cf3ef1b968596585b8376f5b19",
+                "Never point",
+            ),
+            (
+                KnownLegacyGuidance::ReadToolName,
+                false,
+                1037,
+                "353a1dc63f9479b434442d4954a213b6e753c5fe60eb54ee79fe18b158896d83",
+                "Read only what",
+            ),
+            (
+                KnownLegacyGuidance::ReadToolName,
+                true,
+                2005,
+                "6d8f79158ee4d9aed4d5f6693a4056c0e40d62f58705cd548cd6348bc7b09646",
+                "Read only what",
             ),
         ] {
-            let legacy = known_legacy_section(fastshell);
-            assert_eq!(legacy.len(), expected_len);
+            let legacy = guidance.section(fastshell);
+            assert_eq!(legacy.len(), expected_len, "{guidance:?} {fastshell}");
             assert_eq!(
                 hex::encode(Sha256::digest(legacy.as_bytes())),
-                expected_hash
+                expected_hash,
+                "{guidance:?} {fastshell}"
             );
             assert_eq!(
                 classify_managed_section(legacy.as_bytes(), fastshell),
@@ -638,7 +733,8 @@ mod tests {
                 format!("user prefix\n{}\nuser suffix", section(fastshell)).as_bytes()
             );
 
-            let edited = legacy.replace("Never point", "User changed");
+            let edited = legacy.replace(edit_anchor, "User changed");
+            assert_ne!(edited, legacy);
             assert_eq!(
                 classify_managed_section(edited.as_bytes(), fastshell),
                 ManagedSectionState::Drifted
@@ -665,7 +761,7 @@ mod tests {
         let applied = apply_section(original).unwrap();
         let source = std::str::from_utf8(&applied).unwrap();
         assert!(source.contains("### Batch replacement"));
-        assert!(source.contains("mcp__fastctx__replace"));
+        assert!(source.contains("FastCtx's `replace`"));
         assert!(!source.contains("mcp__fastctx__copy"));
         assert!(!source.contains("mcp__fastctx__paste"));
         assert!(source.starts_with("before\n\n"));

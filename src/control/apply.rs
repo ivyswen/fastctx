@@ -273,7 +273,7 @@ pub(crate) fn synchronize_applied_binary(
     Ok(AppliedBinarySync::Updated)
 }
 
-/// Replaces only an exact 0.2.2/0.2.3 managed block, without changing the Apply receipt.
+/// Replaces only an exact managed block from a superseded release, without changing the Apply receipt.
 pub(crate) fn synchronize_applied_guidance(
     paths: &ControlPaths,
 ) -> Result<AppliedGuidanceSync, String> {
@@ -1665,76 +1665,82 @@ mod tests {
     }
 
     #[test]
-    fn product_update_refreshes_only_the_known_bad_managed_block_and_keeps_apply_pending() {
-        for fastshell_enabled in [false, true] {
-            let (_temp, paths, executable) = fixture();
-            std::fs::write(&paths.codex_agents, b"user prefix\n").unwrap();
-            let mut apply_options = options(executable.clone());
-            apply_options.fastshell_enabled = fastshell_enabled;
-            commit_apply(plan_apply(&paths, apply_options).unwrap(), true).unwrap();
+    fn product_update_refreshes_every_superseded_managed_block_and_keeps_apply_pending() {
+        // Every frozen release is exercised, not just the oldest: this refresh is the only
+        // path that reaches a user who upgrades without running Apply again, so a release
+        // whose arm is untested is a release whose users silently keep stale tool names.
+        for legacy_guidance in crate::control::agents::KnownLegacyGuidance::ALL {
+            for fastshell_enabled in [false, true] {
+                let (_temp, paths, executable) = fixture();
+                std::fs::write(&paths.codex_agents, b"user prefix\n").unwrap();
+                let mut apply_options = options(executable.clone());
+                apply_options.fastshell_enabled = fastshell_enabled;
+                commit_apply(plan_apply(&paths, apply_options).unwrap(), true).unwrap();
 
-            let current = crate::control::agents::section(fastshell_enabled);
-            let legacy = crate::control::agents::known_legacy_section(fastshell_enabled);
-            let applied = std::fs::read_to_string(&paths.codex_agents).unwrap();
-            assert!(applied.contains(&current));
-            let legacy_bytes = format!(
-                "{}\nuser suffix\n",
-                applied
-                    .replacen(&current, &legacy, 1)
-                    .trim_end_matches('\n')
-            )
-            .into_bytes();
-            std::fs::write(&paths.codex_agents, &legacy_bytes).unwrap();
-
-            let mut settings = crate::control::settings::load(&paths).unwrap();
-            let record = settings.applied.as_mut().unwrap();
-            record.agents_contract_id = None;
-            record.codex_agents.applied_sha256 = super::sha256(&legacy_bytes);
-            let settings_bytes = crate::control::settings::encode(&settings).unwrap();
-            std::fs::write(&paths.fastctx_config, &settings_bytes).unwrap();
-
-            assert_eq!(
-                synchronize_applied_guidance(&paths).unwrap(),
-                AppliedGuidanceSync::Refreshed
-            );
-            let expected = legacy_bytes
-                .windows(legacy.len())
-                .position(|window| window == legacy.as_bytes())
-                .map(|start| {
-                    let mut bytes = Vec::new();
-                    bytes.extend_from_slice(&legacy_bytes[..start]);
-                    bytes.extend_from_slice(current.as_bytes());
-                    bytes.extend_from_slice(&legacy_bytes[start + legacy.len()..]);
-                    bytes
-                })
-                .unwrap();
-            assert_eq!(std::fs::read(&paths.codex_agents).unwrap(), expected);
-            assert_eq!(
-                std::fs::read(&paths.fastctx_config).unwrap(),
-                settings_bytes
-            );
-            assert_eq!(
-                crate::control::settings::load(&paths)
-                    .unwrap()
-                    .applied
-                    .unwrap()
-                    .agents_contract_id,
-                None,
-                "an automatic block refresh must not impersonate a complete Apply"
-            );
-            assert_eq!(
-                synchronize_applied_guidance(&paths).unwrap(),
-                AppliedGuidanceSync::ApplyRequired(
-                    crate::control::agents::ManagedSectionState::Current
+                let current = crate::control::agents::section(fastshell_enabled);
+                let legacy = legacy_guidance.section(fastshell_enabled);
+                let applied = std::fs::read_to_string(&paths.codex_agents).unwrap();
+                assert!(applied.contains(&current));
+                let legacy_bytes = format!(
+                    "{}\nuser suffix\n",
+                    applied
+                        .replacen(&current, &legacy, 1)
+                        .trim_end_matches('\n')
                 )
-            );
+                .into_bytes();
+                std::fs::write(&paths.codex_agents, &legacy_bytes).unwrap();
+
+                let mut settings = crate::control::settings::load(&paths).unwrap();
+                let record = settings.applied.as_mut().unwrap();
+                record.agents_contract_id = None;
+                record.codex_agents.applied_sha256 = super::sha256(&legacy_bytes);
+                let settings_bytes = crate::control::settings::encode(&settings).unwrap();
+                std::fs::write(&paths.fastctx_config, &settings_bytes).unwrap();
+
+                assert_eq!(
+                    synchronize_applied_guidance(&paths).unwrap(),
+                    AppliedGuidanceSync::Refreshed,
+                    "{legacy_guidance:?} fastshell={fastshell_enabled}"
+                );
+                let expected = legacy_bytes
+                    .windows(legacy.len())
+                    .position(|window| window == legacy.as_bytes())
+                    .map(|start| {
+                        let mut bytes = Vec::new();
+                        bytes.extend_from_slice(&legacy_bytes[..start]);
+                        bytes.extend_from_slice(current.as_bytes());
+                        bytes.extend_from_slice(&legacy_bytes[start + legacy.len()..]);
+                        bytes
+                    })
+                    .unwrap();
+                assert_eq!(std::fs::read(&paths.codex_agents).unwrap(), expected);
+                assert_eq!(
+                    std::fs::read(&paths.fastctx_config).unwrap(),
+                    settings_bytes
+                );
+                assert_eq!(
+                    crate::control::settings::load(&paths)
+                        .unwrap()
+                        .applied
+                        .unwrap()
+                        .agents_contract_id,
+                    None,
+                    "an automatic block refresh must not impersonate a complete Apply"
+                );
+                assert_eq!(
+                    synchronize_applied_guidance(&paths).unwrap(),
+                    AppliedGuidanceSync::ApplyRequired(
+                        crate::control::agents::ManagedSectionState::Current
+                    )
+                );
+            }
         }
     }
 
     #[test]
     fn product_update_never_reclaims_unowned_or_post_apply_guidance_drift() {
         let (_temp, paths, executable) = fixture();
-        let legacy = crate::control::agents::known_legacy_section(false);
+        let legacy = crate::control::agents::KnownLegacyGuidance::ResourceRouting.section(false);
         std::fs::create_dir_all(&paths.codex_dir).unwrap();
         std::fs::write(&paths.codex_agents, &legacy).unwrap();
         assert_eq!(
@@ -1782,7 +1788,7 @@ mod tests {
         let (_temp, paths, executable) = fixture();
         commit_apply(plan_apply(&paths, options(executable)).unwrap(), true).unwrap();
         let current = crate::control::agents::section(false);
-        let legacy = crate::control::agents::known_legacy_section(false);
+        let legacy = crate::control::agents::KnownLegacyGuidance::ResourceRouting.section(false);
         let bytes = std::fs::read_to_string(&paths.codex_agents)
             .unwrap()
             .replacen(&current, &legacy, 1)

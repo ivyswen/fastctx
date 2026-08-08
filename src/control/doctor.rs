@@ -816,18 +816,18 @@ fn check_agents_state(
         {
             DoctorCheck::fail(
                 "AGENTS guidance",
-                "State: known-bad legacy after Apply. The receipt already records a guidance contract, so these bytes are post-Apply drift and automatic updates preserve them.",
+                "State: superseded guidance after Apply. The receipt already records a guidance contract, so these bytes are post-Apply drift and automatic updates preserve them.",
                 "Run fastctx apply to replace the managed block and record the complete connection, then restart Codex.",
             )
         }
         agents::ManagedSectionState::KnownLegacy if has_receipt => DoctorCheck::fail(
             "AGENTS guidance",
-            "State: known-bad legacy. The exact 0.2.2/0.2.3 block remains. A managed product update may safely refresh this exact block, but that refresh never completes Apply.",
+            "State: superseded guidance. An exact managed block from an earlier release remains. A managed product update may safely refresh this exact block, but that refresh never completes Apply.",
             "Run fastctx apply to replace the managed block and record the complete connection, then restart Codex.",
         ),
         agents::ManagedSectionState::KnownLegacy => DoctorCheck::fail(
             "AGENTS guidance",
-            "State: known-bad legacy without an Apply receipt. Automatic updates will not rewrite it because FastCtx cannot prove ownership.",
+            "State: superseded guidance without an Apply receipt. Automatic updates will not rewrite it because FastCtx cannot prove ownership.",
             "Run fastctx apply to adopt and replace the managed block, then restart Codex.",
         ),
         agents::ManagedSectionState::Missing if has_receipt => DoctorCheck::fail(
@@ -1297,8 +1297,10 @@ mod tests {
 
         for (bytes, state, automatic) in [
             (
-                crate::control::agents::known_legacy_section(false).into_bytes(),
-                "known-bad legacy",
+                crate::control::agents::KnownLegacyGuidance::ResourceRouting
+                    .section(false)
+                    .into_bytes(),
+                "superseded guidance",
                 "post-Apply drift",
             ),
             (
@@ -1329,7 +1331,7 @@ mod tests {
         record.agents_contract_id = None;
         std::fs::write(
             &paths.codex_agents,
-            crate::control::agents::known_legacy_section(false),
+            crate::control::agents::KnownLegacyGuidance::ResourceRouting.section(false),
         )
         .unwrap();
         let upgrade_legacy = check_agents(&paths, Some(&record));

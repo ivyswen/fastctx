@@ -12,9 +12,18 @@ pub(crate) const LOCAL_PATH_INPUT_GUIDANCE: &str = concat!(
     "use its equivalent local absolute path."
 );
 
-const READ_TOOL_DETAILS: &str = concat!(
-    "Read one file (text, image, or PDF) or a batch of text files from the local\n",
-    "filesystem. Text returns 1-based `N<tab>content` lines, as much of the file as\n",
+/// Opening sentence of the file-inspection tool's description.
+///
+/// It leads with what the tool is over a local filesystem path, because that is the
+/// sentence a routing decision is made on: `read_mcp_resource` competes for the same
+/// intent and the discriminating fact is the input shape, not the verb (2026-08-08).
+const INSPECT_TOOL_SUMMARY: &str = concat!(
+    "Inspect the contents of local filesystem paths: one file (text, image, or PDF),\n",
+    "a batch of text files, or any file's raw bytes."
+);
+
+const INSPECT_TOOL_DETAILS: &str = concat!(
+    "Text returns 1-based `N<tab>content` lines, as much of the file as\n",
     "the output budget holds. For several text files in one call, pass\n",
     "files=[{\"path\": ...}, ...] instead of file_path: one token budget, per-file\n",
     "problems reported inline without failing the batch, and a Partial note returns\n",
@@ -32,18 +41,19 @@ pub(crate) fn local_path_description(context: &str) -> String {
     format!("{LOCAL_PATH_INPUT_GUIDANCE} {context}")
 }
 
-pub(crate) fn read_tool_description() -> String {
+pub(crate) fn inspect_tool_description() -> String {
     format!(
-        "{} {READ_TOOL_DETAILS}",
+        "{} {} {INSPECT_TOOL_DETAILS}",
+        INSPECT_TOOL_SUMMARY.replace('\n', " "),
         LOCAL_FILE_ROUTE_GUIDANCE.replace('\n', " ")
     )
 }
 
 pub(crate) fn server_instructions(enable_shell: bool) -> String {
     let tools = if enable_shell {
-        "Local-file tools: read, grep, glob, replace, plus POSIX-bash shell tools."
+        "Local-file tools: inspect_local_file, grep, glob, replace, plus POSIX-bash shell tools."
     } else {
-        "Local-file tools: read, grep, glob, and replace."
+        "Local-file tools: inspect_local_file, grep, glob, and replace."
     };
     format!("{tools} {}", LOCAL_FILE_ROUTE_GUIDANCE.replace('\n', " "))
 }

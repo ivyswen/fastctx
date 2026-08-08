@@ -1973,7 +1973,8 @@ mod tests {
                 "<!-- fastctx:begin -->",
                 "mcp_servers.fastctx",
                 "FASTCTX_TOKEN_BUDGET",
-                "mcp__fastctx__read",
+                "mcp__fastctx__",
+                "inspect_local_file",
             ] {
                 assert!(
                     !messages.contains(forbidden),

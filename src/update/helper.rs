@@ -2346,7 +2346,7 @@ mod tests {
         // Put the machine back into the state every 0.2.2/0.2.3 user upgraded from: the exact
         // known-bad block on disk, under a receipt written before the contract id existed.
         let current = crate::control::agents::section(false);
-        let legacy = crate::control::agents::known_legacy_section(false);
+        let legacy = crate::control::agents::KnownLegacyGuidance::ResourceRouting.section(false);
         let applied = std::fs::read_to_string(&paths.codex_agents).unwrap();
         std::fs::write(&paths.codex_agents, applied.replacen(&current, &legacy, 1)).unwrap();
         let mut settings = crate::control::settings::load(&paths).unwrap();

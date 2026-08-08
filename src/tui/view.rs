@@ -766,7 +766,10 @@ fn render_apply_home(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 Style::default().fg(theme::muted()),
             ),
         ]),
-        detail_line("read", &budget_summary(saved_budgets.read, saved_global)),
+        detail_line(
+            "inspect_local_file",
+            &budget_summary(saved_budgets.read, saved_global),
+        ),
         detail_line("grep", &budget_summary(saved_budgets.grep, saved_global)),
         detail_line("glob", &budget_summary(saved_budgets.glob, saved_global)),
         detail_line("run", &budget_summary(saved_budgets.run, saved_global)),
@@ -1015,6 +1018,10 @@ fn render_config(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if window.show_below {
         table_rows.push(config_more_row(messages.config_more_below));
     }
+    // The value column carries the scroll hint as well as the values, and its longest
+    // translations need every column of this share; widening the item column to fit the
+    // longest tool identifier on a narrow terminal clips those hints instead. Both columns
+    // clip below roughly 70 columns, which is the terminal's limit rather than a layout choice.
     let mut table = Table::new(
         table_rows,
         [Constraint::Percentage(42), Constraint::Percentage(58)],
@@ -4843,7 +4850,10 @@ mod tests {
                         app.messages().tier_label,
                         app.guard_messages().label,
                         app.config_messages().replace_limit_label,
-                        "read",
+                        // A prefix, because the longest tool identifier only fits the item
+                        // column on wider terminals. What this pins is that the row renders
+                        // at all, which is what the viewport is on trial for here.
+                        "inspect",
                         "grep",
                         "glob",
                         "run",
@@ -4859,7 +4869,7 @@ mod tests {
                     assert!(text.contains('└'), "{}\n{text}", language.code());
                 } else if width >= 40 {
                     assert!(
-                        contains_visible_text(&text, "read"),
+                        contains_visible_text(&text, "inspect"),
                         "{} selected child at {width}x{height}\n{text}",
                         language.code()
                     );
@@ -5280,7 +5290,7 @@ mod tests {
         app.config_cursor = ConfigCursor::default().next().next();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let top = buffer_text(&terminal);
-        assert!(contains_visible_text(&top, "read"));
+        assert!(contains_visible_text(&top, "inspect"));
         assert!(contains_visible_text(
             &top,
             app.messages().config_more_below

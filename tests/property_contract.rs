@@ -52,7 +52,7 @@ fn independent_o200k_oracle_keeps_high_entropy_outputs_below_the_budget() {
     let mut session = McpSession::start(command);
 
     let batch_response = session.call(
-        "read",
+        "inspect_local_file",
         serde_json::json!({
             "files": [
                 {"path": normalized(&source), "limit": 50, "encoding": "utf-8"},
@@ -64,7 +64,7 @@ fn independent_o200k_oracle_keeps_high_entropy_outputs_below_the_budget() {
 
     let cases = [
         session.call(
-            "read",
+            "inspect_local_file",
             serde_json::json!({"file_path": normalized(&source), "limit": 2000}),
         ),
         session.call(

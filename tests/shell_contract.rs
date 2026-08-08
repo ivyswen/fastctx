@@ -17,10 +17,10 @@ fn enable_shell_adds_exactly_five_tools_to_the_file_server() {
         [
             "glob",
             "grep",
+            "inspect_local_file",
             "job_kill",
             "job_list",
             "job_output",
-            "read",
             "replace",
             "run",
             "run_background",
@@ -45,7 +45,7 @@ fn background_status_tracks_only_known_jobs_and_consumes_terminal_entries_explic
     let running = started_job_id(mcp_text(&running_start));
     assert!(!mcp_text(&running_start).contains("(Background:"));
 
-    let read = session.call("read", read_arguments.clone());
+    let read = session.call("inspect_local_file", read_arguments.clone());
     let read_text = mcp_text(&read);
     let read_lines = read_text.lines().collect::<Vec<_>>();
     assert!(
@@ -55,14 +55,14 @@ fn background_status_tracks_only_known_jobs_and_consumes_terminal_entries_explic
     assert!(read_lines.last().unwrap().starts_with("(Complete:"));
 
     let missing = session.call(
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&temp.path().join("missing.txt"))}),
     );
     assert_eq!(missing["result"]["isError"], true);
     assert!(!mcp_text(&missing).contains("(Background:"));
 
     let mut other = shell_session(temp.path(), None);
-    let isolated = other.call("read", read_arguments.clone());
+    let isolated = other.call("inspect_local_file", read_arguments.clone());
     assert!(!mcp_text(&isolated).contains("(Background:"));
     assert!(other.close().success());
 
@@ -90,7 +90,7 @@ fn background_status_tracks_only_known_jobs_and_consumes_terminal_entries_explic
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let both = session.call("read", read_arguments.clone());
+    let both = session.call("inspect_local_file", read_arguments.clone());
     let both_status = mcp_text(&both)
         .lines()
         .find(|line| line.starts_with("(Background:"))
@@ -108,7 +108,7 @@ fn background_status_tracks_only_known_jobs_and_consumes_terminal_entries_explic
         .unwrap();
     assert!(list_status.contains(&running));
     assert!(list_status.contains(&finished));
-    let after_list = session.call("read", read_arguments.clone());
+    let after_list = session.call("inspect_local_file", read_arguments.clone());
     let after_list_status = mcp_text(&after_list)
         .lines()
         .find(|line| line.starts_with("(Background:"))
@@ -126,7 +126,7 @@ fn background_status_tracks_only_known_jobs_and_consumes_terminal_entries_explic
         .unwrap();
     assert!(consumed_status.contains(&running));
     assert!(!consumed_status.contains(&finished));
-    let after_output = session.call("read", read_arguments.clone());
+    let after_output = session.call("inspect_local_file", read_arguments.clone());
     let after_output_status = mcp_text(&after_output)
         .lines()
         .find(|line| line.starts_with("(Background:"))
@@ -136,7 +136,7 @@ fn background_status_tracks_only_known_jobs_and_consumes_terminal_entries_explic
 
     let killed = session.call("job_kill", serde_json::json!({"job_id": &running}));
     assert!(!mcp_text(&killed).contains("(Background:"));
-    let empty = session.call("read", read_arguments);
+    let empty = session.call("inspect_local_file", read_arguments);
     assert!(!mcp_text(&empty).contains("(Background:"));
     assert!(session.close().success());
 }
@@ -539,7 +539,7 @@ fn background_log_over_eight_mib_is_complete_and_the_omission_coordinate_reads_b
         "{output}"
     );
     let recovered = session.call(
-        "read",
+        "inspect_local_file",
         serde_json::json!({
             "file_path": &log_path,
             "offset": omitted,
@@ -1357,7 +1357,7 @@ fn output_encoding_errors_are_exact_and_precede_process_side_effects() {
                 "command": format!("printf touched > {}", bash_quote(&foreground_marker)),
                 "encoding": "utf-16le"
             }),
-            "Encoding \"utf-16le\" is not supported for command output. UTF-16/UTF-32 output is decoded automatically when the stream starts with a BOM; otherwise redirect the command to a file (command > file 2>&1) and read it with the read tool.",
+            "Encoding \"utf-16le\" is not supported for command output. UTF-16/UTF-32 output is decoded automatically when the stream starts with a BOM; otherwise redirect the command to a file (command > file 2>&1) and read it with the inspect_local_file tool.",
         ),
         (
             "run_background",
@@ -1368,7 +1368,7 @@ fn output_encoding_errors_are_exact_and_precede_process_side_effects() {
                 ),
                 "encoding": "utf-32be"
             }),
-            "Encoding \"utf-32be\" is not supported for command output. UTF-16/UTF-32 output is decoded automatically when the stream starts with a BOM; otherwise redirect the command to a file (command > file 2>&1) and read it with the read tool.",
+            "Encoding \"utf-32be\" is not supported for command output. UTF-16/UTF-32 output is decoded automatically when the stream starts with a BOM; otherwise redirect the command to a file (command > file 2>&1) and read it with the inspect_local_file tool.",
         ),
         (
             "job_output",
@@ -1771,7 +1771,7 @@ fn expected_run_garble_note(invalid_sequences: u64) -> String {
     };
     match expected_legacy_code_page_label() {
         Some(label) => format!(
-            "(Note: {invalid_sequences} invalid byte {noun} shown as U+FFFD — the command likely wrote {label}, this system's legacy code page. Re-run with encoding=\"{label}\", or redirect to a file and use the read tool.)"
+            "(Note: {invalid_sequences} invalid byte {noun} shown as U+FFFD — the command likely wrote {label}, this system's legacy code page. Re-run with encoding=\"{label}\", or redirect to a file and use the inspect_local_file tool.)"
         ),
         None => format!(
             "(Note: {invalid_sequences} invalid byte {noun} shown as U+FFFD. If the text looks garbled, pass the source encoding via the encoding parameter.)"

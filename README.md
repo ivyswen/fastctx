@@ -29,7 +29,7 @@ FastCtx turns common repository operations into structured input and output. The
 
 The tools cover the main parts of a coding task:
 
-- `read` reads text, images, PDFs, and raw bytes;
+- `inspect_local_file` reads text, images, PDFs, and raw bytes;
 - `grep` searches file contents;
 - `glob` finds files;
 - `replace` performs mechanical batch replacement;
@@ -151,7 +151,7 @@ FastCtx provides nine MCP tools:
 
 | Tool | Purpose |
 |---|---|
-| `read` | Read one file in any supported format, or batch 1–32 text files |
+| `inspect_local_file` | Read one file in any supported format, or batch 1–32 text files |
 | `grep` | Search contents in a file or repository tree |
 | `glob` | Find files by path pattern |
 | `replace` | Apply mechanical batch replacements to files or a repository tree |
@@ -161,11 +161,11 @@ FastCtx provides nine MCP tools:
 | `job_kill` | Stop the full process tree of a background job |
 | `job_list` | Rediscover running and retained finished jobs |
 
-`read`, `grep`, `glob`, and `replace` are published by default. The other five tools are enabled with the **Bash terminal** setting in the control terminal. Once enabled, they share the same `mcp__fastctx__*` namespace as the file tools.
+`inspect_local_file`, `grep`, `glob`, and `replace` are published by default. The other five tools are enabled with the **Bash terminal** setting in the control terminal. Once enabled, they share the `mcp__fastctx` namespace with the file tools; how a host spells an individual tool inside that namespace is the host's own convention.
 
-### `read`
+### `inspect_local_file`
 
-`read` returns 1-based line numbers for text and supports paging:
+`inspect_local_file` returns 1-based line numbers for text and supports paging:
 
 ```json
 {
@@ -199,7 +199,7 @@ When several known text files are relevant, batch them into one call instead of 
 
 The `files` form accepts 1–32 text files, preserves request order, and packs them into one shared read budget. A missing, empty, binary, or undecodable member is reported inside its own segment while the remaining files continue. If the budget fills, the final `Partial` line contains the exact compact `files=[...]` array for the next call, including per-file offsets, remaining limits, and encodings. Images, PDFs, and hex view remain single-file calls.
 
-`read` also supports:
+`inspect_local_file` also supports:
 
 - PNG, JPG, GIF, WebP, and BMP images;
 - PDF text layers and rendered page images;
@@ -327,7 +327,7 @@ Commands run in a non-interactive environment. Installation, confirmation, and e
 
 On Windows, every FastCtx-owned non-interactive child process is created without allocating a console window, including Bash discovery, foreground/background Bash, detached supervisors, and doctor probes. There is no hidden-window parameter to remember. A command that explicitly launches a GUI or a new terminal still has that visible effect.
 
-Output uses bounded memory. When output exceeds the response capacity, the final status line reports the truncated range and gives a path to the complete result: redirect the command output to a file, then page through it with `read`.
+Output uses bounded memory. When output exceeds the response capacity, the final status line reports the truncated range and gives a path to the complete result: redirect the command output to a file, then page through it with `inspect_local_file`.
 
 #### Command environment
 
@@ -350,7 +350,7 @@ Two environment variables configure this. Both are read from either the persiste
 
 Each job is owned by a detached supervisor rather than by the MCP server. It keeps running across server exits, ChatGPT / Codex restarts, and session changes until the command exits or `job_kill` stops it. There is no background timeout parameter.
 
-Output and exit status are stored under `~/.fastctx/jobs/`, so another FastCtx session can resume the same job by id. For jobs started by the current format, output is appended to a plain log file whose path is returned when the job starts, so `read` and `grep` work on the retained prefix directly. At supervisor startup, each job freezes a hard ceiling for the combined log and line index from the current `fastshell.job_storage_limit_mib` setting. If output reaches that ceiling, FastCtx keeps draining the child process so the command can finish, stops persisting further bytes, and records an explicit truncation notice without changing the command's exit code.
+Output and exit status are stored under `~/.fastctx/jobs/`, so another FastCtx session can resume the same job by id. For jobs started by the current format, output is appended to a plain log file whose path is returned when the job starts, so `inspect_local_file` and `grep` work on the retained prefix directly. At supervisor startup, each job freezes a hard ceiling for the combined log and line index from the current `fastshell.job_storage_limit_mib` setting. If output reaches that ceiling, FastCtx keeps draining the child process so the command can finish, stops persisting further bytes, and records an explicit truncation notice without changing the command's exit code.
 
 While one MCP session has jobs that it started or queried, every successful text result from that session carries a one-line background readout with each job's current state and elapsed time. The readout refreshes only when another tool is called; it is not a notification and nothing is pushed while the caller is idle. A finished entry remains visible until that session handles it with `job_output` or `job_kill`.
 
@@ -358,7 +358,7 @@ While one MCP session has jobs that it started or queried, every successful text
 
 `job_output` queries a background job, including jobs started in earlier sessions, and reports `running`, `exited`, or `interrupted` together with the newest output the caller has not been shown. `wait_ms` (0–240000, default 30000) is how long the query may take: it returns as soon as the job ends and otherwise waits the window out; intermediate lines do not end the wait. Pass `wait_ms=0` for an immediate snapshot, and raise it only when there is nothing else to do because the call blocks. Long current-format output is windowed — the newest lines that fit, plus the start of the log on the first call — and a note names the exact lines that were skipped and the log path to read them from. Line numbers in that log are the same `seq` numbers `after_seq` takes, so moving between the two tools needs no translation. Records written by the preceding segmented format remain readable, including while an older supervisor is still appending, but they do not advertise direct log coordinates and cannot recover bytes that their original rolling window already evicted.
 
-`Complete` appears only after the job ends; a development server or watcher may never reach it. Before the per-job disk ceiling is reached, anything a response leaves out is still one `read` or `grep` away. After the ceiling is reached, `job_output` and the Jobs dashboard identify the last retained sequence and explain that the supervisor continued draining without persistence. The compatibility limitation above applies only to records created by the preceding format.
+`Complete` appears only after the job ends; a development server or watcher may never reach it. Before the per-job disk ceiling is reached, anything a response leaves out is still one `inspect_local_file` or `grep` away. After the ceiling is reached, `job_output` and the Jobs dashboard identify the last retained sequence and explain that the supervisor continued draining without persistence. The compatibility limitation above applies only to records created by the preceding format.
 
 ### `job_kill`
 
@@ -378,7 +378,7 @@ The FastCtx MCP server inherits the local permissions of the host process.
 
 | Capability | Default state | Access scope |
 |---|---|---|
-| `read` / `grep` / `glob` | Enabled | Local files readable by the host process |
+| `inspect_local_file` / `grep` / `glob` | Enabled | Local files readable by the host process |
 | `replace` | Enabled | Local file writes with dry-run, CAS, and atomic replacement safeguards |
 | Bash tools | Disabled | Bash command execution after the user enables them |
 | TUI update check | Enabled for npm and GitHub Release launches | Version metadata from `registry.npmjs.org` and GitHub's `releases/latest` web redirect; downloads require explicit confirmation |

@@ -47,7 +47,7 @@ pub struct ToolContract {
 
 const TOOL_ENTRIES: [ToolManifestEntry; 9] = [
     ToolManifestEntry {
-        name: "read",
+        name: "inspect_local_file",
         group: ToolGroup::File,
     },
     ToolManifestEntry {
@@ -147,7 +147,7 @@ impl ToolManifest {
             }
             let expected_read_only = matches!(
                 tool.name.as_ref(),
-                "read" | "grep" | "glob" | "job_output" | "job_list"
+                "inspect_local_file" | "grep" | "glob" | "job_output" | "job_list"
             );
             if annotations.read_only_hint != Some(expected_read_only)
                 || annotations.destructive_hint != Some(false)
@@ -234,34 +234,34 @@ mod tests {
         let mut tools = FastCtxServer::new().tool_definitions();
         let duplicate = tools
             .iter()
-            .find(|tool| tool.name == "read")
+            .find(|tool| tool.name == "inspect_local_file")
             .unwrap()
             .clone();
         tools.push(duplicate);
         assert_eq!(
             ToolManifest::validate(&tools, false).unwrap_err(),
-            "tool router contains duplicate names: read"
+            "tool router contains duplicate names: inspect_local_file"
         );
         assert_eq!(
             ToolManifest::contracts(&tools).unwrap_err(),
-            "tool router contains duplicate name: read"
+            "tool router contains duplicate name: inspect_local_file"
         );
 
         let mut missing = FastCtxServer::new().tool_definitions();
         missing
             .iter_mut()
-            .find(|tool| tool.name == "read")
+            .find(|tool| tool.name == "inspect_local_file")
             .unwrap()
             .annotations = None;
         assert_eq!(
             ToolManifest::validate(&missing, false).unwrap_err(),
-            "tool read is missing annotations"
+            "tool inspect_local_file is missing annotations"
         );
 
         let mut incorrect = FastCtxServer::new().tool_definitions();
         incorrect
             .iter_mut()
-            .find(|tool| tool.name == "read")
+            .find(|tool| tool.name == "inspect_local_file")
             .unwrap()
             .annotations
             .as_mut()
@@ -269,7 +269,7 @@ mod tests {
             .open_world_hint = Some(true);
         assert_eq!(
             ToolManifest::validate(&incorrect, false).unwrap_err(),
-            "tool read has incorrect permission annotations: expected readOnlyHint=true, destructiveHint=false, openWorldHint=false"
+            "tool inspect_local_file has incorrect permission annotations: expected readOnlyHint=true, destructiveHint=false, openWorldHint=false"
         );
     }
 
@@ -278,7 +278,7 @@ mod tests {
         let tool = FastCtxServer::new()
             .tool_definitions()
             .into_iter()
-            .find(|tool| tool.name == "read")
+            .find(|tool| tool.name == "inspect_local_file")
             .unwrap();
         let before = contract_hash(&tool, ToolGroup::File);
 

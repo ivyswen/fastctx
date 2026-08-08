@@ -10,13 +10,16 @@ use std::process::Command;
 fn replace_is_default_and_deprecated_enable_edit_is_a_noop() {
     let temp = tempfile::tempdir().unwrap();
     let mut default = edit_session(temp.path(), None);
-    assert_eq!(default.list_tools(), ["glob", "grep", "read", "replace"]);
+    assert_eq!(
+        default.list_tools(),
+        ["glob", "grep", "inspect_local_file", "replace"]
+    );
     assert!(default.close().success());
 
     let mut compatibility = McpSession::start(edit_command(temp.path(), None, true));
     assert_eq!(
         compatibility.list_tools(),
-        ["glob", "grep", "read", "replace"]
+        ["glob", "grep", "inspect_local_file", "replace"]
     );
     assert!(compatibility.close().success());
 }

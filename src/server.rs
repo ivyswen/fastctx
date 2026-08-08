@@ -124,10 +124,10 @@ impl FastCtxServer {
         // is observable so the positive route still has one production source.
         tool_router
             .map
-            .get_mut("read")
-            .expect("the compiled file router must contain read")
+            .get_mut("inspect_local_file")
+            .expect("the compiled file router must contain inspect_local_file")
             .attr
-            .description = Some(crate::model_guidance::read_tool_description().into());
+            .description = Some(crate::model_guidance::inspect_tool_description().into());
         for entry in ToolManifest::entries() {
             if !entry.group.enabled(options.enable_shell) {
                 tool_router.remove_route(entry.name);
@@ -176,16 +176,19 @@ impl Default for FastCtxServer {
 #[tool_router(router = file_tool_router, vis = "pub(crate)")]
 impl FastCtxServer {
     #[tool(
-        name = "read",
-        description = "Read local files.",
+        name = "inspect_local_file",
+        description = "Inspect local files.",
         annotations(
-            title = "Read local file",
+            title = "Inspect local file",
             read_only_hint = true,
             destructive_hint = false,
             open_world_hint = false
         )
     )]
-    async fn read(&self, Parameters(request): Parameters<ReadRequest>) -> CallToolResult {
+    async fn inspect_local_file(
+        &self,
+        Parameters(request): Parameters<ReadRequest>,
+    ) -> CallToolResult {
         let _activity = self.activity.request();
         let status_shell = self.shell.clone();
         run_blocking(

@@ -80,17 +80,23 @@ fn help_version_ui_guard_and_language_errors_are_scriptable() {
 #[test]
 fn default_pipe_and_serve_flags_route_exact_tool_sets() {
     for (arguments, expected) in [
-        (vec![], vec!["glob", "grep", "read", "replace"]),
-        (vec!["serve"], vec!["glob", "grep", "read", "replace"]),
+        (
+            vec![],
+            vec!["glob", "grep", "inspect_local_file", "replace"],
+        ),
+        (
+            vec!["serve"],
+            vec!["glob", "grep", "inspect_local_file", "replace"],
+        ),
         (
             vec!["serve", "--enable-shell"],
             vec![
                 "glob",
                 "grep",
+                "inspect_local_file",
                 "job_kill",
                 "job_list",
                 "job_output",
-                "read",
                 "replace",
                 "run",
                 "run_background",
@@ -98,17 +104,17 @@ fn default_pipe_and_serve_flags_route_exact_tool_sets() {
         ),
         (
             vec!["serve", "--enable-edit"],
-            vec!["glob", "grep", "read", "replace"],
+            vec!["glob", "grep", "inspect_local_file", "replace"],
         ),
         (
             vec!["serve", "--enable-shell", "--enable-edit"],
             vec![
                 "glob",
                 "grep",
+                "inspect_local_file",
                 "job_kill",
                 "job_list",
                 "job_output",
-                "read",
                 "replace",
                 "run",
                 "run_background",
@@ -265,7 +271,7 @@ fn explicit_serve_performs_a_real_initialize_and_tools_list() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(names, ["glob", "grep", "read", "replace"]);
+    assert_eq!(names, ["glob", "grep", "inspect_local_file", "replace"]);
     drop(stdin);
     assert!(child.wait().unwrap().success());
 }
@@ -559,7 +565,7 @@ fn noninteractive_apply_is_idempotent_and_unapply_restores_user_files() {
 
     let drifted_agents = String::from_utf8(user_extended_agents)
         .unwrap()
-        .replace("mcp__fastctx__read", "mcp__fastctx__read_broken");
+        .replace("inspect_local_file", "inspect_local_file_broken");
     std::fs::write(codex.join("AGENTS.md"), drifted_agents).unwrap();
     let mut agents_drift_command = isolated_command(temp.path());
     agents_drift_command.arg("status").env("PATH", &empty_path);
@@ -971,9 +977,9 @@ fn apply_status_and_unapply_cover_both_shell_states() {
         assert_eq!(agents.matches("<!-- fastctx:end -->").count(), 1);
         assert_eq!(agents.contains("### Shell commands"), fastshell);
         assert!(agents.contains("### Batch replacement"), "{agents}");
-        assert!(agents.contains("mcp__fastctx__replace"), "{agents}");
+        assert!(agents.contains("FastCtx's `replace`"), "{agents}");
         for removed in ["copy", "cut", "paste", "clips", "drop"] {
-            assert!(!agents.contains(&format!("mcp__fastctx__{removed}")));
+            assert!(!agents.contains(&format!("`{removed}`")));
         }
         let status = isolated_command(temp.path())
             .arg("status")
@@ -1031,7 +1037,7 @@ fn reapply_removes_a_disabled_shell_flag_from_the_single_server() {
     let agents = std::fs::read_to_string(temp.path().join(".codex/AGENTS.md")).unwrap();
     assert!(!agents.contains("### Shell commands"));
     assert!(agents.contains("### Batch replacement"));
-    assert!(agents.contains("mcp__fastctx__replace"));
+    assert!(agents.contains("FastCtx's `replace`"));
 }
 
 #[test]
@@ -1147,7 +1153,7 @@ fn apply_migrates_owned_three_server_config_and_legacy_agents_blocks_atomically(
     assert_eq!(agents.matches("<!-- fastctx:begin -->").count(), 1);
     assert!(agents.contains("### Shell commands"), "{agents}");
     assert!(agents.contains("### Batch replacement"), "{agents}");
-    assert!(agents.contains("mcp__fastctx__replace"), "{agents}");
+    assert!(agents.contains("FastCtx's `replace`"), "{agents}");
     assert!(!agents.contains("mcp__fastctx__copy"), "{agents}");
     assert!(!agents.contains("mcp__fastctx__paste"), "{agents}");
 }

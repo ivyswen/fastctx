@@ -20,13 +20,13 @@ fn every_file_tool_accepts_local_file_uris_without_echoing_them() {
 
     assert_same_success(
         &mut session,
-        "read",
+        "inspect_local_file",
         json!({"file_path": plain_file}),
         json!({"file_path": uri_file}),
     );
     let batch = assert_same_success(
         &mut session,
-        "read",
+        "inspect_local_file",
         json!({"files": [{"path": plain_file, "limit": 2}]}),
         json!({"files": [{"path": uri_file, "limit": 2}]}),
     );
@@ -66,8 +66,11 @@ fn every_file_tool_accepts_local_file_uris_without_echoing_them() {
 
     let unsupported = "https://example.invalid/file.txt";
     for (tool, arguments) in [
-        ("read", json!({"file_path": unsupported})),
-        ("read", json!({"files": [{"path": unsupported}]})),
+        ("inspect_local_file", json!({"file_path": unsupported})),
+        (
+            "inspect_local_file",
+            json!({"files": [{"path": unsupported}]}),
+        ),
         ("grep", json!({"pattern": "hit", "path": unsupported})),
         ("glob", json!({"pattern": "*", "path": unsupported})),
         (
@@ -111,7 +114,7 @@ fn batch_uri_continuations_match_the_equivalent_plain_symlink_path() {
 
     let response = assert_same_success(
         &mut session,
-        "read",
+        "inspect_local_file",
         json!({"files": [{"path": plain_alias, "limit": 1}]}),
         json!({"files": [{"path": uri_alias, "limit": 1}]}),
     );

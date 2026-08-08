@@ -230,7 +230,7 @@ pub(crate) fn item_label(
         ConfigItemId::OutputTier => messages.tier_label,
         ConfigItemId::OutputGuard => guard_messages.label,
         ConfigItemId::ReplaceFileLimit => config_messages.replace_limit_label,
-        ConfigItemId::ReadBudget => "read",
+        ConfigItemId::ReadBudget => "inspect_local_file",
         ConfigItemId::GrepBudget => "grep",
         ConfigItemId::GlobBudget => "glob",
         ConfigItemId::RunBudget => "run",

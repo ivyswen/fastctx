@@ -95,7 +95,7 @@ pub(crate) fn validate_output_encoding(value: &str) -> Result<OutputEncoding, St
 
 fn wide_label_error(value: &str) -> String {
     format!(
-        "Encoding \"{value}\" is not supported for command output. UTF-16/UTF-32 output is decoded automatically when the stream starts with a BOM; otherwise redirect the command to a file (command > file 2>&1) and read it with the read tool."
+        "Encoding \"{value}\" is not supported for command output. UTF-16/UTF-32 output is decoded automatically when the stream starts with a BOM; otherwise redirect the command to a file (command > file 2>&1) and read it with the inspect_local_file tool."
     )
 }
 
@@ -318,7 +318,7 @@ pub(crate) fn run_garble_note(invalid_sequences: u64) -> Option<String> {
     };
     Some(match legacy_code_page_label() {
         Some(label) => format!(
-            "(Note: {invalid_sequences} invalid byte {noun} shown as U+FFFD — the command likely wrote {label}, this system's legacy code page. Re-run with encoding=\"{label}\", or redirect to a file and use the read tool.)"
+            "(Note: {invalid_sequences} invalid byte {noun} shown as U+FFFD — the command likely wrote {label}, this system's legacy code page. Re-run with encoding=\"{label}\", or redirect to a file and use the inspect_local_file tool.)"
         ),
         None => format!(
             "(Note: {invalid_sequences} invalid byte {noun} shown as U+FFFD. If the text looks garbled, pass the source encoding via the encoding parameter.)"
@@ -432,7 +432,7 @@ mod tests {
         );
         assert_eq!(
             validate_output_encoding("utf-16le").unwrap_err(),
-            "Encoding \"utf-16le\" is not supported for command output. UTF-16/UTF-32 output is decoded automatically when the stream starts with a BOM; otherwise redirect the command to a file (command > file 2>&1) and read it with the read tool."
+            "Encoding \"utf-16le\" is not supported for command output. UTF-16/UTF-32 output is decoded automatically when the stream starts with a BOM; otherwise redirect the command to a file (command > file 2>&1) and read it with the inspect_local_file tool."
         );
     }
 

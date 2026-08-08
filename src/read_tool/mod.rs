@@ -1,4 +1,4 @@
-//! Text, image, PDF, and raw-byte dispatch for the read tool.
+//! Text, image, PDF, and raw-byte dispatch for the file-inspection tool.
 
 mod batch;
 mod hex_file;
@@ -53,7 +53,7 @@ enum ViewMode {
     Hex,
 }
 
-/// Parameters for the read tool; offset is a one-based line number.
+/// Parameters for the file-inspection tool; offset is a one-based line number.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadRequest {

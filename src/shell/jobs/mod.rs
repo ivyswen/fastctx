@@ -822,7 +822,7 @@ fn render_candidate(
         for (line, truncated) in selected.iter().zip(&decoded.truncated_per_line) {
             if *truncated {
                 notes.push(format!(
-                    "(Note: line {} was truncated at 2000 chars in this response; read the complete line at {} with offset={}, or inspect a fragment with grep or the read tool's hex view.)",
+                    "(Note: line {} was truncated at 2000 chars in this response; read the complete line at {} with offset={}, or inspect a fragment with grep or the inspect_local_file tool's hex view.)",
                     line.seq,
                     display_path(path),
                     line.seq
