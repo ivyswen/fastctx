@@ -149,7 +149,7 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
     assert_positive_local_path_schema(&grep.input_schema["properties"]["path"]);
     assert_eq!(
         grep.input_schema["properties"]["encoding"]["description"],
-        "Single-file target only: decode that file with this WHATWG encoding label (e.g. \"gbk\"), same semantics as read's encoding. On a directory target use fallback_encoding instead."
+        "Single-file target only: decode that file with this WHATWG encoding label (e.g. \"gbk\"), same semantics as inspect_local_file's encoding. On a directory target use fallback_encoding instead."
     );
     assert_eq!(
         grep.input_schema["properties"]["fallback_encoding"]["description"],
@@ -310,7 +310,8 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
             "never PowerShell. Commands must be non-interactive: there is no TTY or\n",
             "stdin; use flags like -y or --no-edit. A non-zero exit code is a normal\n",
             "result, not an error. Oversized output is truncated; for the full output,\n",
-            "redirect it to a file (command > file 2>&1) and page that file with read.\n",
+            "redirect it to a file (command > file 2>&1) and page that file with\n",
+            "inspect_local_file.\n",
             "Default timeout 120000 ms, ceiling 240000 — start anything that may outlast\n",
             "it with run_background. If output looks garbled (U+FFFD), pass encoding\n",
             "(e.g. \"gbk\"). The last line states Complete or Partial."
@@ -340,8 +341,8 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
             "output and exit code stay retrievable by job_id. Check on it with\n",
             "job_output; stop with job_kill; rediscover past jobs with job_list. There\n",
             "is no timeout: a job runs until it exits or is killed. Everything it\n",
-            "prints is kept in a plain log file whose path is returned here; read or\n",
-            "grep that path for anything job_output does not show. While your jobs\n",
+            "prints is kept in a plain log file whose path is returned here;\n",
+            "inspect_local_file or grep that path for anything job_output does not show. While your jobs\n",
             "run, every FastCtx result carries a one-line background status naming\n",
             "each job and how long it has run, just above the closing Complete or\n",
             "Partial line. It is a readout, not a notification: it refreshes only when\n",
@@ -375,8 +376,8 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
             "started in earlier sessions. Long output is windowed: the newest lines\n",
             "that fit, the start of the log on the first call, and a note naming the\n",
             "exact lines skipped. The job's whole output is a plain log file on disk\n",
-            "whose line numbers are the seq numbers used here, so read or grep that\n",
-            "path for anything not shown. The call blocks up to wait_ms, so raise it\n",
+            "whose line numbers are the seq numbers used here, so inspect_local_file or\n",
+            "grep that path for anything not shown. The call blocks up to wait_ms, so raise it\n",
             "only when you have nothing else to do. If output looks garbled (U+FFFD),\n",
             "call again with encoding set to the source encoding (e.g. \"gbk\").\n",
             "Complete appears only once the job ends; servers and watchers never reach\n",

@@ -218,7 +218,8 @@ fn contract_hash(tool: &Tool, group: ToolGroup) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ToolGroup, ToolManifest, contract_hash};
-    use crate::server::FastCtxServer;
+    use crate::server::{FastCtxServer, ServerOptions};
+    use std::collections::BTreeSet;
 
     #[test]
     fn enabled_combinations_have_the_frozen_counts_and_order() {
@@ -304,5 +305,155 @@ mod tests {
         assert_ne!(before, contract_hash(&changed_annotations, ToolGroup::File));
 
         assert_ne!(before, contract_hash(&tool, ToolGroup::Shell));
+    }
+
+    /// Underscore-shaped identifiers model-visible prose may cite even though no tool,
+    /// parameter, or schema enum vouches for them.
+    const DOCUMENTED_PROSE_LITERALS: [&str; 3] = [
+        // grep's output_mode is a free-form string, so its default value exists only in prose.
+        "files_with_matches",
+        // The job_list page-size setting cited by the limit parameter's description.
+        "job_list_limit",
+        // A WHATWG encoding label used as an example value in encoding parameters.
+        "shift_jis",
+    ];
+
+    fn all_published_tools() -> Vec<rmcp::model::Tool> {
+        FastCtxServer::with_options(ServerOptions::all()).tool_definitions()
+    }
+
+    /// Labelled model-visible prose plus the identifier vocabulary the same surface
+    /// publishes: tool names, every schema property name, and every schema enum value.
+    fn model_visible_prose_and_vocabulary() -> (Vec<(String, String)>, BTreeSet<String>) {
+        let mut vocabulary: BTreeSet<String> = ToolManifest::entries()
+            .iter()
+            .map(|entry| entry.name.to_string())
+            .collect();
+        vocabulary.extend(DOCUMENTED_PROSE_LITERALS.iter().map(|literal| literal.to_string()));
+        let mut prose = vec![(
+            "server instructions".to_string(),
+            crate::model_guidance::server_instructions(true),
+        )];
+        for tool in all_published_tools() {
+            if let Some(description) = tool.description.as_deref() {
+                prose.push((format!("{} description", tool.name), description.to_string()));
+            }
+            if let Some(title) = tool.annotations.as_ref().and_then(|entry| entry.title.clone()) {
+                prose.push((format!("{} title", tool.name), title));
+            }
+            let schema = serde_json::Value::Object((*tool.input_schema).clone());
+            collect_schema_prose_and_vocabulary(&schema, &tool.name, &mut prose, &mut vocabulary);
+        }
+        (prose, vocabulary)
+    }
+
+    fn collect_schema_prose_and_vocabulary(
+        value: &serde_json::Value,
+        tool: &str,
+        prose: &mut Vec<(String, String)>,
+        vocabulary: &mut BTreeSet<String>,
+    ) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, entry) in map {
+                    match (key.as_str(), entry) {
+                        ("properties", serde_json::Value::Object(properties)) => {
+                            vocabulary.extend(properties.keys().cloned());
+                        }
+                        ("enum", serde_json::Value::Array(values)) => {
+                            for value in values {
+                                if let serde_json::Value::String(text) = value {
+                                    vocabulary.insert(text.clone());
+                                }
+                            }
+                        }
+                        ("description", serde_json::Value::String(text)) => {
+                            prose.push((format!("{tool} schema"), text.clone()));
+                        }
+                        _ => {}
+                    }
+                    collect_schema_prose_and_vocabulary(entry, tool, prose, vocabulary);
+                }
+            }
+            serde_json::Value::Array(entries) => {
+                for entry in entries {
+                    collect_schema_prose_and_vocabulary(entry, tool, prose, vocabulary);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Tokens of lowercase letters, digits, and underscores; only those containing an
+    /// underscore are identifier-shaped. Hyphenated words split, so "single-file" never
+    /// counts, while possessives shed their tail ("inspect_local_file's" resolves).
+    fn identifier_tokens(text: &str) -> Vec<String> {
+        split_tokens(text, |character: char| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+        .into_iter()
+        .map(|token| token.trim_matches('_').to_string())
+        .filter(|token| token.contains('_'))
+        .collect()
+    }
+
+    /// Word tokens where '-' and '\'' bind, so "re-read" and "read's" survive as single
+    /// tokens distinct from the bare word "read".
+    fn word_tokens(text: &str) -> Vec<String> {
+        split_tokens(text, |character: char| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | '-' | '\'')
+        })
+    }
+
+    fn split_tokens(text: &str, keep: impl Fn(char) -> bool) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut current = String::new();
+        for character in text.chars() {
+            if keep(character) {
+                current.push(character);
+            } else if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            tokens.push(current);
+        }
+        tokens
+    }
+
+    /// The file tool shipped as `read` through 0.2.4, and renaming it stranded prose in
+    /// other tools' descriptions that still cited the old name. Every underscore-shaped
+    /// identifier in model-visible prose must resolve against the published vocabulary so
+    /// a rename can never strand references again (2026-08-08).
+    #[test]
+    fn model_visible_prose_cites_only_published_identifiers() {
+        let (prose, vocabulary) = model_visible_prose_and_vocabulary();
+        for (context, text) in &prose {
+            for token in identifier_tokens(&text.to_lowercase()) {
+                assert!(
+                    vocabulary.contains(&token),
+                    "{context} cites `{token}`, which no published tool, parameter, or documented value resolves; full text: {text}"
+                );
+            }
+        }
+    }
+
+    /// `read` was the file tool's name for three releases, so any standalone "read" in
+    /// model-visible prose still presents it as callable. Prose must pick another verb or
+    /// name inspect_local_file outright; hyphenated forms like "re-read" stay legal
+    /// (2026-08-08).
+    #[test]
+    fn model_visible_prose_never_says_bare_read() {
+        let (prose, _) = model_visible_prose_and_vocabulary();
+        for (context, text) in &prose {
+            for token in word_tokens(&text.to_lowercase()) {
+                assert!(
+                    token != "read" && token != "read's",
+                    "{context} says bare `read`, the file tool's retired name; full text: {text}"
+                );
+            }
+        }
     }
 }

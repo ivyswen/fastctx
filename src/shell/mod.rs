@@ -65,7 +65,7 @@ pub struct RunBackgroundRequest {
     #[serde(default = "default_login_shell")]
     #[schemars(default = "default_login_shell")]
     pub login_shell: bool,
-    /// Default source encoding for this job's output when read with job_output (WHATWG label
+    /// Default source encoding for this job's output when shown by job_output (WHATWG label
     /// like "gbk"). Each job_output call may override it.
     pub encoding: Option<String>,
 }

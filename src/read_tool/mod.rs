@@ -42,7 +42,7 @@ const DEFAULT_HEX_LINE_LIMIT: usize = 2_000;
 const MAX_LINE_CHARS: usize = 2_000;
 const TOTAL_COUNT_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 
-/// Automatic read dispatch or raw-byte viewing.
+/// Automatic channel dispatch or raw-byte viewing.
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum ViewMode {
@@ -57,21 +57,21 @@ enum ViewMode {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadRequest {
-    /// File to read; mutually exclusive with files.
+    /// File to inspect; mutually exclusive with files.
     #[schemars(description = crate::model_guidance::local_path_description(
-        "File to read; both / and \\\\ are accepted. Mutually exclusive with files."
+        "File to inspect; both / and \\\\ are accepted. Mutually exclusive with files."
     ))]
     pub file_path: Option<String>,
     /// Batch form: an array of {"path", "offset"?, "limit"?, "encoding"?} objects for
-    /// reading 1-32 text files in one call. Each entry behaves like a single-file text read;
-    /// results are packed in request order. Mutually exclusive with file_path and with the
-    /// top-level offset/limit/encoding/pages/pdf_mode/view parameters.
+    /// reading 1-32 text files in one call. Each entry behaves like its own single-file
+    /// text request; results are packed in request order. Mutually exclusive with file_path
+    /// and with the top-level offset/limit/encoding/pages/pdf_mode/view parameters.
     #[schemars(length(min = 1, max = 32))]
     pub files: Option<Vec<BatchReadEntry>>,
     /// The 1-based line number to start reading from. Use for paging through large files.
     #[schemars(range(min = 1))]
     pub offset: Option<usize>,
-    /// The number of lines to read. Omit to read as much as the output budget holds.
+    /// The number of lines to return. Omit to return as much as the output budget holds.
     #[schemars(range(min = 1))]
     pub limit: Option<usize>,
     /// Page range for PDF files, e.g. "1-5", "3", "10-20". Max 20 pages per call. Required in text mode for PDFs with more than 10 pages.
@@ -86,22 +86,22 @@ pub struct ReadRequest {
     pub view: Option<String>,
 }
 
-/// One text file in a batch read request.
+/// One text file in a batch inspection request.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BatchReadEntry {
-    /// Text file to read.
+    /// Text file to inspect.
     #[schemars(description = crate::model_guidance::local_path_description(
-        "Text file to read; both / and \\\\ are accepted."
+        "Text file to inspect; both / and \\\\ are accepted."
     ))]
     pub path: String,
     /// The 1-based line number to start reading from.
     #[schemars(range(min = 1))]
     pub offset: Option<usize>,
-    /// Maximum lines to read from this file in this call. Omit to let the shared budget decide.
+    /// Maximum lines to return from this file in this call. Omit to let the shared budget decide.
     #[schemars(range(min = 1))]
     pub limit: Option<usize>,
-    /// Known source encoding for this file, using the same labels as single-file read.
+    /// Known source encoding for this file, using the same labels as the top-level encoding parameter.
     pub encoding: Option<String>,
 }
 
