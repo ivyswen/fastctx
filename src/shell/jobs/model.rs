@@ -81,6 +81,15 @@ fn is_natural_exit(kind: &TerminationKind) -> bool {
     *kind == TerminationKind::Exited
 }
 
+impl ExitRecord {
+    /// Whether job_kill ended this job. Displays must say "killed" instead of showing
+    /// exit_code: Windows TerminateProcess hardcodes exit code 1, so the number cannot
+    /// distinguish a requested stop from a real failure (2026-08-08).
+    pub(crate) fn was_killed(&self) -> bool {
+        self.termination == TerminationKind::Killed
+    }
+}
+
 /// One durable capture failure; the command itself continues to run.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct CaptureErrorRecord {

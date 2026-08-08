@@ -535,7 +535,7 @@ fn terminate(paths: &ControlPaths, job_id: &str) -> Result<KillState, String> {
                     "Cannot kill job {job_id}: its supervisor did not acknowledge within 6 seconds. Retry job_kill or stop the supervisor process manually."
                 ));
             }
-            JobStatus::Exited(exit) if exit.termination == TerminationKind::Killed => {
+            JobStatus::Exited(exit) if exit.was_killed() => {
                 return Ok(KillState::Killed);
             }
             JobStatus::Exited(exit) => return Ok(KillState::AlreadyExited(exit.exit_code)),
@@ -977,6 +977,12 @@ fn output_terminal(
     }
     if let Some(path) = snapshot.direct_log.as_ref() {
         return match &snapshot.status {
+            JobStatus::Exited(exit) if exit.was_killed() => format!(
+                "(Complete: job {job_id} was killed; {} {} total. Full log: {})",
+                snapshot.total_lines,
+                plural(snapshot.total_lines, "line", "lines"),
+                display_path(path)
+            ),
             JobStatus::Exited(exit) => format!(
                 "(Complete: job {job_id} exited {}; {} {} total. Full log: {})",
                 exit.exit_code,
@@ -999,6 +1005,9 @@ fn output_terminal(
             || snapshot.head.last().is_some_and(|line| line.seq > next));
     if more {
         return match &snapshot.status {
+            JobStatus::Exited(exit) if exit.was_killed() => format!(
+                "(Partial: job {job_id} was killed; more legacy output remains. Call job_output again with after_seq={next}.)"
+            ),
             JobStatus::Exited(exit) => format!(
                 "(Partial: job {job_id} exited {}; more legacy output remains. Call job_output again with after_seq={next}.)",
                 exit.exit_code
@@ -1015,6 +1024,11 @@ fn output_terminal(
         ""
     };
     match &snapshot.status {
+        JobStatus::Exited(exit) if exit.was_killed() => format!(
+            "(Complete: job {job_id} was killed; {} {} total{loss}.)",
+            snapshot.total_lines,
+            plural(snapshot.total_lines, "line", "lines")
+        ),
         JobStatus::Exited(exit) => format!(
             "(Complete: job {job_id} exited {}; {} {} total{loss}.)",
             exit.exit_code,
@@ -1203,6 +1217,7 @@ fn job_list_status_name(status: JobListStatus) -> &'static str {
 fn format_job_entry(record: &JobRecord) -> String {
     let status = match &record.status {
         JobStatus::Running => "running".to_string(),
+        JobStatus::Exited(exit) if exit.was_killed() => "killed".to_string(),
         JobStatus::Exited(exit) => format!("exited {}", exit.exit_code),
         JobStatus::Interrupted => "interrupted".to_string(),
     };

@@ -665,6 +665,42 @@ fn job_output_wait_window_delivers_accumulated_output_without_returning_on_each_
     assert!(session.close().success());
 }
 
+/// A stop requested through job_kill must never display as a plain exit code:
+/// Windows TerminateProcess hardcodes exit code 1, which reads as a real failure.
+/// A fresh-host field test hit exactly this misreport (2026-08-08).
+#[test]
+fn killed_jobs_report_killed_not_a_synthetic_exit_code() {
+    let _serial = shell_contract_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let mut session = shell_session(temp.path(), None);
+    let started = session.call(
+        "run_background",
+        serde_json::json!({"command": "sleep 30", "login_shell": false}),
+    );
+    let job_id = started_job_id(mcp_text(&started));
+    let killed = session.call("job_kill", serde_json::json!({"job_id": job_id}));
+    assert_eq!(
+        mcp_text(&killed),
+        format!("(Complete: job {job_id} killed.)")
+    );
+    let output = session.call(
+        "job_output",
+        serde_json::json!({"job_id": job_id, "wait_ms": 0}),
+    );
+    let text = mcp_text(&output);
+    assert!(
+        text.contains(&format!("(Complete: job {job_id} was killed; ")),
+        "{text}"
+    );
+    let listed = session.call("job_list", serde_json::json!({"status": "finished"}));
+    let listed_text = mcp_text(&listed);
+    assert!(
+        listed_text.contains(&format!("{job_id}  killed; started ")),
+        "{listed_text}"
+    );
+    assert!(session.close().success());
+}
+
 #[test]
 fn background_default_cursor_and_explicit_after_seq_are_lossless_and_idempotent() {
     let _serial = shell_contract_guard();

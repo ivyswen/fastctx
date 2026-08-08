@@ -95,8 +95,9 @@ impl BackgroundTracker {
                 Ok(Some(record)) => {
                     let start = tracked_start(&record, fallback.started_at);
                     self.jobs.lock().unwrap().insert(job_id.clone(), start);
-                    let state = match record.status {
+                    let state = match &record.status {
                         JobStatus::Running => BackgroundState::Running,
+                        JobStatus::Exited(exit) if exit.was_killed() => BackgroundState::Killed,
                         JobStatus::Exited(exit) => BackgroundState::Exited(exit.exit_code),
                         JobStatus::Interrupted => BackgroundState::Interrupted,
                     };

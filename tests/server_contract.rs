@@ -371,8 +371,8 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
     assert_eq!(
         output.description.as_deref(),
         Some(concat!(
-            "Query a background job: its status (running, exited with its code, or\n",
-            "interrupted) plus output you have not been shown yet. Works for jobs\n",
+            "Query a background job: its status (running, exited with its code,\n",
+            "killed, or interrupted) plus output you have not been shown yet. Works for jobs\n",
             "started in earlier sessions. Long output is windowed: the newest lines\n",
             "that fit, the start of the log on the first call, and a note naming the\n",
             "exact lines skipped. The job's whole output is a plain log file on disk\n",
