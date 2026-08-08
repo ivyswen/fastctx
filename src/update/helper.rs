@@ -1758,9 +1758,9 @@ fn expected_npm_platform_package() -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NPM_HANDOFF_SCHEMA_VERSION, NpmLauncherHandoff, REQUEST_SCHEMA_VERSION,
-        extract_release_binary, finish_failed_update, npm_install_arguments,
-        replace_release_with_rollback, run_with_npm_rollback, sha256_hex,
+        FinalizeGuidanceOutcome, FinalizeOutcome, NPM_HANDOFF_SCHEMA_VERSION, NpmLauncherHandoff,
+        REQUEST_SCHEMA_VERSION, extract_release_binary, finish_failed_update,
+        npm_install_arguments, replace_release_with_rollback, run_with_npm_rollback, sha256_hex,
         validate_download_response_url, validate_plan, verify_release_archive, write_handoff,
     };
     use crate::update::model::{
@@ -2307,5 +2307,103 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&handoff).unwrap()).unwrap();
         assert_eq!(done["state"], "done");
         assert_eq!(done["helper_pid"], 42);
+    }
+
+    /// The seam the guidance refresh reaches users through: an ordinary product update, not a
+    /// direct call. Each half is proven on its own elsewhere; this one proves the update path
+    /// actually runs the guidance half and reports its real result alongside the binary's.
+    #[test]
+    fn a_product_update_refreshes_known_bad_guidance_while_the_binary_half_still_succeeds() {
+        let Some(archive_name) = super::expected_release_archive_name() else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let paths = crate::control::paths::ControlPaths::for_home(temp.path());
+        std::fs::create_dir_all(&paths.codex_dir).unwrap();
+        let source = temp.path().join(if cfg!(windows) {
+            "source-fastctx.exe"
+        } else {
+            "source-fastctx"
+        });
+        std::fs::write(&source, b"binary fixture").unwrap();
+        std::fs::write(&paths.codex_agents, b"user prefix\n").unwrap();
+        crate::control::apply::commit_apply(
+            crate::control::apply::plan_apply(
+                &paths,
+                crate::control::apply::ApplyOptions {
+                    tier: Default::default(),
+                    tool_budgets: Default::default(),
+                    output_guard_enabled: true,
+                    fastshell_enabled: false,
+                    current_executable: source,
+                },
+            )
+            .unwrap(),
+            true,
+        )
+        .unwrap();
+
+        // Put the machine back into the state every 0.2.2/0.2.3 user upgraded from: the exact
+        // known-bad block on disk, under a receipt written before the contract id existed.
+        let current = crate::control::agents::section(false);
+        let legacy = crate::control::agents::known_legacy_section(false);
+        let applied = std::fs::read_to_string(&paths.codex_agents).unwrap();
+        std::fs::write(&paths.codex_agents, applied.replacen(&current, &legacy, 1)).unwrap();
+        let mut settings = crate::control::settings::load(&paths).unwrap();
+        settings.applied.as_mut().unwrap().agents_contract_id = None;
+        std::fs::write(
+            &paths.fastctx_config,
+            crate::control::settings::encode(&settings).unwrap(),
+        )
+        .unwrap();
+
+        let update_dir = super::prepare_update_directory(&paths).unwrap();
+        let base = format!(
+            "https://github.com/yc-duan/fastctx/releases/download/v{}",
+            env!("CARGO_PKG_VERSION")
+        );
+        let request_path = write_request_value(
+            &update_dir,
+            &serde_json::json!({
+                "schema_version": REQUEST_SCHEMA_VERSION,
+                "current_version": "0.1.1",
+                "plan": {
+                    "channel": "github-release",
+                    "target_version": env!("CARGO_PKG_VERSION"),
+                    "archive_name": archive_name,
+                    "archive_url": format!("{base}/{archive_name}"),
+                    "checksums_url": format!("{base}/SHA256SUMS"),
+                },
+                "target_executable": std::env::current_exe().unwrap(),
+                "helper_executable": update_dir.join("helper-seam"),
+                "health_file": update_dir.join("health-seam"),
+            }),
+        );
+
+        let notice = super::finalize_update(&paths, &request_path).unwrap();
+        assert_eq!(notice.guidance, FinalizeGuidanceOutcome::Refreshed);
+        assert!(
+            matches!(
+                notice.outcome,
+                FinalizeOutcome::Updated | FinalizeOutcome::RuntimeUpdated
+            ),
+            "a guidance refresh must not disturb the binary outcome: {:?}",
+            notice.outcome
+        );
+        assert!(
+            std::fs::read_to_string(&paths.codex_agents)
+                .unwrap()
+                .contains(&current),
+            "the managed block must be current after an ordinary update"
+        );
+        assert_eq!(
+            crate::control::settings::load(&paths)
+                .unwrap()
+                .applied
+                .unwrap()
+                .agents_contract_id,
+            None,
+            "an update must still leave an explicit Apply pending"
+        );
     }
 }
