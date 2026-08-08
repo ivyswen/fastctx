@@ -17,7 +17,12 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if (-not $IsWindows) {
+# $IsWindows exists only in PowerShell 6+. Windows PowerShell 5.1 leaves it undefined and runs
+# nowhere else, so reading its absence as "not Windows" turns the whole drain into a silent no-op
+# on the one platform that needs it — and the next cargo invocation then fails with os error 5
+# for no visible reason.
+$onWindows = if ($null -eq $IsWindows) { $true } else { $IsWindows }
+if (-not $onWindows) {
     exit 0
 }
 $root = [System.IO.Path]::GetFullPath($TargetDirectory)
