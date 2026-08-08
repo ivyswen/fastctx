@@ -163,7 +163,8 @@ fn default_tool_definitions_publish_replace_with_explicit_permissions() {
     assert_eq!(
         glob.description.as_deref(),
         Some(concat!(
-            "Find files by glob pattern, e.g. \"**/*.rs\" or \"src/**/*.ts\". Returns absolute\n",
+            "Find files by glob pattern, e.g. \"**/*.rs\" or \"src/**/*.ts\". Matches files\n",
+            "only, never directories. Returns absolute\n",
             "paths sorted by path (or newest first with sort=\"modified\"), 100 per page by\n",
             "default. filter_mode defaults to \"project\" (respects .gitignore, skips .git);\n",
             "\"all\" lists everything. Omit `path` entirely for the session working directory\n",
