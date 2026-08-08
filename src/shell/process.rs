@@ -19,11 +19,23 @@ use std::os::windows::process::CommandExt;
 
 const TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Byte length of command text above which the command runs from a script file.
+///
+/// Windows CreateProcessW caps one command line at 32,767 UTF-16 units, and argument
+/// quoting can double the text in the worst case, so a long command passed straight to
+/// `bash -c` fails to spawn (os error 206). Commands over this threshold are written to
+/// a temp script instead, which has no length ceiling; 12,000 bytes doubles to well
+/// under the cap with room for the bash path and flags. Applied on every platform so
+/// behavior does not fork by OS (2026-08-08).
+const SCRIPT_SPAWN_THRESHOLD_BYTES: usize = 12_000;
+
 /// A spawned bash process whose kill operation covers the whole descendant tree.
 #[derive(Debug)]
 pub(crate) struct ManagedProcess {
     child: Box<dyn ChildWrapper>,
     output: Option<PipeReader>,
+    /// Keeps an over-threshold command's script file alive until the process is reaped.
+    _command_script: Option<tempfile::TempPath>,
 }
 
 impl ManagedProcess {
@@ -97,13 +109,25 @@ pub(crate) fn spawn_bash(
     let (reader, writer) = std::io::pipe()?;
     let mut command = crate::process_policy::noninteractive_command(bash);
     environment.configure_command(&mut command);
-    if login_shell {
-        command.arg("-lc");
+    let command_script = if command_text.len() > SCRIPT_SPAWN_THRESHOLD_BYTES {
+        let script = write_command_script(command_text)?;
+        if login_shell {
+            command.arg("-l");
+        } else {
+            command.args(["--noprofile", "--norc"]);
+        }
+        command.arg(script_operand(&script));
+        Some(script)
     } else {
-        command.args(["--noprofile", "--norc", "-c"]);
-    }
+        if login_shell {
+            command.arg("-lc");
+        } else {
+            command.args(["--noprofile", "--norc", "-c"]);
+        }
+        command.arg(command_text);
+        None
+    };
     command
-        .arg(command_text)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(writer.try_clone()?)
@@ -142,7 +166,35 @@ pub(crate) fn spawn_bash(
     Ok(ManagedProcess {
         child,
         output: Some(reader),
+        _command_script: command_script,
     })
+}
+
+/// Writes over-threshold command text to a private temp script deleted when dropped.
+fn write_command_script(command_text: &str) -> std::io::Result<tempfile::TempPath> {
+    use std::io::Write;
+
+    let mut script = tempfile::Builder::new()
+        .prefix("fastctx-command-")
+        .suffix(".sh")
+        .tempfile()?;
+    script.write_all(command_text.as_bytes())?;
+    script.flush()?;
+    Ok(script.into_temp_path())
+}
+
+/// Renders the script path as the bash operand.
+fn script_operand(script: &tempfile::TempPath) -> std::ffi::OsString {
+    #[cfg(windows)]
+    {
+        // The msys argument layer passes a native absolute path through cleanly only in
+        // forward-slash form; backslashes are exposed to POSIX escaping rules.
+        std::ffi::OsString::from(script.to_string_lossy().replace('\\', "/"))
+    }
+    #[cfg(not(windows))]
+    {
+        script.as_os_str().to_os_string()
+    }
 }
 
 /// Owns a Windows Job Object whose process tree dies even if the supervising process is killed.

@@ -478,6 +478,27 @@ fn unusable_run_budget_refuses_before_the_command_can_write() {
     assert!(session.close().success());
 }
 
+/// A command longer than one Windows command line must still run: over the script-spawn
+/// threshold the text is handed to bash as a temp script, so no host length cap applies.
+/// Passed as a bare `bash -c` argument it fails CreateProcessW with os error 206
+/// (2026-08-08).
+#[test]
+fn run_accepts_commands_beyond_one_windows_command_line() {
+    let _serial = shell_contract_guard();
+    let temp = tempfile::tempdir().unwrap();
+    let mut session = shell_session(temp.path(), None);
+    let padding = "# padding\n".repeat(4_000);
+    let response = session.call(
+        "run",
+        serde_json::json!({"command": format!("{padding}echo LONG_COMMAND_RAN")}),
+    );
+    assert_eq!(response["result"]["isError"], false, "{response}");
+    let text = mcp_text(&response);
+    assert!(text.contains("LONG_COMMAND_RAN"), "{text}");
+    assert!(text.contains("(Complete: exited 0"), "{text}");
+    assert!(session.close().success());
+}
+
 #[test]
 fn job_output_budget_is_independent_and_inherits_the_global_ceiling() {
     let _serial = shell_contract_guard();
