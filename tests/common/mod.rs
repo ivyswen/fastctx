@@ -215,6 +215,11 @@ impl McpSession {
         )
     }
 
+    pub fn call_with_timeout(&mut self, name: &str, arguments: Value, timeout: Duration) -> Value {
+        let id = self.begin_call(name, arguments);
+        self.await_response_with_timeout(id, timeout)
+    }
+
     pub fn begin_call(&mut self, name: &str, arguments: Value) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -228,11 +233,15 @@ impl McpSession {
     }
 
     pub fn await_response(&mut self, id: i64) -> Value {
+        self.await_response_with_timeout(id, MCP_RESPONSE_TIMEOUT)
+    }
+
+    fn await_response_with_timeout(&mut self, id: i64, timeout: Duration) -> Value {
         if let Some(response) = self.pending_responses.remove(&id) {
             return response;
         }
         loop {
-            let value = self.read();
+            let value = self.read_with_timeout(timeout);
             if value["id"].as_i64() == Some(id) {
                 return value;
             }
@@ -336,13 +345,11 @@ impl McpSession {
         stdin.flush().unwrap();
     }
 
-    fn read(&mut self) -> Value {
+    fn read_with_timeout(&mut self, timeout: Duration) -> Value {
         let line = self
             .responses
-            .recv_timeout(MCP_RESPONSE_TIMEOUT)
-            .unwrap_or_else(|error| {
-                panic!("MCP server did not reply within {MCP_RESPONSE_TIMEOUT:?}: {error}")
-            })
+            .recv_timeout(timeout)
+            .unwrap_or_else(|error| panic!("MCP server did not reply within {timeout:?}: {error}"))
             .unwrap_or_else(|error| panic!("MCP server stdout failed: {error}"));
         serde_json::from_str(&line).unwrap()
     }

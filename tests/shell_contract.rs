@@ -124,13 +124,16 @@ fn foreground_output_over_eight_mib_runs_to_natural_exit_and_reports_true_line_c
     let _serial = shell_contract_guard();
     let temp = tempfile::tempdir().unwrap();
     let mut session = shell_session(temp.path(), Some("1000"));
-    let response = session.call(
+    // This fixture deliberately pushes more than 8 MiB through debug output fitting;
+    // it is a correctness contract, not a ten-second latency contract.
+    let response = session.call_with_timeout(
         "run",
         serde_json::json!({
             "command": "printf -v payload '%01000d' 0; for i in {1..9000}; do printf '%s\\n' \"$payload\"; done; exit 23",
             "timeout_ms": 120000,
             "login_shell": false
         }),
+        Duration::from_secs(60),
     );
     assert_eq!(response["result"]["isError"], false);
     let text = mcp_text(&response);

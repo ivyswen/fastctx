@@ -21,6 +21,7 @@ const EOF_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 /// all. The run starts a cold control center from an empty HOME, which costs over a second on
 /// an idle machine and more inside a full test group, so a tight budget would only report a
 /// busy machine as a defect (observed 2026-08-08 in the local gate).
+#[cfg(windows)]
 const STARTUP_FAILURE_DEADLINE: Duration = Duration::from_secs(30);
 
 #[test]
