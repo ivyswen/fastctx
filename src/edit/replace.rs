@@ -8,10 +8,18 @@ use crate::budget::{
 };
 use crate::glob_filter::{GlobPatterns, PathGlobFilter};
 use crate::model::ToolResponse;
+use crate::skip_report::{SkipTally, terminal_with_skips};
 use regex::{Captures, Regex, RegexBuilder};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// The paths a walk never entered: those worth listing, and how many there were.
+#[derive(Clone, Copy)]
+struct Unreachable<'a> {
+    issues: &'a [Issue],
+    total: usize,
+}
 
 const MAX_CANDIDATES: usize = 10_000;
 const MAX_STORED_PREVIEWS: usize = 100_000;
@@ -95,11 +103,25 @@ pub(super) fn replace(
         Ok(glob) => glob,
         Err(error) => return ToolResponse::error(error),
     };
-    let candidates = match crate::traversal::collect_project_candidates(&root, glob.as_ref(), None)
-    {
-        Ok(candidates) => candidates,
+    let collected = match crate::traversal::collect_project_candidates(&root, glob.as_ref(), None) {
+        Ok(collected) => collected,
         Err(error) => return ToolResponse::error(error),
     };
+    // Paths the walk never entered hide an unknown number of files. For a tool
+    // that writes, that is a coverage hole, not a footnote.
+    let unreachable_issues = collected
+        .skipped
+        .listed()
+        .map(|path| Issue {
+            path: path.display.to_string(),
+            message: path.reason.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let unreachable = Unreachable {
+        issues: &unreachable_issues,
+        total: collected.skipped.total(),
+    };
+    let candidates = collected.items;
     if candidates.len() > MAX_CANDIDATES {
         return ToolResponse::error(
             "Too many candidate files: over 10000 matched. Narrow the path or glob.",
@@ -235,6 +257,7 @@ pub(super) fn replace(
             &analyzed,
             &skipped,
             &planning_failures,
+            unreachable,
             total_matches,
             budget,
             fallback_label,
@@ -380,6 +403,7 @@ pub(super) fn replace(
         &successes,
         &skipped,
         &failures,
+        unreachable,
         written_replacements,
         budget,
         &fallback_note(&analyzed, fallback_label),
@@ -755,6 +779,7 @@ fn format_dry_run(
     analyzed: &[AnalyzedFile],
     skipped: &[Issue],
     failures: &[Issue],
+    unreachable: Unreachable<'_>,
     total_matches: usize,
     budget: usize,
     fallback_label: Option<&str>,
@@ -769,8 +794,9 @@ fn format_dry_run(
         .collect::<Vec<_>>();
     groups.extend(issue_groups(skipped, "skipped"));
     groups.extend(issue_groups(failures, "failed"));
+    groups.extend(issue_groups(unreachable.issues, "unreachable"));
     let matched_files = analyzed.len();
-    let mut terminal = if total_matches == 0 {
+    let terminal = if total_matches == 0 {
         "(Complete: dry run — no matches found.)".to_string()
     } else {
         format!(
@@ -779,16 +805,13 @@ fn format_dry_run(
             plural(matched_files, "file", "files")
         )
     };
-    if !skipped.is_empty() || !failures.is_empty() {
-        terminal = append_terminal_clause(
-            &terminal,
-            &format!(
-                "{} {} skipped",
-                skipped.len() + failures.len(),
-                plural(skipped.len() + failures.len(), "file", "files")
-            ),
-        );
-    }
+    let terminal = downgrade_if_unreachable(terminal, unreachable.total);
+    let tally = SkipTally {
+        files: skipped.len() + failures.len(),
+        unreachable: unreachable.total,
+        listed: 0,
+    };
+    let terminal = terminal_with_skips(&terminal, &tally, 0).unwrap_or(terminal);
     render_report(
         &groups,
         &terminal,
@@ -802,6 +825,7 @@ fn format_apply(
     successes: &[(String, usize)],
     skipped: &[Issue],
     failures: &[Issue],
+    unreachable: Unreachable<'_>,
     replacements: usize,
     budget: usize,
     extra_notes: &[String],
@@ -817,7 +841,8 @@ fn format_apply(
         .collect::<Vec<_>>();
     groups.extend(issue_groups(skipped, "skipped"));
     groups.extend(issue_groups(failures, "failed"));
-    let mut terminal = if replacements == 0 && failures.is_empty() {
+    groups.extend(issue_groups(unreachable.issues, "unreachable"));
+    let terminal = if replacements == 0 && failures.is_empty() {
         "(Complete: no matches found; nothing written.)".to_string()
     } else if failures.is_empty() {
         format!(
@@ -836,17 +861,27 @@ fn format_apply(
             plural(failures.len(), "file", "files")
         )
     };
-    if !skipped.is_empty() {
-        terminal = append_terminal_clause(
-            &terminal,
-            &format!(
-                "{} {} skipped",
-                skipped.len(),
-                plural(skipped.len(), "file", "files")
-            ),
-        );
-    }
+    let terminal = downgrade_if_unreachable(terminal, unreachable.total);
+    let tally = SkipTally {
+        files: skipped.len(),
+        unreachable: unreachable.total,
+        listed: 0,
+    };
+    let terminal = terminal_with_skips(&terminal, &tally, 0).unwrap_or(terminal);
     render_report(&groups, &terminal, extra_notes, budget, false)
+}
+
+/// A run that could not enter every path did not finish the job, however well
+/// the files it did reach turned out. `Complete` would overstate the coverage,
+/// and for a tool that writes, overstated coverage is the dangerous direction.
+fn downgrade_if_unreachable(terminal: String, unreachable: usize) -> String {
+    if unreachable == 0 {
+        return terminal;
+    }
+    if let Some(rest) = terminal.strip_prefix("(Complete:") {
+        return format!("(Partial:{rest}");
+    }
+    terminal
 }
 
 fn render_report(

@@ -10,7 +10,10 @@ use crate::model::ToolResponse;
 use crate::operation::{OpError, OperationCtx, RequestWorkGuard};
 use crate::path_codec::{PathRecord, ResolvedRoot, RootRequirement, resolve_search_root};
 use crate::render_plan::{LineRenderGraph, RenderPlanError};
-use crate::traversal::{TraversalFailure, TraversalLimit, collect_walk_batched};
+use crate::skip_report::{SkipTally, detail_line, terminal_with_skips};
+use crate::traversal::{
+    SkippedPaths, TraversalCollection, TraversalFailure, TraversalLimit, collect_walk_batched,
+};
 use ignore::WalkBuilder;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -134,7 +137,7 @@ fn glob_files_with_execution_unadapted(
         ));
     }
     let sort = request.sort.unwrap_or_default();
-    let matches = match collect_matches(
+    let collected = match collect_matches(
         &root,
         &matcher,
         request.filter_mode.unwrap_or_default(),
@@ -142,11 +145,12 @@ fn glob_files_with_execution_unadapted(
         operation,
         executor,
     ) {
-        Ok(matches) => matches,
+        Ok(collected) => collected,
         Err(message) => return ToolResponse::error(message),
     };
+    let report = SkipReport::new(&collected.skipped);
     let matches = match sort_cancelable(
-        matches,
+        collected.items,
         move |left, right| compare_match_entries(sort, left, right),
         Some(operation),
         Some(executor),
@@ -156,6 +160,7 @@ fn glob_files_with_execution_unadapted(
     };
     format_matches(
         &matches,
+        &report,
         request.offset.unwrap_or(0),
         limit,
         budget,
@@ -192,7 +197,7 @@ fn collect_matches(
     sort: SortMode,
     operation: &OperationCtx,
     executor: &Arc<GrepGlobExecutor>,
-) -> Result<Vec<MatchEntry>, String> {
+) -> Result<TraversalCollection<MatchEntry>, String> {
     if operation.check().is_err() {
         return Err("Request cancelled.".to_string());
     }
@@ -237,7 +242,6 @@ fn collect_matches(
             evaluate_match(root, entry, matcher, sort)
         },
     )
-    .map(|collected| collected.items)
 }
 
 fn compare_match_entries(
@@ -311,8 +315,42 @@ fn evaluate_match(
     Ok(Some(MatchEntry { path: record }))
 }
 
+/// A note set that fits the budget, with the token count that proved it.
+type FittedNotes = Option<(Vec<Arc<str>>, usize)>;
+
+/// The paths this walk never entered, ready to be rendered alongside results.
+struct SkipReport {
+    details: Vec<Arc<str>>,
+    tally: SkipTally,
+}
+
+impl SkipReport {
+    fn new(skipped: &SkippedPaths) -> Self {
+        let details = skipped
+            .listed()
+            .map(|path| Arc::<str>::from(detail_line(path.display, path.reason)))
+            .collect::<Vec<_>>();
+        Self {
+            tally: SkipTally {
+                files: 0,
+                unreachable: skipped.total(),
+                listed: details.len(),
+            },
+            details,
+        }
+    }
+
+    fn notes(&self, shown_details: usize, terminal: &str) -> Option<Vec<Arc<str>>> {
+        let terminal = terminal_with_skips(terminal, &self.tally, shown_details)?;
+        let mut notes = self.details[..shown_details].to_vec();
+        notes.push(Arc::from(terminal));
+        Some(notes)
+    }
+}
+
 fn format_matches(
     matches: &[MatchEntry],
+    report: &SkipReport,
     offset: usize,
     limit: usize,
     budget: usize,
@@ -323,6 +361,7 @@ fn format_matches(
     if total == 0 {
         return status_response(
             "(Complete: no files matched.)".to_string(),
+            report,
             budget,
             budget_variable,
             operation,
@@ -335,6 +374,7 @@ fn format_matches(
                 "(Complete: no files at offset={offset}; only {} {verb}.)",
                 counted(total, "file", "files")
             ),
+            report,
             budget,
             budget_variable,
             operation,
@@ -353,9 +393,13 @@ fn format_matches(
         Ok(graph) => graph,
         Err(error) => return render_plan_failure(error),
     };
+    // The body is sized against a bare skip tally so results never lose room to
+    // the detail lines describing what is missing; detail fills what is left.
     for shown in (1..=maximum).rev() {
         let terminal = glob_terminal(offset, shown, total);
-        let notes = [terminal];
+        let Some(notes) = report.notes(0, &terminal) else {
+            return render_plan_failure(RenderPlanError::InvalidTerminal);
+        };
         let tokens = match graph.probe_notes(
             shown,
             &notes,
@@ -365,21 +409,78 @@ fn format_matches(
             Err(error) => return render_plan_failure(error),
         };
         if tokens <= budget {
-            let rendered = match graph.finish(
+            return finish_with_skips(
+                &mut graph,
                 shown,
-                &notes,
-                tokens,
+                &terminal,
+                report,
                 budget,
-                operation.map(|operation| operation as &dyn crate::operation::WorkCheckpoint),
-            ) {
-                Ok(rendered) => rendered,
-                Err(error) => return render_plan_failure(error),
-            };
-            debug_assert!(rendered.tokens <= budget);
-            return ToolResponse::text(rendered.text);
+                budget_variable,
+                operation,
+            );
         }
     }
     budget_too_small(budget, budget_variable)
+}
+
+/// Renders a fixed body with as many skip details as the remaining budget holds.
+///
+/// The caller has already proven the zero-detail form fits, so the search only
+/// has to find how much detail fits on top of it.
+fn finish_with_skips(
+    graph: &mut LineRenderGraph,
+    shown: usize,
+    terminal: &str,
+    report: &SkipReport,
+    budget: usize,
+    budget_variable: &str,
+    operation: Option<&OperationCtx>,
+) -> ToolResponse {
+    let work = operation.map(|operation| operation as &dyn crate::operation::WorkCheckpoint);
+    let probe =
+        |graph: &mut LineRenderGraph, details: usize| -> Result<FittedNotes, RenderPlanError> {
+            let notes = report
+                .notes(details, terminal)
+                .ok_or(RenderPlanError::InvalidTerminal)?;
+            let tokens = graph.probe_notes(shown, &notes, work)?;
+            Ok((tokens <= budget).then_some((notes, tokens)))
+        };
+
+    let full = report.details.len();
+    let mut best = match probe(graph, full) {
+        Ok(Some(hit)) => Some(hit),
+        Ok(None) => None,
+        Err(error) => return render_plan_failure(error),
+    };
+    if best.is_none() && full > 0 {
+        let (mut low, mut high) = (0_usize, full - 1);
+        while low <= high {
+            let middle = low + (high - low) / 2;
+            match probe(graph, middle) {
+                Ok(Some(hit)) => {
+                    best = Some(hit);
+                    low = middle + 1;
+                }
+                Ok(None) => {
+                    if middle == 0 {
+                        break;
+                    }
+                    high = middle - 1;
+                }
+                Err(error) => return render_plan_failure(error),
+            }
+        }
+    }
+    let Some((notes, tokens)) = best else {
+        return budget_too_small(budget, budget_variable);
+    };
+    match graph.finish(shown, &notes, tokens, budget, work) {
+        Ok(rendered) => {
+            debug_assert!(rendered.tokens <= budget);
+            ToolResponse::text(rendered.text)
+        }
+        Err(error) => render_plan_failure(error),
+    }
 }
 
 fn glob_terminal(offset: usize, shown: usize, total: usize) -> String {
@@ -409,8 +510,11 @@ fn counted(count: usize, singular: &str, plural: &str) -> String {
     format!("{count} {noun}")
 }
 
+/// Emits a body-less result. An empty match set is exactly when unreachable
+/// paths matter most, so the skip report travels with it.
 fn status_response(
     status: String,
+    report: &SkipReport,
     budget: usize,
     budget_variable: &str,
     operation: Option<&OperationCtx>,
@@ -422,29 +526,15 @@ fn status_response(
         Ok(graph) => graph,
         Err(error) => return render_plan_failure(error),
     };
-    let notes = [status];
-    let tokens = match graph.probe_notes(
+    finish_with_skips(
+        &mut graph,
         0,
-        &notes,
-        operation.map(|operation| operation as &dyn crate::operation::WorkCheckpoint),
-    ) {
-        Ok(tokens) => tokens,
-        Err(error) => return render_plan_failure(error),
-    };
-    if tokens > budget {
-        return budget_too_small(budget, budget_variable);
-    }
-    let rendered = match graph.finish(
-        0,
-        &notes,
-        tokens,
+        &status,
+        report,
         budget,
-        operation.map(|operation| operation as &dyn crate::operation::WorkCheckpoint),
-    ) {
-        Ok(rendered) => rendered,
-        Err(error) => return render_plan_failure(error),
-    };
-    ToolResponse::text(rendered.text)
+        budget_variable,
+        operation,
+    )
 }
 
 fn render_plan_failure(error: RenderPlanError) -> ToolResponse {

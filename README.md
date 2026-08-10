@@ -259,6 +259,8 @@ Files with uncertain encodings appear in a skip report with their path, reason, 
 
 If a file changes during a directory search, `grep` reports that file as skipped and continues; a changing single-file target returns an error so partial matches never masquerade as complete results.
 
+A directory the walk cannot enter — denied permissions, a locked file, a symlink loop — never discards the results found around it. `grep`, `glob`, and `replace` return what they reached, list each unreachable path with its cause, and count them in the terminal note. An unreadable search root is still an error, because a walk that reached nothing cannot report that it found nothing.
+
 ### `glob`
 
 `glob` finds files with a pattern relative to the search root:

@@ -27,7 +27,8 @@ use crate::render_plan::{
     DetailRenderGraph, LineRenderGraph, LineRenderView, RenderPlanError, SharedLineRenderGraph,
 };
 use crate::search_text::{SearchText, SearchTextFailure};
-use crate::traversal::collect_search_candidates;
+use crate::skip_report::{SkipTally, detail_line};
+use crate::traversal::{SkippedPaths, collect_search_candidates};
 use grep_matcher::LineTerminator;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::SearcherBuilder;
@@ -216,14 +217,46 @@ struct PageFormat<'a> {
 #[derive(Default)]
 struct SkippedFiles {
     entries: Vec<SkippedFile>,
+    /// Leading entries contributed by traversal rather than by searching.
+    unreachable_listed: usize,
+    /// Unreachable paths the traversal detail cap counted but dropped.
+    unreachable_unlisted: usize,
 }
 
 impl SkippedFiles {
+    /// Seeds the report with paths the walk never entered. Traversal happens
+    /// before any file is searched, so its entries lead the detail list and the
+    /// split point stays a simple prefix length.
+    fn from_traversal(skipped: &SkippedPaths) -> Self {
+        let entries = skipped
+            .listed()
+            .map(|path| SkippedFile {
+                path: path.display.to_string(),
+                reason: path.reason.to_string(),
+            })
+            .collect::<Vec<_>>();
+        Self {
+            unreachable_listed: entries.len(),
+            unreachable_unlisted: skipped.unlisted(),
+            entries,
+        }
+    }
+
     fn record(&mut self, path: &str, skip: &CandidateSkip) {
         self.entries.push(SkippedFile {
             path: path.to_string(),
             reason: skip.reason(),
         });
+    }
+
+    fn tally(&self) -> SkipTally {
+        SkipTally {
+            files: self.entries.len().saturating_sub(self.unreachable_listed),
+            unreachable: self
+                .unreachable_listed
+                .saturating_add(self.unreachable_unlisted),
+            listed: self.entries.len(),
+        }
     }
 }
 
@@ -404,16 +437,18 @@ fn grep_files_with_budget_source_and_execution_unadapted(
         Ok(glob) => glob,
         Err(message) => return ToolResponse::error(message),
     };
-    let candidates = match collect_search_candidates(
+    let collected = match collect_search_candidates(
         &root,
         glob.as_ref(),
         request.file_type.as_deref(),
         Some(&operation),
         Some(&executor),
     ) {
-        Ok(candidates) => Arc::<[Candidate]>::from(candidates),
+        Ok(collected) => collected,
         Err(message) => return ToolResponse::error(message),
     };
+    let traversal_skips = collected.skipped;
+    let candidates = Arc::<[Candidate]>::from(collected.items);
     let offset = request.offset.unwrap_or(0);
     let head_limit = request.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT);
     let mode = request.output_mode.unwrap_or_default();
@@ -433,7 +468,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     if mode == OutputMode::Summary {
         let mut occurrence_total = 0_usize;
         let mut file_total = 0_usize;
-        let mut skipped_files = SkippedFiles::default();
+        let mut skipped_files = SkippedFiles::from_traversal(&traversal_skips);
         let mut transcoding_notes = BTreeSet::new();
         let mut fallback_usage = FallbackUsage::default();
         let plan = GrepSearchPlan::Count;
@@ -532,7 +567,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     let mut skip_remaining = offset;
     let mut total_entries_seen = 0_usize;
     let mut scan_complete = true;
-    let mut skipped_files = SkippedFiles::default();
+    let mut skipped_files = SkippedFiles::from_traversal(&traversal_skips);
     let mut transcoding_notes = BTreeSet::new();
     let mut fallback_usage = FallbackUsage::default();
     // Every candidate is searched with identical options so files can run in
@@ -1114,6 +1149,7 @@ struct GrepNoteUnits {
     fixed: Vec<Arc<str>>,
     details: Vec<Arc<str>>,
     fallback: Option<Arc<str>>,
+    tally: SkipTally,
 }
 
 impl GrepNoteUnits {
@@ -1127,13 +1163,14 @@ impl GrepNoteUnits {
             .skipped_files
             .entries
             .iter()
-            .map(|entry| Arc::<str>::from(format!("{} — {}", entry.path, entry.reason)))
+            .map(|entry| Arc::<str>::from(detail_line(&entry.path, &entry.reason)))
             .collect();
         let fallback = page.fallback_usage.note().map(Arc::<str>::from);
         Self {
             fixed,
             details,
             fallback,
+            tally: page.skipped_files.tally(),
         }
     }
 
@@ -1163,7 +1200,7 @@ impl GrepNoteUnits {
     }
 
     fn baseline_notes(&self, terminal: &str) -> Result<Vec<Arc<str>>, RenderPlanError> {
-        let terminal = Arc::<str>::from(terminal_with_skips(terminal, self.details.len(), 0)?);
+        let terminal = Arc::<str>::from(terminal_with_skips(terminal, &self.tally, 0)?);
         Ok(self.final_notes(0, terminal))
     }
 }
@@ -1305,13 +1342,13 @@ fn select_grep_notes(
     let total_skipped = notes.details.len();
 
     let full_terminal =
-        Arc::<str>::from(terminal_with_skips(terminal, total_skipped, total_skipped)?);
+        Arc::<str>::from(terminal_with_skips(terminal, &notes.tally, total_skipped)?);
     let full_tail = notes.tail(Arc::clone(&full_terminal));
     let full_tokens = details.probe_tail(total_skipped, &full_tail, page.work())?;
     let (shown_skips, selected_terminal, selected_tokens) = if full_tokens <= page.budget {
         (total_skipped, full_terminal, full_tokens)
     } else {
-        let baseline_terminal = Arc::<str>::from(terminal_with_skips(terminal, total_skipped, 0)?);
+        let baseline_terminal = Arc::<str>::from(terminal_with_skips(terminal, &notes.tally, 0)?);
         let baseline_tail = notes.tail(Arc::clone(&baseline_terminal));
         let baseline_tokens = details.probe_tail(0, &baseline_tail, page.work())?;
         if baseline_tokens > page.budget {
@@ -1328,7 +1365,7 @@ fn select_grep_notes(
                 Some(baseline.clone()),
                 |middle| -> Result<Option<(usize, Arc<str>, usize)>, RenderPlanError> {
                     let candidate_terminal =
-                        Arc::<str>::from(terminal_with_skips(terminal, total_skipped, middle)?);
+                        Arc::<str>::from(terminal_with_skips(terminal, &notes.tally, middle)?);
                     let candidate_tail = notes.tail(Arc::clone(&candidate_terminal));
                     let candidate_tokens =
                         details.probe_tail(middle, &candidate_tail, page.work())?;
@@ -2247,26 +2284,11 @@ fn format_context_line(prefix: String, line: ResultLine<'_>) -> io::Result<Strin
 
 fn terminal_with_skips(
     terminal: &str,
-    skipped: usize,
+    tally: &SkipTally,
     shown: usize,
 ) -> Result<String, RenderPlanError> {
-    if skipped == 0 {
-        return Ok(terminal.to_string());
-    }
-    let stem = terminal
-        .strip_suffix(".)")
-        .ok_or(RenderPlanError::InvalidTerminal)?;
-    if shown == skipped {
-        Ok(format!(
-            "{stem}; {} skipped.)",
-            counted(skipped, "file", "files")
-        ))
-    } else {
-        Ok(format!(
-            "{stem}; {} skipped, showing {shown} — narrow path/glob to inspect the rest.)",
-            counted(skipped, "file", "files")
-        ))
-    }
+    crate::skip_report::terminal_with_skips(terminal, tally, shown)
+        .ok_or(RenderPlanError::InvalidTerminal)
 }
 
 fn format_summary(occurrences: usize, files: usize, page: &PageFormat<'_>) -> ToolResponse {

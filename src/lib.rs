@@ -36,6 +36,7 @@ pub(crate) mod server_support;
 pub mod session;
 pub mod shell;
 mod shell_server;
+pub(crate) mod skip_report;
 pub(crate) mod stdio_transport;
 pub(crate) mod traversal;
 pub mod tui;
