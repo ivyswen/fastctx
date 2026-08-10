@@ -280,7 +280,7 @@ jobs:
           }
           require '"id"[[:space:]]*:[[:space:]]*1' 'answer to initialize'
           require '"id"[[:space:]]*:[[:space:]]*2' 'answer to tools/list'
-          require '"name"[[:space:]]*:[[:space:]]*"read"' 'read tool'
+          require '"name"[[:space:]]*:[[:space:]]*"inspect_local_file"' 'inspect_local_file tool'
           require '"name"[[:space:]]*:[[:space:]]*"replace"' 'replace tool'
           SCRIPT
           chmod +x target/glibc-smoke.sh
@@ -372,26 +372,54 @@ jobs:
         run: |
           notes="$RUNNER_TEMP/fastctx-release-notes.md"
           cat > "$notes" <<'EOF'
-          ## FastCtx v0.2.4
+          ## FastCtx v0.2.5
 
-          - **~90% less memory.** One shared control center per user instead of a full
-            server per session. Restart Codex after upgrading.
-          - **`replace` no longer stops at 64 MB.** The ceiling is now a setting, default
-            256 MB. Rewriting how offsets are tracked cut the memory a large edit needs by
-            roughly 10×, which is what makes the higher default safe; the control terminal
-            explains the memory trade-off before you raise it further. (#16)
-          - **`grep` no longer fails an entire search because of one file.** An oversized
-            line now skips that file and says so, instead of discarding every result
-            already collected.
-          - **Resource handling reverted to pre-0.2.2**, matching what other tool-only MCP
-            servers do. The trigger is in how Codex handles MCP resources; still under
-            observation. Run `fastctx apply` to refresh the AGENTS block.
-          - **No more compaction failures on non-official providers.**
-          - **Settings page**: output budgets move in quarter steps, an explicit save
-            button, and readable contrast on disabled values.
-          - **License is now Apache-2.0** (previously MIT OR Apache-2.0). Anyone
-            redistributing FastCtx or bundling it must reproduce the attribution notice in
-            `NOTICE` where third-party notices normally appear.
+          This release renames the file tool, keeps search results when part of a tree cannot be read, and gives shell commands the environment your machine actually has.
+
+          **Upgrading:** run `fastctx apply` once. The rename below only reaches the model after the guidance block in your `AGENTS.md` is refreshed.
+
+          ### Breaking
+
+          - **The file tool `read` is now `inspect_local_file`.**
+            As soon as any MCP server is configured, Codex offers its own `read_mcp_resource` tool — and FastCtx appeared to the model as a namespace whose member was called `read`. "Read this file with FastCtx" therefore had two spellings that both looked correct, and models regularly picked the resource tool, which cannot open local files, then retried with invented arguments rather than switching tools. The new name carries the fact that tells the two apart: the input is a path on this machine, not a resource a server advertised.
+            Upgrading from 0.2.2, 0.2.3 or 0.2.4 refreshes the guidance block that names the tool, as long as you have not edited that block yourself.
+
+          ### Added
+
+          - **Search results survive an unreadable directory.**
+            A permission denial, a locked file, a symlink loop, or a file removed mid-walk used to discard everything collected around it, so one bad directory erased a whole tree of results — and nothing told you whether your target had been searched at all. `grep`, `glob` and `replace` now return what they reached and list each path they could not enter, with the reason and a count. `replace` marks such a run partial, because a run that could not visit every path did not finish the job. An unreadable search root is still an error: a walk that reached nothing cannot honestly report that it found nothing.
+
+          - **Read several ranges of one file in a single call.**
+            `inspect_local_file` accepts disjoint ranges of the same file, mixed freely with ranges of other files, so jumping between a few known regions costs one call instead of one per region. Only an entry that repeats another exactly is rejected.
+
+          - **Exclude patterns.**
+            `glob`, `grep` and `replace` accept `!pattern` entries, so ruling out `target/**` or `node_modules/**` no longer has to be expressed as a more elaborate positive pattern.
+
+          - **Shell commands see the environment your machine has.**
+            Codex starts an MCP server with a cleared environment and about twenty names restored, which is why `run` could answer `cargo: command not found` for a toolchain that works fine in your own terminal. FastCtx now reads the environment Windows persists for your user and lays the host's own values on top, so anything the host supplied still wins, and `PATH` is merged rather than replaced — your live search path stays first and only genuinely missing directories are appended. A Windows login shell is also told to inherit that path, which some msys2 installations otherwise discard. Set `FASTCTX_INHERIT_ENVIRONMENT=0` to keep the previous behaviour.
+
+          - **Long commands run.**
+            Windows caps a command line at 32,767 units, and anything past it failed to spawn with an opaque OS error — a heredoc writing a file was enough to hit the wall. Commands over 12,000 bytes now run from a private temporary script that is removed with the process.
+
+          - **The control terminal says what it is and whether you are connected.**
+            Three recurring reports had one cause: the terminal never stated its own state. It now leads with whether Codex is connected and whether the guidance FastCtx wrote is still current — which matters because upgrading the binary does not rewrite that guidance, so anyone who connected on an earlier release keeps running what that release wrote until they reconnect. A closing line says the terminal only configures FastCtx and can be closed at any time. "Apply" is now "Connect to Codex" throughout the interface in all seventeen languages; the `fastctx apply` command keeps its name.
+
+          - **A steadier guard on large tool output.**
+            Where Codex cannot compact a conversation remotely, one oversized tool response can push a session past its context window. FastCtx now decides how tightly to cap output from both where the model comes from and what compaction Codex declares for it, shares one budget across the tool calls a model issues in the same round instead of letting each call spend the full amount, and reports what it found in `fastctx doctor`. The guard wording was rewritten in all seventeen languages.
+
+          - **Third-party licence notices ship with every artifact.**
+            The published binaries statically link 331 crates. Their copyright notices now travel with the release archives, the npm packages and the crate — the same obligation this project asks of its own downstream.
+
+          ### Fixed
+
+          - A `file:` URI naming a remote host is rejected even when its path starts with a drive letter. `file://example.com/C:/secret.txt` used to drop the host and read the local drive instead, handing back that file's contents as the resource you asked for.
+          - `replace` fails the whole call when the search root itself cannot be entered, as `grep` and `glob` already did. It used to report "nothing written" for a walk that never happened.
+          - `C:notes.txt` is read as a path rather than an unknown URI scheme, which used to send callers after a protocol problem they did not have.
+          - A stopped background job reports `killed` instead of exit code 1. The record always said so, but every display showed only the exit code — and a terminated process on Windows always exits 1, making a requested stop look like a failure.
+          - `glob`'s description states that directories never match, so an empty result over a folder of folders no longer reads as a broken tool.
+          - The Apply summary and the configuration table name `inspect_local_file` rather than the retired `read`, as do the tool descriptions that still mentioned the old name.
+          - When a release needs you to reconnect, the main menu marks the entry that does it.
+          - Several gaps in local file URI handling closed.
           EOF
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release delete "${GITHUB_REF_NAME}" --yes
