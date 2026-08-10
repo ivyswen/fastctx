@@ -1,11 +1,11 @@
 mod common;
 
 #[cfg(unix)]
-use common::{error_text, normalized};
+use common::{error_text, glob_files, normalized};
 #[cfg(unix)]
 use fastctx::glob_filter::GlobPatterns;
 #[cfg(unix)]
-use fastctx::glob_tool::{FilterMode, GlobRequest, glob_files};
+use fastctx::glob_tool::{FilterMode, GlobRequest};
 
 #[cfg(unix)]
 fn request(path: &std::path::Path, pattern: &str) -> GlobRequest {

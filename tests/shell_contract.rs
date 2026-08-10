@@ -643,11 +643,8 @@ fn capture_failure_keeps_the_command_running_and_falls_back_to_the_exit_record()
     assert!(session.close().success());
 }
 
-/// Locks the Windows PATH augmentation: a clean (non-login) shell must still find
-/// the Unix toolset even when the host that launched the server has no Git
-/// directory on PATH (e.g. Codex started from PowerShell). Removing the
-/// augmentation makes every external command fail with 127 and this test red.
-#[cfg(windows)]
+/// Serializes shell contracts whose detached process trees would otherwise make
+/// OS process and pipe pressure part of unrelated scenarios.
 fn shell_contract_guard() -> MutexGuard<'static, ()> {
     // These cases launch detached process trees. Keeping unrelated scenarios
     // isolated prevents OS process and pipe pressure from becoming test input.

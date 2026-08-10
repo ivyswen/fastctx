@@ -246,12 +246,38 @@ fn finish_early_response(
     into_mcp_result(response)
 }
 
-fn apply_test_tool_delay() {
+fn await_test_tool_barrier() {
     #[cfg(debug_assertions)]
-    if let Ok(value) = crate::session::var("FASTCTX_TEST_TOOL_DELAY_MS")
-        && let Ok(milliseconds) = value.parse::<u64>()
-    {
-        std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    if let Ok(directory) = crate::session::var("FASTCTX_TEST_TOOL_BARRIER_DIR") {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NEXT_PARTICIPANT: AtomicUsize = AtomicUsize::new(0);
+        let directory = std::path::PathBuf::from(directory);
+        let participant = NEXT_PARTICIPANT.fetch_add(1, Ordering::Relaxed);
+        std::fs::write(directory.join(format!("participant-{participant}")), [])
+            .expect("the guarded-burst test barrier must accept participant markers");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let participants = std::fs::read_dir(&directory)
+                .expect("the guarded-burst test barrier must remain readable")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("participant-")
+                })
+                .count();
+            if participants >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "two guarded tool calls did not reach blocking work concurrently"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
 
@@ -302,7 +328,7 @@ pub(crate) async fn run_blocking(
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         session.activate(|| {
-            apply_test_tool_delay();
+            await_test_tool_barrier();
             let burst = BurstFormatter::new(burst_ticket, budget_variable);
             let decorator = BackgroundDecorator::new(status(), budget_variable);
             let response = loop {
@@ -467,7 +493,7 @@ async fn run_blocking_cancellable_with_context(
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         session.activate(|| {
-            apply_test_tool_delay();
+            await_test_tool_barrier();
             let burst = BurstFormatter::new(burst_ticket, budget_variable);
             let error_adapter =
                 ErrorBudgetAdapter::new(error_budget_hint(budget_variable), budget_variable);
