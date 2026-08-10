@@ -1208,7 +1208,7 @@ fn preview_apply(
                 (
                     PreviewAction::Record,
                     vec![PreviewDetail::kept(format!(
-                        "tier = {} · read/grep/glob/run/job_output = {}/{}/{}/{}/{} · fastshell = {}",
+                        "tier = {} · inspect_local_file/grep/glob/run/job_output = {}/{}/{}/{}/{} · fastshell = {}",
                         expected.tier.as_str(),
                         expected.tool_budgets.read.label(),
                         expected.tool_budgets.grep.label(),

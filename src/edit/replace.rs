@@ -772,7 +772,8 @@ fn resolve_root(input: &str) -> Result<PathBuf, String> {
         return Err(crate::paths::missing_search_path_message(&input_display));
     }
     fs::metadata(&parsed).map_err(|error| crate::paths::io_error_message(&parsed, &error))?;
-    Ok(crate::paths::canonical_existing(&parsed).unwrap_or(parsed))
+    crate::paths::canonical_existing(&parsed)
+        .map_err(|error| crate::paths::io_error_message(&parsed, &error))
 }
 
 fn format_dry_run(

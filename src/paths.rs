@@ -36,6 +36,11 @@ pub(crate) fn parse_local_path_input(input: &str) -> Result<PathBuf, String> {
         return Err("Invalid local file URI: malformed percent escape.".to_string());
     }
 
+    let authority = input[scheme.len() + 3..]
+        .split(['/', '\\', '?', '#'])
+        .next()
+        .unwrap_or_default();
+
     let uri =
         url::Url::parse(input).map_err(|error| format!("Invalid local file URI: {error}."))?;
     if !uri.username().is_empty() || uri.password().is_some() || uri.port().is_some() {
@@ -48,9 +53,12 @@ pub(crate) fn parse_local_path_input(input: &str) -> Result<PathBuf, String> {
             "Invalid local file URI: query and fragment components are not supported.".to_string(),
         );
     }
-    if uri
-        .host_str()
-        .is_some_and(|host| !host.eq_ignore_ascii_case("localhost"))
+    // url intentionally erases a file URL's host when the path begins with a Windows drive
+    // designator. Inspect the original authority so a remote URI can never become a local path.
+    if (!authority.is_empty() && !authority.eq_ignore_ascii_case("localhost"))
+        || uri
+            .host_str()
+            .is_some_and(|host| !host.eq_ignore_ascii_case("localhost"))
     {
         return Err("Invalid local file URI: remote authorities are not supported.".to_string());
     }

@@ -592,7 +592,20 @@ fn render_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     ];
     let items = labels
         .iter()
-        .map(|label| ListItem::new(format!(" {label}")))
+        .enumerate()
+        .map(|(index, label)| {
+            let requires_action = index == 0 && app.link_state.requires_apply();
+            let item = ListItem::new(format!(" {}", main_menu_label(app, index, label)));
+            if requires_action {
+                item.style(
+                    Style::default()
+                        .fg(theme::warning())
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                item
+            }
+        })
         .collect::<Vec<_>>();
     let mut state = ListState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(
@@ -649,6 +662,15 @@ fn render_main(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .wrap(Wrap { trim: false }),
         chunks[1],
     );
+}
+
+/// Marks the action that repairs a stale connection in text, so it stays visible without colour.
+fn main_menu_label(app: &App, index: usize, label: &str) -> String {
+    if index == 0 && app.link_state.requires_apply() {
+        format!("! {label}")
+    } else {
+        label.to_string()
+    }
 }
 
 /// One line naming the connection to the host, shared by the main menu and the connect page so
@@ -3029,16 +3051,18 @@ fn render_narrow(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             ALL_LANGUAGES[app.selected].code(),
             ALL_LANGUAGES[app.selected].native_name()
         ),
-        Screen::Main => [
-            messages.menu_apply,
-            messages.menu_config,
-            app.job_messages().menu,
-            app.update_messages().page_title,
-            messages.menu_status,
-            messages.menu_about,
-            messages.menu_language,
-        ][app.selected]
-            .to_string(),
+        Screen::Main => {
+            let labels = [
+                messages.menu_apply,
+                messages.menu_config,
+                app.job_messages().menu,
+                app.update_messages().page_title,
+                messages.menu_status,
+                messages.menu_about,
+                messages.menu_language,
+            ];
+            main_menu_label(app, app.selected, labels[app.selected])
+        }
         Screen::ApplyHome => {
             [messages.action_apply, messages.action_unapply][app.selected].to_string()
         }
@@ -3088,7 +3112,16 @@ fn render_narrow(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     lines.push(Line::styled(
         selected,
         Style::default()
-            .fg(theme::fg())
+            .fg(
+                if app.screen == Screen::Main
+                    && app.selected == 0
+                    && app.link_state.requires_apply()
+                {
+                    theme::warning()
+                } else {
+                    theme::fg()
+                },
+            )
             .add_modifier(Modifier::BOLD),
     ));
     // A terminal too small for the panel still has to show whether the host is connected; the
