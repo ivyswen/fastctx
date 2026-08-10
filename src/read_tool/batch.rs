@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 
-const MAX_BATCH_FILES: usize = 32;
+const MAX_BATCH_ENTRIES: usize = 32;
 
 #[derive(Clone, Debug, Serialize)]
 struct ContinuationEntry {
@@ -42,7 +42,7 @@ pub(super) fn read_text_files(mut request: ReadRequest) -> ToolResponse {
         .files
         .take()
         .expect("batch shape was validated by read_file");
-    if !(1..=MAX_BATCH_FILES).contains(&entries.len()) {
+    if !(1..=MAX_BATCH_ENTRIES).contains(&entries.len()) {
         return ToolResponse::error(format!(
             "Invalid files value: expected 1 to 32 entries, got {}.",
             entries.len()
@@ -114,17 +114,18 @@ fn validate_entries(mut entries: Vec<BatchReadEntry>) -> Result<Vec<BatchReadEnt
         } else {
             parsed.clone()
         };
-        let key = display_path(&key_path);
+        let key_path = display_path(&key_path);
         entry.path = if from_uri {
             normalized_input
         } else {
             continuation_path(&entry.path)
         };
         #[cfg(windows)]
-        let key = key.to_ascii_lowercase();
+        let key_path = key_path.to_ascii_lowercase();
+        let key = (key_path, entry.offset, entry.limit, entry.encoding.clone());
         if !seen.insert(key) {
             return Err(format!(
-                "Duplicate path in files: {}. List each file once.",
+                "Duplicate files entry: two entries request the exact same text interval for {} (including offset, limit, and encoding).",
                 entry.path
             ));
         }
@@ -388,12 +389,12 @@ fn render_response(
 fn batch_terminal(progress: &[Option<ContinuationEntry>], total: usize) -> String {
     let pending = progress.iter().flatten().collect::<Vec<_>>();
     if pending.is_empty() {
-        let noun = if total == 1 { "file" } else { "files" };
+        let noun = if total == 1 { "entry" } else { "entries" };
         return format!("(Complete: {total} {noun} processed.)");
     }
     let json = serde_json::to_string(&pending).expect("continuation entries serialize");
     let processed = total - pending.len();
-    format!("(Partial: {processed} of {total} files processed. Continue with files={json}.)")
+    format!("(Partial: {processed} of {total} entries processed. Continue with files={json}.)")
 }
 
 fn budget_too_small(budget: TokenBudget) -> ToolResponse {

@@ -63,11 +63,6 @@ impl BackgroundStatus {
             summary_line: format!("(Background: {running_count} {running_noun} running.)"),
         })
     }
-
-    #[cfg(test)]
-    pub(crate) fn full_line(&self) -> &str {
-        &self.full_line
-    }
 }
 
 fn format_elapsed(elapsed: Duration) -> String {

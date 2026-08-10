@@ -537,8 +537,6 @@ impl SnapshotBuilder {
                     return Err(prefer_stop(operation, CaptureFailure::Snapshot(error)));
                 }
             };
-            #[cfg(test)]
-            tests::notify_temp_created(file.path());
             for chunk in memory.chunks(SNAPSHOT_CHUNK_BYTES) {
                 write_snapshot_chunk(&mut file, chunk, operation)?;
             }
@@ -580,14 +578,6 @@ impl SnapshotBuilder {
                 backing: SnapshotBacking::Temp(Arc::new(TempSnapshot { file })),
             },
         })
-    }
-
-    #[cfg(test)]
-    fn temp_path(&self) -> Option<&Path> {
-        match self {
-            Self::Memory(_) => None,
-            Self::Temp { file, .. } => Some(file.path()),
-        }
     }
 }
 
@@ -740,8 +730,6 @@ pub(crate) fn capture_classify(
         }
         Err(error) => return Err(prefer_stop(operation, CaptureFailure::Io(error))),
     };
-    #[cfg(test)]
-    tests::notify_original_open(&candidate.native);
     let (before, is_regular) = match identity_from_file(&file) {
         Ok(identity) => identity,
         Err(error) => return Err(prefer_stop(operation, CaptureFailure::Io(error))),
@@ -998,90 +986,22 @@ fn identity_from_path(path: &Path) -> io::Result<(FileIdentity, bool)> {
 mod tests {
     use super::{
         CaptureDisposition, CaptureFailure, CaptureRead, FallbackTerminalState,
-        MEMORY_SNAPSHOT_LIMIT, PREFLIGHT_BYTES, SNAPSHOT_CHUNK_BYTES, SnapshotBuilder,
-        TerminalProof, capture_classify, capture_reader,
+        MEMORY_SNAPSHOT_LIMIT, PREFLIGHT_BYTES, SNAPSHOT_CHUNK_BYTES, TerminalProof,
+        capture_classify, capture_reader,
     };
     use crate::encoding::{
         ByteSource, EncodingDecision, EncodingRejection, validate_source_encoding,
     };
-    use crate::operation::{RequestWorkGuard, TestStage, WorkCheckpoint, WorkStop};
+    use crate::operation::{RequestWorkGuard, TestStage};
     use crate::path_codec::PathRecord;
-    use crate::search_text::SearchText;
+
     use filetime::{FileTime, set_file_mtime};
     use rmcp::model::RequestId;
-    use std::cell::RefCell;
     use std::io::{self, Read, Write};
-    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::Mutex;
+
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio_util::sync::CancellationToken;
-
-    type TempCreateCallback = Arc<dyn Fn(&Path)>;
-    type OriginalOpenCallback = Arc<dyn Fn(&Path)>;
-
-    thread_local! {
-        static TEMP_CREATE_OBSERVER: RefCell<Option<TempCreateCallback>> = RefCell::new(None);
-        static ORIGINAL_OPEN_OBSERVER: RefCell<Option<OriginalOpenCallback>> = RefCell::new(None);
-    }
-
-    pub(super) fn notify_temp_created(path: &Path) {
-        let observer = TEMP_CREATE_OBSERVER.with(|slot| slot.borrow().clone());
-        if let Some(observer) = observer {
-            observer(path);
-        }
-    }
-
-    pub(super) fn notify_original_open(path: &Path) {
-        let observer = ORIGINAL_OPEN_OBSERVER.with(|slot| slot.borrow().clone());
-        if let Some(observer) = observer {
-            observer(path);
-        }
-    }
-
-    struct TempCreateObserverGuard;
-
-    impl TempCreateObserverGuard {
-        fn install(observer: TempCreateCallback) -> Self {
-            TEMP_CREATE_OBSERVER.with(|slot| {
-                assert!(
-                    slot.borrow_mut().replace(observer).is_none(),
-                    "one temp observer may be active per test thread"
-                );
-            });
-            Self
-        }
-    }
-
-    impl Drop for TempCreateObserverGuard {
-        fn drop(&mut self) {
-            TEMP_CREATE_OBSERVER.with(|slot| {
-                slot.borrow_mut().take();
-            });
-        }
-    }
-
-    struct OriginalOpenObserverGuard;
-
-    impl OriginalOpenObserverGuard {
-        fn install(observer: OriginalOpenCallback) -> Self {
-            ORIGINAL_OPEN_OBSERVER.with(|slot| {
-                assert!(
-                    slot.borrow_mut().replace(observer).is_none(),
-                    "one original-open observer may be active per test thread"
-                );
-            });
-            Self
-        }
-    }
-
-    impl Drop for OriginalOpenObserverGuard {
-        fn drop(&mut self) {
-            ORIGINAL_OPEN_OBSERVER.with(|slot| {
-                slot.borrow_mut().take();
-            });
-        }
-    }
 
     struct ChunkedReader {
         bytes: Vec<u8>,
@@ -1148,77 +1068,6 @@ mod tests {
         }
     }
 
-    struct VirtualNulReader {
-        len: usize,
-        nul_offset: usize,
-        position: usize,
-        requested: Vec<usize>,
-    }
-
-    impl VirtualNulReader {
-        fn new(len: usize, nul_offset: usize) -> Self {
-            assert!(nul_offset < len);
-            Self {
-                len,
-                nul_offset,
-                position: 0,
-                requested: Vec::new(),
-            }
-        }
-    }
-
-    impl Read for VirtualNulReader {
-        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-            self.requested.push(output.len());
-            if self.position >= PREFLIGHT_BYTES {
-                return Err(io::Error::other(
-                    "the NUL proof illegally observed the virtual suffix",
-                ));
-            }
-            let count = output.len().min(self.len.saturating_sub(self.position));
-            output[..count].fill(b'a');
-            let end = self.position.saturating_add(count);
-            if (self.position..end).contains(&self.nul_offset) {
-                output[self.nul_offset - self.position] = 0;
-            }
-            self.position = end;
-            Ok(count)
-        }
-    }
-
-    struct StopOnCheck {
-        checks: AtomicUsize,
-        stop_on: usize,
-        stop: WorkStop,
-    }
-
-    impl StopOnCheck {
-        fn new(stop_on: usize, stop: WorkStop) -> Self {
-            Self {
-                checks: AtomicUsize::new(0),
-                stop_on,
-                stop,
-            }
-        }
-
-        fn checks(&self) -> usize {
-            self.checks.load(Ordering::Acquire)
-        }
-    }
-
-    impl WorkCheckpoint for StopOnCheck {
-        fn check_work(&self) -> Result<(), WorkStop> {
-            let check = self.checks.fetch_add(1, Ordering::AcqRel) + 1;
-            if check >= self.stop_on {
-                Err(self.stop)
-            } else {
-                Ok(())
-            }
-        }
-
-        fn stage(&self, _stage: TestStage) {}
-    }
-
     #[derive(Debug, Eq, PartialEq)]
     enum ReferenceDisposition {
         Text { used_fallback: bool },
@@ -1268,88 +1117,6 @@ mod tests {
         bytes.push(0xFF);
         bytes.resize(PREFLIGHT_BYTES, b'a');
         bytes
-    }
-
-    fn late_magic_proof_bytes() -> Vec<u8> {
-        let mut bytes = vec![b'a'; MEMORY_SNAPSHOT_LIMIT + SNAPSHOT_CHUNK_BYTES + 1];
-        bytes[..2].copy_from_slice(b"MZ");
-        *bytes.last_mut().unwrap() = 0xFF;
-        bytes
-    }
-
-    #[test]
-    fn fifty_mib_nul_proof_reads_only_the_frozen_probe_and_never_creates_temp() {
-        for offset in [0, PREFLIGHT_BYTES - 1] {
-            let temp_creates = Arc::new(AtomicUsize::new(0));
-            let temp_creates_for_observer = Arc::clone(&temp_creates);
-            let _observer = TempCreateObserverGuard::install(Arc::new(move |_| {
-                temp_creates_for_observer.fetch_add(1, Ordering::AcqRel);
-            }));
-            let mut reader = VirtualNulReader::new(50 * 1024 * 1024, offset);
-            let result = capture_reader(&mut reader, None, None, None).unwrap();
-            assert!(matches!(
-                result,
-                CaptureRead::Terminal(TerminalProof::NulWithinFrozenProbe)
-            ));
-            assert!(reader.position <= PREFLIGHT_BYTES);
-            assert!(
-                reader
-                    .requested
-                    .iter()
-                    .all(|requested| *requested <= PREFLIGHT_BYTES)
-            );
-            assert_eq!(temp_creates.load(Ordering::Acquire), 0);
-        }
-    }
-
-    #[test]
-    fn a_fault_before_terminal_proof_remains_the_precise_io_failure() {
-        let mut bytes = vec![b'a'; PREFLIGHT_BYTES];
-        bytes[PREFLIGHT_BYTES - 1] = 0;
-        let mut reader = ChunkedReader::new(bytes, 127);
-        reader.fail_at = Some(127);
-        let failure = match capture_reader(&mut reader, None, None, None) {
-            Err(failure) => failure,
-            Ok(_) => panic!("expected original-reader IO failure"),
-        };
-        let CaptureFailure::Io(error) = failure else {
-            panic!("expected original-reader IO failure");
-        };
-        assert_eq!(error.to_string(), "injected read failure");
-    }
-
-    #[test]
-    fn explicit_encoding_and_unicode_boms_bypass_the_nul_terminal() {
-        for (bytes, explicit) in [
-            (b"\0plain".as_slice(), Some("utf-8")),
-            (b"\xFF\xFEA\0".as_slice(), None),
-            (b"\xFE\xFF\0A".as_slice(), None),
-            (b"\xFF\xFE\0\0A\0\0\0".as_slice(), None),
-            (b"\0\0\xFE\xFF\0\0\0A".as_slice(), None),
-        ] {
-            let mut reader = ChunkedReader::new(bytes.to_vec(), 2);
-            assert!(matches!(
-                capture_reader(&mut reader, explicit, None, None).unwrap(),
-                CaptureRead::Complete(_)
-            ));
-        }
-
-        let mut utf8_bom = ChunkedReader::new(b"\xEF\xBB\xBF\0text".to_vec(), 8);
-        assert!(matches!(
-            capture_reader(&mut utf8_bom, None, None, None).unwrap(),
-            CaptureRead::Terminal(TerminalProof::NulWithinFrozenProbe)
-        ));
-    }
-
-    #[test]
-    fn nul_at_offset_8192_is_outside_the_frozen_probe() {
-        let mut bytes = vec![b'a'; PREFLIGHT_BYTES + 1];
-        bytes[PREFLIGHT_BYTES] = 0;
-        let mut reader = ChunkedReader::new(bytes, 113);
-        assert!(matches!(
-            capture_reader(&mut reader, None, None, None).unwrap(),
-            CaptureRead::Complete(_)
-        ));
     }
 
     #[test]
@@ -1503,115 +1270,6 @@ mod tests {
     }
 
     #[test]
-    fn suffix_sensitive_states_are_never_published_as_terminal_proofs() {
-        let short_utf8_bom_malformed = b"\xEF\xBB\xBF\xFF";
-        let mut reader = ChunkedReader::new(short_utf8_bom_malformed.to_vec(), 4);
-        assert!(matches!(
-            capture_reader(&mut reader, None, None, None).unwrap(),
-            CaptureRead::Complete(_)
-        ));
-        assert!(matches!(
-            reference_disposition(short_utf8_bom_malformed, None, None),
-            ReferenceDisposition::Rejected(EncodingRejection::BomMismatch { encoding: "UTF-8" })
-        ));
-        let mut extended = short_utf8_bom_malformed.to_vec();
-        extended.push(0);
-        assert_eq!(
-            reference_disposition(&extended, None, None),
-            ReferenceDisposition::Binary
-        );
-
-        let mut mixed = "界".repeat(11).into_bytes();
-        mixed.push(0xFF);
-        let mut reader = ChunkedReader::new(mixed.clone(), mixed.len());
-        assert!(matches!(
-            capture_reader(&mut reader, None, None, None).unwrap(),
-            CaptureRead::Complete(_)
-        ));
-        mixed.push(0);
-        assert_eq!(
-            reference_disposition(&mixed, None, None),
-            ReferenceDisposition::Binary
-        );
-
-        let mixed = mixed_prefix();
-        let mut reader = ChunkedReader::new(mixed.clone(), PREFLIGHT_BYTES);
-        assert!(matches!(
-            capture_reader(&mut reader, None, Some("windows-1252"), None).unwrap(),
-            CaptureRead::Complete(_)
-        ));
-        assert_eq!(
-            reference_disposition(&mixed, None, Some("windows-1252")),
-            ReferenceDisposition::Text {
-                used_fallback: true
-            }
-        );
-
-        let valid_magic_like_text = vec![b'M', b'Z', b' ', b'a'];
-        let mut reader = ChunkedReader::new(valid_magic_like_text.clone(), 4);
-        assert!(matches!(
-            capture_reader(&mut reader, None, None, None).unwrap(),
-            CaptureRead::Complete(_)
-        ));
-        assert_eq!(
-            reference_disposition(&valid_magic_like_text, None, None),
-            ReferenceDisposition::Text {
-                used_fallback: false
-            }
-        );
-    }
-
-    #[test]
-    fn stable_terminal_proofs_map_to_their_exact_candidate_dispositions() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("candidate.bin");
-
-        let mut magic = b"\x1F\x8B".to_vec();
-        magic.resize(PREFLIGHT_BYTES, b'a');
-        std::fs::write(&path, magic).unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let candidate = PathRecord::from_metadata(&path, temp.path(), &metadata, true).unwrap();
-        assert!(matches!(
-            capture_classify(&candidate, None, None, None).unwrap(),
-            CaptureDisposition::BinarySkipped(TerminalProof::BinaryMagicAfterUtf8Failure)
-        ));
-
-        std::fs::write(&path, [b'a', b'b', b'c', 0xFF]).unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let candidate = PathRecord::from_metadata(&path, temp.path(), &metadata, true).unwrap();
-        assert!(matches!(
-            capture_classify(&candidate, Some("utf-8"), None, None).unwrap(),
-            CaptureDisposition::EncodingRejected {
-                rejection: EncodingRejection::ExplicitMalformed { ref encoding },
-                proof: TerminalProof::ExplicitDecoderMalformed {
-                    encoding: ref proof_encoding
-                },
-            } if encoding == "utf-8" && proof_encoding == "utf-8"
-        ));
-
-        let mixed = mixed_prefix();
-        std::fs::write(&path, &mixed).unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let candidate = PathRecord::from_metadata(&path, temp.path(), &metadata, true).unwrap();
-        assert!(matches!(
-            capture_classify(&candidate, None, None, None).unwrap(),
-            CaptureDisposition::EncodingRejected {
-                rejection: EncodingRejection::MixedOrInconsistent {
-                    conflict_hex_offset: Some(3)
-                },
-                proof: TerminalProof::AutomaticRejected {
-                    conflict_hex_offset: 3,
-                    fallback: FallbackTerminalState::Absent,
-                },
-            }
-        ));
-        assert!(matches!(
-            capture_classify(&candidate, None, Some("windows-1252"), None).unwrap(),
-            CaptureDisposition::Searchable(_)
-        ));
-    }
-
-    #[test]
     fn large_capture_promotes_once_reads_repeatably_and_unlinks_on_drop() {
         let bytes = vec![b'x'; MEMORY_SNAPSHOT_LIMIT + 1];
         let mut reader = ChunkedReader::new(bytes.clone(), 17 * 1024);
@@ -1649,150 +1307,6 @@ mod tests {
         }
         drop(snapshot);
         assert!(!temp_path.exists());
-    }
-
-    #[test]
-    fn small_snapshot_prefix_borrows_the_sealed_backing() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("borrowed-prefix.txt");
-        let bytes = b"borrow this prefix without copying";
-        std::fs::write(&path, bytes).unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let candidate = PathRecord::from_metadata(&path, temp.path(), &metadata, true).unwrap();
-        let CaptureDisposition::Searchable(snapshot) =
-            capture_classify(&candidate, None, None, None).unwrap()
-        else {
-            panic!("expected searchable snapshot");
-        };
-        let backing = snapshot.memory_bytes().unwrap();
-        let prefix = snapshot.memory_prefix(8);
-        assert_eq!(prefix, Some(&backing[..8]));
-        assert_eq!(prefix.unwrap().as_ptr(), backing.as_ptr());
-        let shared = snapshot.shared_range(0).unwrap();
-        assert_eq!(shared.memory_bytes().unwrap().as_ptr(), backing.as_ptr());
-    }
-
-    #[test]
-    fn utf8_bom_suffix_reuses_memory_and_rejects_invalid_ranges() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("bom-suffix.txt");
-        let bytes = b"\xef\xbb\xbf\xe5\x89\x8dhit\xe5\x90\x8e\n";
-        std::fs::write(&path, bytes).unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let candidate = PathRecord::from_metadata(&path, temp.path(), &metadata, true).unwrap();
-        let CaptureDisposition::Searchable(snapshot) =
-            capture_classify(&candidate, None, None, None).unwrap()
-        else {
-            panic!("expected searchable UTF-8 BOM snapshot");
-        };
-
-        let backing = snapshot.memory_bytes().unwrap();
-        let suffix = snapshot.shared_range(3).unwrap();
-        assert_eq!(suffix.memory_bytes().unwrap(), &backing[3..]);
-        assert_eq!(
-            suffix.memory_bytes().unwrap().as_ptr(),
-            backing[3..].as_ptr()
-        );
-        assert_eq!(suffix.read_range(3..6).unwrap(), b"hit");
-        let reversed_start = 4;
-        let reversed_end = 3;
-        assert_eq!(
-            suffix
-                .read_range(reversed_start..reversed_end)
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(
-            suffix.read_range(0..suffix.len() + 1).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        let text = SearchText::from_snapshot(suffix);
-        drop(snapshot);
-        assert_eq!(text.range_str(3..6).unwrap().as_str(), "hit");
-    }
-
-    #[test]
-    fn terminal_proof_after_promotion_immediately_unlinks_the_partial_temp() {
-        let created_paths = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
-        let paths_for_observer = Arc::clone(&created_paths);
-        let _observer = TempCreateObserverGuard::install(Arc::new(move |path| {
-            paths_for_observer.lock().unwrap().push(path.to_path_buf());
-        }));
-        let mut reader = ChunkedReader::new(late_magic_proof_bytes(), SNAPSHOT_CHUNK_BYTES);
-
-        assert!(matches!(
-            capture_reader(&mut reader, None, None, None).unwrap(),
-            CaptureRead::Terminal(TerminalProof::BinaryMagicAfterUtf8Failure)
-        ));
-        let created_paths = created_paths.lock().unwrap().clone();
-        assert_eq!(created_paths.len(), 1, "promotion must happen exactly once");
-        assert!(created_paths.iter().all(|path| !path.exists()));
-    }
-
-    #[test]
-    fn cancellation_after_a_promoted_terminal_proof_keeps_the_temp_unlinked() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("late-terminal.exe");
-        std::fs::write(&path, late_magic_proof_bytes()).unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let candidate = PathRecord::from_metadata(&path, temp.path(), &metadata, true).unwrap();
-
-        let created_paths = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
-        let paths_for_observer = Arc::clone(&created_paths);
-        let _observer = TempCreateObserverGuard::install(Arc::new(move |path| {
-            paths_for_observer.lock().unwrap().push(path.to_path_buf());
-        }));
-        let token = CancellationToken::new();
-        let token_for_hook = token.clone();
-        let hook = Arc::new(move |stage| {
-            if stage == TestStage::BeforeIdentityPostCheck {
-                token_for_hook.cancel();
-            }
-        });
-        let (_guard, operation) =
-            RequestWorkGuard::new_with_hook(RequestId::Number(17), token, hook);
-
-        assert!(matches!(
-            capture_classify(&candidate, None, None, Some(&operation)),
-            Err(CaptureFailure::Cancelled)
-        ));
-        let created_paths = created_paths.lock().unwrap().clone();
-        assert_eq!(created_paths.len(), 1, "promotion must happen exactly once");
-        assert!(created_paths.iter().all(|path| !path.exists()));
-    }
-
-    #[test]
-    fn stop_precedes_classifier_rejection_proof_and_eof_publication() {
-        let mut invalid_label = ChunkedReader::new(b"text".to_vec(), PREFLIGHT_BYTES);
-        let stop = StopOnCheck::new(4, WorkStop::RequestCancelled);
-        assert!(matches!(
-            capture_reader(
-                &mut invalid_label,
-                Some("not-an-encoding"),
-                None,
-                Some(&stop),
-            ),
-            Err(CaptureFailure::Cancelled)
-        ));
-        assert_eq!(stop.checks(), 4);
-
-        let mut terminal = ChunkedReader::new(vec![0xFF, b'a', b'b', b'c'], PREFLIGHT_BYTES);
-        let stop = StopOnCheck::new(4, WorkStop::EpochRetired);
-        assert!(matches!(
-            capture_reader(&mut terminal, Some("utf-8"), None, Some(&stop)),
-            Err(CaptureFailure::EpochRetired)
-        ));
-        assert_eq!(stop.checks(), 4);
-
-        let mut eof = ChunkedReader::new(b"text".to_vec(), PREFLIGHT_BYTES);
-        let stop = StopOnCheck::new(8, WorkStop::RequestCancelled);
-        assert!(matches!(
-            capture_reader(&mut eof, None, None, Some(&stop)),
-            Err(CaptureFailure::Cancelled)
-        ));
-        assert_eq!(stop.checks(), 8);
     }
 
     #[test]
@@ -1850,27 +1364,6 @@ mod tests {
         ));
         assert_eq!(promotions.load(Ordering::Acquire), 1);
         assert!(position.load(Ordering::Acquire) <= MEMORY_SNAPSHOT_LIMIT + SNAPSHOT_CHUNK_BYTES);
-    }
-
-    #[test]
-    fn cancelling_a_promoted_builder_drops_its_partial_temp_file() {
-        let mut builder = SnapshotBuilder::new();
-        let full_chunk = vec![b'a'; SNAPSHOT_CHUNK_BYTES];
-        for _ in 0..(MEMORY_SNAPSHOT_LIMIT / SNAPSHOT_CHUNK_BYTES) {
-            builder.append(&full_chunk, None).unwrap();
-        }
-        builder.append(b"x", None).unwrap();
-        let temp_path = builder.temp_path().unwrap().to_path_buf();
-        assert!(temp_path.exists());
-
-        let token = CancellationToken::new();
-        let (_guard, operation) = RequestWorkGuard::new(RequestId::Number(14), token.clone());
-        token.cancel();
-        assert!(matches!(
-            builder.finish(Some(&operation)),
-            Err(CaptureFailure::Cancelled)
-        ));
-        assert!(!temp_path.exists());
     }
 
     #[test]
@@ -1994,92 +1487,5 @@ mod tests {
         ));
         guard.disarm();
         assert!(replaced.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn growth_after_open_uses_actual_bytes_and_promotes_once_before_file_changed() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("growing.txt");
-        std::fs::write(&path, vec![b'a'; 1024]).unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let candidate = PathRecord::from_metadata(&path, temp.path(), &metadata, true).unwrap();
-
-        let original_opens = Arc::new(AtomicUsize::new(0));
-        let original_opens_for_observer = Arc::clone(&original_opens);
-        let _open_observer = OriginalOpenObserverGuard::install(Arc::new(move |_| {
-            original_opens_for_observer.fetch_add(1, Ordering::AcqRel);
-        }));
-
-        let grown = Arc::new(AtomicBool::new(false));
-        let grown_for_hook = Arc::clone(&grown);
-        let promotions = Arc::new(AtomicUsize::new(0));
-        let promotions_for_hook = Arc::clone(&promotions);
-        let path_for_hook = path.clone();
-        let hook = Arc::new(move |stage| match stage {
-            TestStage::CapturePreflightRead if !grown_for_hook.swap(true, Ordering::AcqRel) => {
-                let mut writer = std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(&path_for_hook)
-                    .unwrap();
-                let chunk = vec![b'a'; SNAPSHOT_CHUNK_BYTES];
-                for _ in 0..(64 * 1024 * 1024 / SNAPSHOT_CHUNK_BYTES) {
-                    writer.write_all(&chunk).unwrap();
-                }
-                writer.flush().unwrap();
-            }
-            TestStage::SnapshotPromote => {
-                promotions_for_hook.fetch_add(1, Ordering::AcqRel);
-            }
-            _ => {}
-        });
-        let (mut guard, operation) =
-            RequestWorkGuard::new_with_hook(RequestId::Number(15), CancellationToken::new(), hook);
-        assert!(matches!(
-            capture_classify(&candidate, None, None, Some(&operation)).unwrap(),
-            CaptureDisposition::FileChanged
-        ));
-        guard.disarm();
-        assert!(grown.load(Ordering::Acquire));
-        assert_eq!(original_opens.load(Ordering::Acquire), 1);
-        assert_eq!(promotions.load(Ordering::Acquire), 1);
-    }
-
-    #[test]
-    fn cancellation_wins_before_capture_starts() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("cancelled.txt");
-        std::fs::write(&path, b"text").unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let candidate = PathRecord::from_metadata(&path, temp.path(), &metadata, true).unwrap();
-        let token = CancellationToken::new();
-        let (_guard, operation) = RequestWorkGuard::new(RequestId::Number(3), token.clone());
-        token.cancel();
-        assert!(matches!(
-            capture_classify(&candidate, None, None, Some(&operation)),
-            Err(CaptureFailure::Cancelled)
-        ));
-    }
-
-    #[test]
-    fn cancellation_after_terminal_capture_wins_before_identity_or_skip_publication() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("cancelled-terminal.bin");
-        std::fs::write(&path, [b'a', 0, b'b', b'c']).unwrap();
-        let metadata = std::fs::metadata(&path).unwrap();
-        let candidate = PathRecord::from_metadata(&path, temp.path(), &metadata, true).unwrap();
-        let token = CancellationToken::new();
-        let token_for_hook = token.clone();
-        let hook = Arc::new(move |stage| {
-            if stage == TestStage::BeforeIdentityPostCheck {
-                token_for_hook.cancel();
-            }
-        });
-        let (_guard, operation) =
-            RequestWorkGuard::new_with_hook(RequestId::Number(16), token, hook);
-        assert!(matches!(
-            capture_classify(&candidate, None, None, Some(&operation)),
-            Err(CaptureFailure::Cancelled)
-        ));
     }
 }

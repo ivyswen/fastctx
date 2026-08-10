@@ -25,8 +25,9 @@ const INSPECT_TOOL_SUMMARY: &str = concat!(
 const INSPECT_TOOL_DETAILS: &str = concat!(
     "Text returns 1-based `N<tab>content` lines, as much of the file as\n",
     "the output budget holds. For several text files in one call, pass\n",
-    "files=[{\"path\": ...}, ...] instead of file_path: one token budget, per-file\n",
-    "problems reported inline without failing the batch, and a Partial note returns\n",
+    "files=[{\"path\": ...}, ...] instead of file_path. Repeat a path for distinct\n",
+    "offset/limit ranges, and freely mix ranges from multiple files: one token budget,\n",
+    "per-entry problems reported inline, and a Partial note returns\n",
     "the exact files array for the next call. Images (PNG/JPG/GIF/WebP/BMP) are\n",
     "shown to you visually. PDFs return the selected pages' text layer or those\n",
     "pages rendered as images; image mode defaults to 4 pages. view=\"hex\" dumps\n",

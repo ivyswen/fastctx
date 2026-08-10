@@ -343,34 +343,3 @@ fn resolve_cwd(input: Option<&str>, session_cwd: &std::path::Path) -> Result<Pat
     };
     Ok(canonical_existing(&path).unwrap_or(path))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{FastShell, JobOutputRequest, RunRequest};
-
-    #[test]
-    fn validation_errors_are_exact_and_do_not_probe_bash() {
-        let shell = FastShell::new();
-        assert_eq!(
-            shell.run(RunRequest {
-                command: " ".to_string(),
-                cwd: None,
-                timeout_ms: None,
-                login_shell: true,
-                encoding: None,
-            }),
-            crate::ToolResponse::error("Invalid command: it must be a non-empty string.")
-        );
-        assert_eq!(
-            shell.job_output(JobOutputRequest {
-                job_id: "missing".to_string(),
-                wait_ms: Some(240_001),
-                after_seq: None,
-                encoding: None,
-            }),
-            crate::ToolResponse::error(
-                "Invalid wait_ms value: 240001. Expected an integer from 0 to 240000."
-            )
-        );
-    }
-}

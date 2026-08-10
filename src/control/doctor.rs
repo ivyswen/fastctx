@@ -1,9 +1,10 @@
 //! Diagnosable Status/Doctor checks and a real stdio MCP handshake.
 
+use crate::context_guard::INNER_COMPACTION_BUFFER;
 use crate::control::agents;
 use crate::control::codex_config::{self, ExpectedConfig};
 use crate::control::paths::ControlPaths;
-use crate::control::provider::{self, CompactionSupport, EffectiveOutputMode};
+use crate::control::provider::{self, CodexCompaction, EffectiveOutputMode, ProviderProvenance};
 use crate::control::settings;
 use crate::server::{FastCtxServer, ServerOptions};
 use crate::server_manifest::{ToolContract, ToolManifest};
@@ -19,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use toml_edit::Item;
 
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(4);
 const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -163,6 +165,15 @@ pub fn run(paths: &ControlPaths) -> DoctorReport {
         saved_settings,
         profile_applied,
     ));
+    checks.push(check_context_override_math(
+        &provider_detection,
+        config_bytes.as_deref(),
+    ));
+    checks.push(check_config_rewrite_detection(
+        config_bytes.as_deref(),
+        profile_applied,
+    ));
+    checks.push(check_relay_protocol_self_check(&provider_detection));
     checks.push(match settings.as_ref() {
         Ok(settings) => check_drift(
             paths,
@@ -337,31 +348,43 @@ fn check_output_guard(
     settings: Option<&settings::FastCtxSettings>,
     record: Option<&settings::AppliedRecord>,
 ) -> DoctorCheck {
+    if detection.provenance == ProviderProvenance::Unknown {
+        let settings_detail = if settings.is_none() {
+            " FastCtx settings also could not be loaded, so no effective output policy could be evaluated."
+        } else {
+            ""
+        };
+        return DoctorCheck::info(
+            "Provider and compaction",
+            format!(
+                "WARNING: {} FastCtx never tightens an unresolved provider silently, so Guarded was not activated.{settings_detail} Repair or verify model_provider, then run fastctx status again.",
+                detection.detail
+            ),
+        );
+    }
     let Some(settings) = settings else {
         return DoctorCheck::info(
-            "Provider output guard",
+            "Provider and compaction",
             format!(
                 "{} FastCtx settings could not be loaded, so the effective output policy could not be evaluated.",
                 detection.detail
             ),
         );
     };
-    match detection.support {
-        CompactionSupport::Unknown => DoctorCheck::info(
-            "Provider output guard",
-            format!(
-                "{} No Guarded tightening was applied. Repair or verify model_provider, then run fastctx status again.",
-                detection.detail
-            ),
-        ),
-        CompactionSupport::Local if !settings.output_guard.enabled => DoctorCheck::info(
-            "Provider output guard",
-            format!(
-                "{} Guarded protection is explicitly disabled; local compaction can be slower, more expensive, and less reliable with large tool outputs.",
-                detection.detail
-            ),
-        ),
-        CompactionSupport::Local => {
+    match detection.provenance {
+        ProviderProvenance::Unknown => unreachable!("unknown providers returned above"),
+        ProviderProvenance::LocalRuntime | ProviderProvenance::ThirdPartyRelay
+            if !settings.output_guard.enabled =>
+        {
+            DoctorCheck::info(
+                "Provider and compaction",
+                format!(
+                    "{} Guarded protection is explicitly disabled. A large FastCtx turn can cross the remaining compaction margin, and FastCtx cannot make the provider's catalog, usage, compaction, or context-error contract correct.",
+                    detection.detail
+                ),
+            )
+        }
+        ProviderProvenance::LocalRuntime | ProviderProvenance::ThirdPartyRelay => {
             let effective =
                 provider::effective_output(settings.tier, settings.tool_budgets, true, detection);
             match record {
@@ -371,15 +394,18 @@ fn check_output_guard(
                         && record.tool_budgets == effective.tool_budgets =>
                 {
                     DoctorCheck::pass(
-                        "Provider output guard",
+                        "Provider and compaction",
                         format!(
-                            "{} Guarded is active: host limit {}, FastCtx budget {}, with independently adjustable per-tool shares.",
-                            detection.detail, effective.host_limit, effective.fastctx_budget
+                            "{} Guarded is active: host limit {}, FastCtx burst budget {}, below Codex 0.147.0's {}-token inner compaction buffer. This limits FastCtx's aggregate turn output but cannot verify the other relay contracts.",
+                            detection.detail,
+                            effective.host_limit,
+                            effective.fastctx_budget,
+                            INNER_COMPACTION_BUFFER
                         ),
                     )
                 }
                 Some(record) => DoctorCheck::fail(
-                    "Provider output guard",
+                    "Provider and compaction",
                     format!(
                         "{} New runtime sessions are constrained to Guarded, but the Apply receipt still records host/global limits {}/{} instead of {}/{}.",
                         detection.detail,
@@ -391,7 +417,7 @@ fn check_output_guard(
                     "Run fastctx apply to preview and write the Guarded host and server limits into Codex.",
                 ),
                 None => DoctorCheck::info(
-                    "Provider output guard",
+                    "Provider and compaction",
                     format!(
                         "{} New runtime sessions use Guarded automatically; run fastctx apply to write host limit {} and FastCtx budget {} into Codex.",
                         detection.detail, effective.host_limit, effective.fastctx_budget
@@ -399,7 +425,9 @@ fn check_output_guard(
                 ),
             }
         }
-        CompactionSupport::Remote => {
+        ProviderProvenance::OfficialOpenAi
+        | ProviderProvenance::Azure
+        | ProviderProvenance::AmazonBedrock => {
             let effective = provider::effective_output(
                 settings.tier,
                 settings.tool_budgets,
@@ -412,10 +440,10 @@ fn check_output_guard(
                         && record.fastctx_token_budget == effective.fastctx_budget
                         && record.tool_budgets == effective.tool_budgets =>
                 {
-                    DoctorCheck::pass("Provider output guard", detection.detail.clone())
+                    DoctorCheck::pass("Provider and compaction", detection.detail.clone())
                 }
                 Some(_) => DoctorCheck::info(
-                    "Provider output guard",
+                    "Provider and compaction",
                     format!(
                         "{} Guarded is no longer required. Run fastctx apply to restore the selected {} tier (host limit {}, FastCtx budget {}).",
                         detection.detail,
@@ -425,7 +453,7 @@ fn check_output_guard(
                     ),
                 ),
                 None => DoctorCheck::info(
-                    "Provider output guard",
+                    "Provider and compaction",
                     format!(
                         "{} FastCtx has not been applied in this profile.",
                         detection.detail
@@ -434,6 +462,277 @@ fn check_output_guard(
             }
         }
     }
+}
+
+fn check_context_override_math(
+    detection: &provider::ProviderDetection,
+    config: Option<&[u8]>,
+) -> DoctorCheck {
+    let Some(config) = config else {
+        return DoctorCheck::info(
+            "Context override math",
+            "No readable Codex config is available, so model_context_window and model_auto_compact_token_limit could not be inspected.",
+        );
+    };
+    let document = match std::str::from_utf8(config)
+        .map_err(|error| error.to_string())
+        .and_then(|source| {
+            toml_edit::DocumentMut::from_str(source).map_err(|error| error.to_string())
+        }) {
+        Ok(document) => document,
+        Err(error) => {
+            return DoctorCheck::info(
+                "Context override math",
+                format!("Codex config could not be evaluated for context overrides: {error}"),
+            );
+        }
+    };
+    let context = positive_override(&document, "model_context_window");
+    let auto = positive_override(&document, "model_auto_compact_token_limit");
+    for (key, value) in [
+        ("model_context_window", &context),
+        ("model_auto_compact_token_limit", &auto),
+    ] {
+        if matches!(value, OverrideValue::Invalid) {
+            return DoctorCheck::fail(
+                "Context override math",
+                format!("Codex config key {key} is present but is not a positive integer."),
+                format!(
+                    "Remove or repair {key}, then use Codex /status to verify the resolved model limits."
+                ),
+            );
+        }
+    }
+    let context = context.value();
+    let auto = auto.value();
+    if context.is_none() && auto.is_none() {
+        return DoctorCheck::pass(
+            "Context override math",
+            "No model_context_window or model_auto_compact_token_limit override is configured; Codex resolves both from its selected model catalog. Confirm the resolved values with Codex /status.",
+        );
+    }
+
+    let context_term = context.map_or_else(
+        || "catalog max_context_window".to_string(),
+        |value| format!("min({value}, catalog max_context_window)"),
+    );
+    let auto_term = auto.map_or_else(
+        || "floor(90% × resolved window)".to_string(),
+        |value| format!("min({value}, floor(90% × resolved window))"),
+    );
+    let keys = [
+        context.map(|value| format!("model_context_window={value}")),
+        auto.map(|value| format!("model_auto_compact_token_limit={value}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" and ");
+    let scenarios = [272_000_i64, 1_000_000_i64]
+        .map(|catalog_max| {
+            let resolved_window = context
+                .unwrap_or(catalog_max)
+                .min(catalog_max);
+            let ninety_percent = resolved_window.saturating_mul(9) / 10;
+            let resolved_auto = auto.unwrap_or(ninety_percent).min(ninety_percent);
+            format!(
+                "catalog max {catalog_max} => window {resolved_window}, auto-compact {resolved_auto}"
+            )
+        })
+        .join("; ");
+    let relay_warning = if detection.provenance == ProviderProvenance::ThirdPartyRelay {
+        " This is a third-party route: a high catalog can make a high override effective even when the real backend wall is lower."
+    } else {
+        ""
+    };
+    DoctorCheck::info(
+        "Context override math",
+        format!(
+            "Codex config sets {keys}. Under Codex 0.147.0 rules, resolved window = {context_term}; resolved auto-compact limit = {auto_term}. Applying those exact configured numbers to two illustrative catalog maxima: {scenarios}.{relay_warning} FastCtx does not mirror the live model catalog: use Codex /status to read the resolved values, and remove the overrides unless their catalog provenance is reliable."
+        ),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OverrideValue {
+    Missing,
+    Positive(i64),
+    Invalid,
+}
+
+impl OverrideValue {
+    const fn value(self) -> Option<i64> {
+        match self {
+            Self::Positive(value) => Some(value),
+            Self::Missing | Self::Invalid => None,
+        }
+    }
+}
+
+fn positive_override(document: &toml_edit::DocumentMut, key: &str) -> OverrideValue {
+    match document.get(key) {
+        None => OverrideValue::Missing,
+        Some(item) => match item.as_integer().filter(|value| *value > 0) {
+            Some(value) => OverrideValue::Positive(value),
+            None => OverrideValue::Invalid,
+        },
+    }
+}
+
+fn check_config_rewrite_detection(
+    config: Option<&[u8]>,
+    record: Option<&settings::AppliedRecord>,
+) -> DoctorCheck {
+    let Some(record) = record else {
+        return DoctorCheck::info(
+            "Config rewrite detection",
+            "No Apply receipt owns FastCtx keys in this Codex profile, so whole-file rewrite detection is not applicable yet.",
+        );
+    };
+    let Some(config) = config else {
+        return DoctorCheck::fail(
+            "Config rewrite detection",
+            "An Apply receipt owns FastCtx keys, but Codex config.toml is unavailable.",
+            "Restore a readable config.toml, then run fastctx apply to recreate only the managed entries.",
+        );
+    };
+    let source = match std::str::from_utf8(config) {
+        Ok(source) => source,
+        Err(error) => {
+            return DoctorCheck::info(
+                "Config rewrite detection",
+                format!(
+                    "Codex config is not UTF-8, so managed-key presence could not be checked: {error}"
+                ),
+            );
+        }
+    };
+    let document = match toml_edit::DocumentMut::from_str(source) {
+        Ok(document) => document,
+        Err(error) => {
+            return DoctorCheck::info(
+                "Config rewrite detection",
+                format!("Codex config could not be parsed for managed-key presence: {error}"),
+            );
+        }
+    };
+    let missing = missing_receipt_keys(&document, record);
+    if missing.is_empty() {
+        DoctorCheck::pass(
+            "Config rewrite detection",
+            "The Apply receipt and Codex config still share every FastCtx-managed key. Host-owned edits and formatting changes are intentionally ignored; semantic value drift is checked separately.",
+        )
+    } else {
+        DoctorCheck::fail(
+            "Config rewrite detection",
+            format!(
+                "The Apply receipt records FastCtx-managed keys that disappeared from config.toml: {}. A config switcher or other tool may have rewritten the whole file from an older snapshot.",
+                missing.join(", ")
+            ),
+            "Run fastctx apply to recreate only the managed entries, then configure the other tool to preserve current config.toml keys.",
+        )
+    }
+}
+
+fn missing_receipt_keys(
+    document: &toml_edit::DocumentMut,
+    record: &settings::AppliedRecord,
+) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if document.get("tool_output_token_limit").is_none() {
+        missing.push("tool_output_token_limit");
+    }
+    let fastctx = document
+        .get("mcp_servers")
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("fastctx"))
+        .and_then(Item::as_table_like);
+    let Some(fastctx) = fastctx else {
+        missing.push("mcp_servers.fastctx");
+        return missing;
+    };
+    for key in ["command", "args", "startup_timeout_sec"] {
+        if fastctx.get(key).is_none() {
+            missing.push(match key {
+                "command" => "mcp_servers.fastctx.command",
+                "args" => "mcp_servers.fastctx.args",
+                _ => "mcp_servers.fastctx.startup_timeout_sec",
+            });
+        }
+    }
+    if record.tool_timeout_sec.is_some() && fastctx.get("tool_timeout_sec").is_none() {
+        missing.push("mcp_servers.fastctx.tool_timeout_sec");
+    }
+    let env = fastctx.get("env").and_then(Item::as_table_like);
+    let Some(env) = env else {
+        missing.push("mcp_servers.fastctx.env");
+        return missing;
+    };
+    if env.get("FASTCTX_TOKEN_BUDGET").is_none() {
+        missing.push("mcp_servers.fastctx.env.FASTCTX_TOKEN_BUDGET");
+    }
+    for (key, budget) in [
+        ("FASTCTX_READ_TOKEN_BUDGET", record.tool_budgets.read),
+        ("FASTCTX_GREP_TOKEN_BUDGET", record.tool_budgets.grep),
+        ("FASTCTX_GLOB_TOKEN_BUDGET", record.tool_budgets.glob),
+        ("FASTCTX_RUN_TOKEN_BUDGET", record.tool_budgets.run),
+        (
+            "FASTCTX_JOB_OUTPUT_TOKEN_BUDGET",
+            record.tool_budgets.job_output,
+        ),
+    ] {
+        if budget.resolve(record.fastctx_token_budget).is_some() && env.get(key).is_none() {
+            missing.push(match key {
+                "FASTCTX_READ_TOKEN_BUDGET" => "mcp_servers.fastctx.env.FASTCTX_READ_TOKEN_BUDGET",
+                "FASTCTX_GREP_TOKEN_BUDGET" => "mcp_servers.fastctx.env.FASTCTX_GREP_TOKEN_BUDGET",
+                "FASTCTX_GLOB_TOKEN_BUDGET" => "mcp_servers.fastctx.env.FASTCTX_GLOB_TOKEN_BUDGET",
+                "FASTCTX_RUN_TOKEN_BUDGET" => "mcp_servers.fastctx.env.FASTCTX_RUN_TOKEN_BUDGET",
+                _ => "mcp_servers.fastctx.env.FASTCTX_JOB_OUTPUT_TOKEN_BUDGET",
+            });
+        }
+    }
+    let has_namespace = document
+        .get("features")
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("code_mode"))
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("direct_only_tool_namespaces"))
+        .and_then(Item::as_array)
+        .is_some_and(|array| {
+            array
+                .iter()
+                .any(|item| item.as_str() == Some("mcp__fastctx"))
+        });
+    if !has_namespace {
+        missing.push("features.code_mode.direct_only_tool_namespaces[mcp__fastctx]");
+    }
+    missing
+}
+
+fn check_relay_protocol_self_check(detection: &provider::ProviderDetection) -> DoctorCheck {
+    if detection.provenance != ProviderProvenance::ThirdPartyRelay {
+        return DoctorCheck::info(
+            "Relay protocol self-check",
+            "No third-party relay is selected. FastCtx does not observe model usage or upstream context-error payloads, so this check remains informational.",
+        );
+    }
+    let compact = match detection.codex_compaction {
+        CodexCompaction::RemoteV2 => {
+            "Codex will send V2 compaction to this relay; failure has no local fallback."
+        }
+        CodexCompaction::Local => {
+            "Codex will compact locally, but the relay still owns catalog, usage, and error fidelity."
+        }
+        CodexCompaction::RemoteV1 | CodexCompaction::Unknown => {
+            "The relay compaction path is unresolved."
+        }
+    };
+    DoctorCheck::info(
+        "Relay protocol self-check",
+        format!(
+            "{compact} FastCtx cannot test the relay from inside MCP. In a long Codex session, watch /status: if used tokens barely move after substantial responses, the relay may be dropping terminal usage. Also verify that context failures preserve code=context_length_exceeded; a generic 400/500 does not enter Codex's context-specific recovery path."
+        ),
+    )
 }
 
 fn check_drift(
@@ -1202,660 +1501,4 @@ fn with_stderr(message: String, stderr: &str) -> String {
 
 fn sha256(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        DoctorCheck, DoctorCheckStatus, MCP_INITIALIZE_TIMEOUT, check_agents, check_drift,
-        check_extension_state, check_model_tool_surface, check_output_guard, receipt_drift, run,
-    };
-    use crate::control::codex_config::{self, ExpectedConfig};
-    use crate::control::paths::ControlPaths;
-    use crate::control::settings::{
-        AppliedRecord, FastCtxSettings, ManagedFileRecord, Tier, ToolBudgetLevel,
-        ToolBudgetPreferences, ToolBudgets,
-    };
-
-    #[test]
-    fn the_initialize_budget_outlasts_a_cold_control_center_start() {
-        // The probed server is a thin proxy, so a passing handshake needs the shared control
-        // center to come up first. A budget at or below the proxy startup timeout turns "still
-        // starting" into a reported failure, which is what `fastctx status` did on a fresh home.
-        assert!(
-            MCP_INITIALIZE_TIMEOUT > crate::runtime::STARTUP_TIMEOUT,
-            "initialize budget {MCP_INITIALIZE_TIMEOUT:?} does not outlast a cold start of {:?}",
-            crate::runtime::STARTUP_TIMEOUT
-        );
-    }
-
-    fn provider_record(
-        tier: Tier,
-        host_limit: i64,
-        fastctx_budget: usize,
-        tool_budgets: ToolBudgets,
-    ) -> AppliedRecord {
-        let managed = ManagedFileRecord {
-            path: "managed".to_string(),
-            original_existed: true,
-            applied_sha256: "hash".to_string(),
-        };
-        AppliedRecord {
-            applied_at_utc: "2026-08-01T00:00:00Z".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            command: "fastctx".to_string(),
-            tier,
-            tool_output_token_limit: host_limit,
-            tool_timeout_sec: Some(codex_config::TOOL_TIMEOUT_SECONDS),
-            previous_token_limit_present: false,
-            previous_token_limit: None,
-            fastctx_token_budget: fastctx_budget,
-            tool_budgets,
-            fastshell_enabled: false,
-            fastedit_enabled: false,
-            codex_dir_created: false,
-            codex_config: managed.clone(),
-            codex_agents: managed,
-            agents_contract_id: Some(
-                crate::control::agents::MANAGED_SECTION_CONTRACT_ID.to_string(),
-            ),
-            codex_agents_inserted_separator: None,
-            binary_sha256: "hash".to_string(),
-        }
-    }
-
-    #[test]
-    fn agents_guidance_reports_every_managed_state_and_never_hides_apply_after_refresh() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        std::fs::create_dir_all(&paths.codex_dir).unwrap();
-        let mut record = provider_record(
-            Tier::Standard,
-            Tier::Standard.host_limit(),
-            Tier::Standard.fastctx_budget(),
-            Tier::Standard.default_budgets(),
-        );
-
-        std::fs::write(&paths.codex_agents, crate::control::agents::section(false)).unwrap();
-        let current = check_agents(&paths, Some(&record));
-        assert_eq!(current.status, DoctorCheckStatus::Pass, "{current:?}");
-        assert!(current.detail.contains("State: current"), "{current:?}");
-
-        record.agents_contract_id = None;
-        let refreshed = check_agents(&paths, Some(&record));
-        assert_eq!(refreshed.status, DoctorCheckStatus::Fail, "{refreshed:?}");
-        assert!(refreshed.detail.contains("Apply required"), "{refreshed:?}");
-        assert!(
-            refreshed
-                .remedy
-                .as_deref()
-                .is_some_and(|remedy| remedy.contains("fastctx apply")),
-            "{refreshed:?}"
-        );
-        record.agents_contract_id =
-            Some(crate::control::agents::MANAGED_SECTION_CONTRACT_ID.to_string());
-
-        for (bytes, state, automatic) in [
-            (
-                crate::control::agents::KnownLegacyGuidance::ResourceRouting
-                    .section(false)
-                    .into_bytes(),
-                "superseded guidance",
-                "post-Apply drift",
-            ),
-            (
-                b"<!-- fastctx:begin -->\nuser-owned drift\n<!-- fastctx:end -->".to_vec(),
-                "drifted",
-                "Automatic updates preserve",
-            ),
-            (
-                b"<!-- fastctx:begin -->\n<!-- fastctx:begin -->\n<!-- fastctx:end -->".to_vec(),
-                "malformed",
-                "never rewrite malformed",
-            ),
-        ] {
-            std::fs::write(&paths.codex_agents, bytes).unwrap();
-            let check = check_agents(&paths, Some(&record));
-            assert_eq!(check.status, DoctorCheckStatus::Fail, "{check:?}");
-            assert!(check.detail.contains(state), "{state}: {check:?}");
-            assert!(check.detail.contains(automatic), "{automatic}: {check:?}");
-            assert!(
-                check
-                    .remedy
-                    .as_deref()
-                    .is_some_and(|remedy| remedy.contains("fastctx apply")),
-                "{check:?}"
-            );
-        }
-
-        record.agents_contract_id = None;
-        std::fs::write(
-            &paths.codex_agents,
-            crate::control::agents::KnownLegacyGuidance::ResourceRouting.section(false),
-        )
-        .unwrap();
-        let upgrade_legacy = check_agents(&paths, Some(&record));
-        assert_eq!(
-            upgrade_legacy.status,
-            DoctorCheckStatus::Fail,
-            "{upgrade_legacy:?}"
-        );
-        assert!(
-            upgrade_legacy.detail.contains("managed product update"),
-            "{upgrade_legacy:?}"
-        );
-        record.agents_contract_id =
-            Some(crate::control::agents::MANAGED_SECTION_CONTRACT_ID.to_string());
-
-        std::fs::remove_file(&paths.codex_agents).unwrap();
-        let missing = check_agents(&paths, Some(&record));
-        assert_eq!(missing.status, DoctorCheckStatus::Fail, "{missing:?}");
-        assert!(missing.detail.contains("State: missing"), "{missing:?}");
-        assert!(missing.detail.contains("never recreate"), "{missing:?}");
-
-        let fresh = check_agents(&paths, None);
-        assert_eq!(fresh.status, DoctorCheckStatus::Info, "{fresh:?}");
-        assert!(fresh.detail.contains("State: missing"), "{fresh:?}");
-
-        std::fs::write(&paths.codex_agents, crate::control::agents::section(true)).unwrap();
-        let unowned_shell = check_agents(&paths, None);
-        assert_eq!(
-            unowned_shell.status,
-            DoctorCheckStatus::Info,
-            "{unowned_shell:?}"
-        );
-        assert!(
-            unowned_shell.detail.contains("State: current"),
-            "{unowned_shell:?}"
-        );
-    }
-
-    #[test]
-    fn model_tool_surface_is_always_unverified_independently_of_the_server_contract() {
-        for contract in [
-            DoctorCheck::pass("MCP server contract", "server passed"),
-            DoctorCheck::info("MCP server contract", "not probed"),
-            DoctorCheck::fail("MCP server contract", "server failed", "repair server"),
-        ] {
-            let surface = check_model_tool_surface(&contract);
-            assert_eq!(surface.status, DoctorCheckStatus::Info, "{surface:?}");
-            assert!(surface.detail.starts_with("Unverified:"), "{surface:?}");
-            assert!(surface.detail.contains("model"), "{surface:?}");
-            assert!(
-                surface.detail.contains("direct FastCtx tool call"),
-                "{surface:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn provider_switch_diagnostics_fail_toward_local_and_inform_toward_remote() {
-        let settings = FastCtxSettings {
-            tier: Tier::Standard,
-            ..FastCtxSettings::default()
-        };
-        let official_record = provider_record(
-            Tier::Standard,
-            Tier::Standard.host_limit(),
-            Tier::Standard.fastctx_budget(),
-            Tier::Standard.default_budgets(),
-        );
-        let local = crate::control::provider::detect_bytes(Some(
-            b"model_provider='custom'\n[model_providers.custom]\nname='Third Party'\n",
-        ));
-        let tightened = check_output_guard(&local, Some(&settings), Some(&official_record));
-        assert_eq!(tightened.status, DoctorCheckStatus::Fail, "{tightened:?}");
-        assert!(
-            tightened
-                .detail
-                .contains("New runtime sessions are constrained")
-        );
-        assert!(
-            tightened
-                .remedy
-                .as_deref()
-                .is_some_and(|remedy| remedy.contains("fastctx apply"))
-        );
-
-        let guarded_record = provider_record(
-            Tier::Standard,
-            crate::control::provider::GUARDED_HOST_LIMIT,
-            crate::control::provider::GUARDED_FASTCTX_BUDGET,
-            ToolBudgets {
-                read: ToolBudgetLevel::Inherit,
-                grep: ToolBudgetLevel::Inherit,
-                glob: ToolBudgetLevel::Inherit,
-                run: ToolBudgetLevel::Inherit,
-                job_output: ToolBudgetLevel::Inherit,
-            },
-        );
-        let remote = crate::control::provider::detect_bytes(None);
-        let relaxed = check_output_guard(&remote, Some(&settings), Some(&guarded_record));
-        assert_eq!(relaxed.status, DoctorCheckStatus::Info, "{relaxed:?}");
-        assert!(relaxed.detail.contains("Guarded is no longer required"));
-        assert!(relaxed.detail.contains("fastctx apply"));
-    }
-
-    #[test]
-    fn receipt_drift_ignores_unowned_file_bytes_but_detects_paths_and_binary() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        std::fs::create_dir_all(&paths.codex_dir).unwrap();
-        std::fs::create_dir_all(&paths.fastctx_bin_dir).unwrap();
-        let config = b"config";
-        let agents = b"agents";
-        let binary = b"binary";
-        std::fs::write(&paths.codex_config, config).unwrap();
-        std::fs::write(&paths.codex_agents, agents).unwrap();
-        std::fs::write(&paths.installed_binary, binary).unwrap();
-        let managed = |path: &std::path::Path, bytes: &[u8]| ManagedFileRecord {
-            path: crate::paths::display_path(path),
-            original_existed: true,
-            applied_sha256: super::sha256(bytes),
-        };
-        let mut record = AppliedRecord {
-            applied_at_utc: "2026-07-12T00:00:00Z".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            command: crate::paths::display_path(&paths.installed_binary),
-            tier: Tier::Compact,
-            tool_output_token_limit: 10_000,
-            tool_timeout_sec: None,
-            previous_token_limit_present: false,
-            previous_token_limit: None,
-            fastctx_token_budget: 8_500,
-            tool_budgets: ToolBudgets::default(),
-            fastshell_enabled: false,
-            fastedit_enabled: false,
-            codex_dir_created: false,
-            codex_config: managed(&paths.codex_config, config),
-            codex_agents: managed(&paths.codex_agents, agents),
-            agents_contract_id: Some(
-                crate::control::agents::MANAGED_SECTION_CONTRACT_ID.to_string(),
-            ),
-            codex_agents_inserted_separator: None,
-            binary_sha256: super::sha256(binary),
-        };
-        assert!(receipt_drift(&paths, &record).unwrap().is_empty());
-
-        let drifted_config = b"config\n# unrelated user comment";
-        std::fs::write(&paths.codex_config, drifted_config).unwrap();
-        std::fs::write(&paths.codex_agents, b"user edit").unwrap();
-        assert!(
-            receipt_drift(&paths, &record).unwrap().is_empty(),
-            "whole-file edits outside FastCtx ownership are checked semantically elsewhere"
-        );
-
-        record.codex_config.path = "wrong/config".to_string();
-        record.codex_agents.path = "wrong/agents".to_string();
-        record.command = "wrong/path".to_string();
-        std::fs::write(&paths.installed_binary, b"changed binary").unwrap();
-        let drift = receipt_drift(&paths, &record).unwrap();
-        assert!(drift.contains(&"Codex config receipt path".to_string()));
-        assert!(drift.contains(&"AGENTS receipt path".to_string()));
-        assert!(drift.contains(&"installed binary receipt path".to_string()));
-        assert!(drift.contains(&"installed binary content".to_string()));
-    }
-
-    #[test]
-    fn applied_state_ignores_host_rewrites_but_detects_managed_semantic_drift() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        std::fs::create_dir_all(&paths.codex_dir).unwrap();
-        std::fs::create_dir_all(&paths.fastctx_bin_dir).unwrap();
-        let binary = b"binary";
-        let agents = b"agents";
-        std::fs::write(&paths.installed_binary, binary).unwrap();
-        std::fs::write(&paths.codex_agents, agents).unwrap();
-        let expected = ExpectedConfig {
-            command: crate::paths::display_path(&paths.installed_binary),
-            tier: Tier::Compact,
-            host_limit: Tier::Compact.host_limit(),
-            fastctx_budget: Tier::Compact.fastctx_budget(),
-            tool_budgets: Tier::Compact.default_budgets(),
-            fastshell_enabled: false,
-        };
-        let applied_config = codex_config::apply(
-            b"# host-owned heading\n[desktop]\nintegrated_terminal_shell = \"powershell\"\n",
-            &expected,
-        )
-        .unwrap()
-        .bytes;
-        let managed = |path: &std::path::Path, bytes: &[u8]| ManagedFileRecord {
-            path: crate::paths::display_path(path),
-            original_existed: true,
-            applied_sha256: super::sha256(bytes),
-        };
-        let record = AppliedRecord {
-            applied_at_utc: "2026-07-17T00:00:00Z".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            command: expected.command.clone(),
-            tier: Tier::Compact,
-            // Derived from the tier so the receipt stays consistent with the config bytes above;
-            // this test is about drift detection, and the tier numbers themselves are pinned by
-            // their own hardcoded oracle in settings.rs.
-            tool_output_token_limit: Tier::Compact.host_limit(),
-            tool_timeout_sec: Some(codex_config::TOOL_TIMEOUT_SECONDS),
-            previous_token_limit_present: false,
-            previous_token_limit: None,
-            fastctx_token_budget: Tier::Compact.fastctx_budget(),
-            tool_budgets: Tier::Compact.default_budgets(),
-            fastshell_enabled: false,
-            fastedit_enabled: false,
-            codex_dir_created: false,
-            codex_config: managed(&paths.codex_config, &applied_config),
-            codex_agents: managed(&paths.codex_agents, agents),
-            agents_contract_id: Some(
-                crate::control::agents::MANAGED_SECTION_CONTRACT_ID.to_string(),
-            ),
-            codex_agents_inserted_separator: None,
-            binary_sha256: super::sha256(binary),
-        };
-        let settings = FastCtxSettings {
-            tier: Tier::Compact,
-            applied: Some(record),
-            ..FastCtxSettings::default()
-        };
-        let mut host_rewritten = b"# normalized by Codex\nhost_runtime_epoch = 7\n".to_vec();
-        host_rewritten.extend_from_slice(&applied_config);
-        host_rewritten
-            .extend_from_slice(b"\n[plugins.runtime]\nlast_refresh = \"2026-07-17T00:01:00Z\"\n");
-
-        let status = check_drift(
-            &paths,
-            Some(&settings),
-            settings.applied.as_ref(),
-            Some(&host_rewritten),
-        );
-        assert_eq!(status.status, DoctorCheckStatus::Pass, "{status:?}");
-
-        let mut pending_settings = settings.clone();
-        pending_settings.tier = Tier::High;
-        let status = check_drift(
-            &paths,
-            Some(&pending_settings),
-            pending_settings.applied.as_ref(),
-            Some(&host_rewritten),
-        );
-        assert_eq!(status.status, DoctorCheckStatus::Info, "{status:?}");
-        assert!(status.detail.contains("selected tier"), "{status:?}");
-        assert!(status.detail.contains("Run fastctx apply"), "{status:?}");
-
-        let managed_drift_source = String::from_utf8(host_rewritten).unwrap();
-        let applied_budget = format!(
-            "FASTCTX_TOKEN_BUDGET = \"{}\"",
-            Tier::Compact.fastctx_budget()
-        );
-        assert!(
-            managed_drift_source.contains(&applied_budget),
-            "{managed_drift_source}"
-        );
-        let managed_drift = managed_drift_source
-            .replace(&applied_budget, "FASTCTX_TOKEN_BUDGET = \"1234\"")
-            .into_bytes();
-        let status = check_drift(
-            &paths,
-            Some(&settings),
-            settings.applied.as_ref(),
-            Some(&managed_drift),
-        );
-        assert_eq!(status.status, DoctorCheckStatus::Fail, "{status:?}");
-        assert!(
-            status
-                .detail
-                .contains("mcp_servers.fastctx.env.FASTCTX_TOKEN_BUDGET"),
-            "{status:?}"
-        );
-    }
-
-    #[test]
-    fn applied_state_prompts_reapply_when_a_receipt_uses_a_retired_tier_mapping() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        std::fs::create_dir_all(&paths.codex_dir).unwrap();
-        std::fs::create_dir_all(&paths.fastctx_bin_dir).unwrap();
-        let binary = b"binary";
-        let agents = b"agents";
-        std::fs::write(&paths.installed_binary, binary).unwrap();
-        std::fs::write(&paths.codex_agents, agents).unwrap();
-        let legacy_budgets = ToolBudgets {
-            read: ToolBudgetLevel::Inherit,
-            grep: ToolBudgetLevel::Inherit,
-            glob: ToolBudgetLevel::Percent(50),
-            run: ToolBudgetLevel::Inherit,
-            job_output: ToolBudgetLevel::Percent(25),
-        };
-        let expected = ExpectedConfig {
-            command: crate::paths::display_path(&paths.installed_binary),
-            tier: Tier::Standard,
-            host_limit: Tier::Standard.host_limit(),
-            fastctx_budget: Tier::Standard.fastctx_budget(),
-            tool_budgets: legacy_budgets,
-            fastshell_enabled: false,
-        };
-        let legacy_config = format!(
-            concat!(
-                "tool_output_token_limit = 16000\n",
-                "[mcp_servers.fastctx]\n",
-                "command = \"{}\"\n",
-                "args = [\"serve\"]\n",
-                "startup_timeout_sec = 120\n",
-                "tool_timeout_sec = 300\n",
-                "[mcp_servers.fastctx.env]\n",
-                "FASTCTX_TOKEN_BUDGET = \"13600\"\n",
-                "FASTCTX_GLOB_TOKEN_BUDGET = \"6800\"\n",
-                "FASTCTX_JOB_OUTPUT_TOKEN_BUDGET = \"3400\"\n",
-                "[features.code_mode]\n",
-                "direct_only_tool_namespaces = [\"mcp__fastctx\"]\n",
-            ),
-            expected.command
-        )
-        .into_bytes();
-        let managed = |path: &std::path::Path, bytes: &[u8]| ManagedFileRecord {
-            path: crate::paths::display_path(path),
-            original_existed: true,
-            applied_sha256: super::sha256(bytes),
-        };
-        let record = AppliedRecord {
-            applied_at_utc: "2026-07-23T00:00:00Z".to_string(),
-            version: "0.2.1".to_string(),
-            command: expected.command,
-            tier: Tier::Standard,
-            tool_output_token_limit: 16_000,
-            tool_timeout_sec: Some(codex_config::TOOL_TIMEOUT_SECONDS),
-            previous_token_limit_present: false,
-            previous_token_limit: None,
-            fastctx_token_budget: 13_600,
-            tool_budgets: legacy_budgets,
-            fastshell_enabled: false,
-            fastedit_enabled: false,
-            codex_dir_created: false,
-            codex_config: managed(&paths.codex_config, &legacy_config),
-            codex_agents: managed(&paths.codex_agents, agents),
-            agents_contract_id: None,
-            codex_agents_inserted_separator: None,
-            binary_sha256: super::sha256(binary),
-        };
-        let settings = FastCtxSettings {
-            tier: Tier::Standard,
-            // Pinned explicitly so the only difference from the receipt is the tier's own numbers;
-            // leaving these unset would let today's tier defaults add a second drift reason and
-            // mask whether the tier limits alone were detected.
-            tool_budgets: ToolBudgetPreferences {
-                read: Some(legacy_budgets.read),
-                grep: Some(legacy_budgets.grep),
-                glob: Some(legacy_budgets.glob),
-                run: Some(legacy_budgets.run),
-                job_output: Some(legacy_budgets.job_output),
-            },
-            applied: Some(record),
-            ..FastCtxSettings::default()
-        };
-
-        let status = check_drift(
-            &paths,
-            Some(&settings),
-            settings.applied.as_ref(),
-            Some(&legacy_config),
-        );
-
-        assert_eq!(status.status, DoctorCheckStatus::Info, "{status:?}");
-        assert!(status.detail.contains("current tier limits"), "{status:?}");
-        assert!(status.detail.contains("Run fastctx apply"), "{status:?}");
-    }
-
-    #[test]
-    fn fresh_profile_is_informational_and_does_not_require_any_codex_installation() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        let report = run(&paths);
-
-        assert!(report.passed(), "{report:?}");
-        let job_limits = report
-            .checks
-            .iter()
-            .find(|check| check.name == "Job limits")
-            .expect("fresh profiles still expose the effective current-user limits");
-        assert_eq!(job_limits.status, DoctorCheckStatus::Pass);
-        assert!(
-            job_limits.detail.contains(
-                "1024 MiB retained job storage; 128 running jobs; 20 records per job_list page"
-            ),
-            "{job_limits:?}"
-        );
-        assert!(
-            report
-                .checks
-                .iter()
-                .filter(|check| !matches!(check.name, "Job limits" | "Search CPU limit"))
-                .all(|check| check.status == DoctorCheckStatus::Info),
-            "{report:?}"
-        );
-        let search = report
-            .checks
-            .iter()
-            .find(|check| check.name == "Search CPU limit")
-            .expect("fresh profiles expose automatic search parallelism");
-        assert_eq!(search.status, DoctorCheckStatus::Pass);
-        assert!(search.detail.contains("Automatic grep/glob parallelism"));
-        assert!(search.detail.contains("effective P="));
-        assert!(
-            report
-                .checks
-                .iter()
-                .all(|check| !check.name.contains("host"))
-        );
-        assert!(report.checks.iter().any(
-            |check| check.name == "Codex profile" && check.detail.contains("Apply will create")
-        ));
-    }
-
-    #[test]
-    fn invalid_current_user_job_limits_are_reported_with_effective_defaults() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        std::fs::create_dir_all(&paths.fastctx_dir).unwrap();
-        std::fs::write(
-            &paths.fastctx_config,
-            b"schema_version = 1\n\n[fastshell]\njob_storage_limit_mib = 0\nmax_running_jobs = -2\njob_list_limit = 101\n",
-        )
-        .unwrap();
-
-        let report = run(&paths);
-        let job_limits = report
-            .checks
-            .iter()
-            .find(|check| check.name == "Job limits")
-            .unwrap();
-        assert_eq!(job_limits.status, DoctorCheckStatus::Info);
-        assert!(
-            job_limits
-                .detail
-                .contains("fastshell.job_storage_limit_mib"),
-            "{job_limits:?}"
-        );
-        assert!(
-            job_limits.detail.contains("fastshell.max_running_jobs"),
-            "{job_limits:?}"
-        );
-        assert!(
-            job_limits.detail.contains("fastshell.job_list_limit"),
-            "{job_limits:?}"
-        );
-        assert!(
-            job_limits.detail.contains(
-                "1024 MiB retained job storage; 128 running jobs; 20 records per job_list page"
-            ),
-            "{job_limits:?}"
-        );
-        assert!(report.passed(), "{report:?}");
-    }
-
-    #[test]
-    fn invalid_search_cpu_limit_is_an_actionable_status_failure() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        std::fs::create_dir_all(&paths.fastctx_dir).unwrap();
-        let maximum = crate::search_parallelism::detected_available();
-        std::fs::write(
-            &paths.fastctx_config,
-            format!(
-                "schema_version = 1\n\n[search]\nmax_cpu_cores = {}\n",
-                maximum + 1
-            ),
-        )
-        .unwrap();
-
-        let report = run(&paths);
-        let search = report
-            .checks
-            .iter()
-            .find(|check| check.name == "Search CPU limit")
-            .unwrap();
-        assert_eq!(search.status, DoctorCheckStatus::Fail);
-        assert!(search.detail.contains("search.max_cpu_cores"), "{search:?}");
-        assert!(
-            search.detail.contains(&format!("1..={maximum}")),
-            "{search:?}"
-        );
-        assert!(
-            search
-                .remedy
-                .as_deref()
-                .is_some_and(|remedy| remedy.contains("remove the key")),
-            "{search:?}"
-        );
-        assert!(!report.passed());
-    }
-
-    #[test]
-    fn a_non_directory_codex_profile_is_an_actionable_failure() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        std::fs::write(&paths.codex_dir, b"not a directory").unwrap();
-
-        let report = run(&paths);
-        let profile = report
-            .checks
-            .iter()
-            .find(|check| check.name == "Codex profile")
-            .unwrap();
-        assert_eq!(profile.status, DoctorCheckStatus::Fail);
-        assert!(profile.detail.contains("not a directory"));
-        assert!(!report.passed());
-    }
-
-    #[test]
-    fn shell_extension_checks_cover_disabled_pending_stale_and_applied_states() {
-        let cases = [
-            (false, false, DoctorCheckStatus::Info, "is disabled"),
-            (true, false, DoctorCheckStatus::Info, "next Apply"),
-            (false, true, DoctorCheckStatus::Info, "will remove it"),
-            (true, true, DoctorCheckStatus::Pass, "enabled and applied"),
-        ];
-        for (desired, applied, status, phrase) in cases {
-            let check = check_extension_state("fastshell", desired, applied);
-            assert_eq!(check.status, status);
-            assert!(check.detail.contains(phrase), "{check:?}");
-        }
-    }
 }

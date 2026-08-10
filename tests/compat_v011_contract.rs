@@ -57,7 +57,7 @@ fn current_fastctx_matches_the_frozen_v011_ordinary_success_corpus() {
     assert_eq!(spec.schema, 1);
     let temp = tempfile::Builder::new()
         .prefix("fastctx-v011-current-")
-        .tempdir_in(std::env::current_dir().unwrap())
+        .tempdir()
         .unwrap();
     fs::create_dir(temp.path().join(".git")).unwrap();
     let fixture_root = temp.path().join("fixture");

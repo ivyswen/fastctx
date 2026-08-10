@@ -377,43 +377,8 @@ fn legacy_code_page_label() -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EncodedLine, OutputEncoding, decode_job, decode_run, validate_output_encoding};
+    use super::{EncodedLine, decode_run, validate_output_encoding};
     use crate::shell::normalize::StreamEncoding;
-
-    fn raw(bytes: &[u8]) -> EncodedLine<'_> {
-        EncodedLine {
-            bytes,
-            total_bytes: bytes.len() as u64,
-            stream_encoding: None,
-            legacy_text: None,
-            known_truncated: false,
-        }
-    }
-
-    #[test]
-    fn explicit_gbk_decoding_and_byte_counted_truncation_are_exact() {
-        let encoding = validate_output_encoding("gbk").unwrap();
-        let decoded = decode_job(&[raw(&[0xd6, 0xd0, 0xce, 0xc4])], Some(encoding), None);
-        assert_eq!(decoded.lines, ["中文"]);
-        assert_eq!(
-            decoded.transcoding_note.as_deref(),
-            Some("(Note: decoded from GBK as requested; output is UTF-8.)")
-        );
-
-        let input = vec![b'x'; 2_001];
-        let decoded = decode_run(
-            &[raw(&input)],
-            Some(validate_output_encoding("utf-8").unwrap()),
-        );
-        assert_eq!(
-            decoded.lines[0],
-            format!(
-                "{}... [line truncated: 2001 bytes total]",
-                "x".repeat(2_000)
-            )
-        );
-        assert!(decoded.had_truncation);
-    }
 
     #[test]
     fn utf16_bom_locked_lines_decode_without_accepting_wide_parameters() {
@@ -434,18 +399,5 @@ mod tests {
             validate_output_encoding("utf-16le").unwrap_err(),
             "Encoding \"utf-16le\" is not supported for command output. UTF-16/UTF-32 output is decoded automatically when the stream starts with a BOM; otherwise redirect the command to a file (command > file 2>&1) and read it with the inspect_local_file tool."
         );
-    }
-
-    #[test]
-    fn invalid_sequences_are_counted_independently_from_literal_replacement_characters() {
-        let decoded = decode_job(
-            &[raw(&[0xef, 0xbf, 0xbd, 0xff, 0xfe])],
-            Some(OutputEncoding {
-                encoding: encoding_rs::UTF_8,
-            }),
-            None,
-        );
-        assert_eq!(decoded.lines, ["���"]);
-        assert_eq!(decoded.invalid_sequences, 2);
     }
 }

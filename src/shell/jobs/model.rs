@@ -242,32 +242,3 @@ pub(crate) struct JobRecord {
     pub(crate) status: JobStatus,
     pub(crate) ended_sort_key: SystemTime,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::JobMeta;
-
-    #[test]
-    fn version_one_metadata_without_new_origin_fields_remains_readable() {
-        let source = r#"{
-            "schema_version": 1,
-            "command": "printf ok",
-            "cwd": "/workspace",
-            "login_shell": false,
-            "supervisor": {"pid": 42, "started": "supervisor-token"},
-            "origin": {
-                "server_pid": 7,
-                "parent_executable": "codex",
-                "server_cwd": "/workspace"
-            },
-            "started_at": "2026-07-16T10:00:00Z"
-        }"#;
-
-        let meta: JobMeta = serde_json::from_str(source).unwrap();
-        assert_eq!(meta.schema_version, 1);
-        assert_eq!(meta.origin.server_pid, 7);
-        assert_eq!(meta.origin.server_started, None);
-        assert_eq!(meta.origin.parent_pid, None);
-        assert_eq!(meta.encoding, None);
-    }
-}

@@ -124,7 +124,7 @@ fn independent_o200k_oracle_keeps_high_entropy_outputs_below_the_budget() {
         "{batch_output}"
     );
     let pending_json = batch_terminal
-        .strip_prefix("(Partial: 0 of 3 files processed. Continue with files=")
+        .strip_prefix("(Partial: 0 of 3 entries processed. Continue with files=")
         .and_then(|terminal| terminal.strip_suffix(".)"))
         .unwrap_or_else(|| panic!("unexpected batch terminal: {batch_terminal}"));
     assert!(
@@ -444,7 +444,7 @@ fn glob_offset_pages_reassemble_without_duplicates_or_gaps_across_a_matrix() {
         let mut actual = Vec::new();
         while offset < expected.len() {
             let output = text(glob_files(GlobRequest {
-                pattern: "**/*.dat".to_string(),
+                pattern: fastctx::glob_filter::GlobPatterns::One("**/*.dat".to_string()),
                 path: Some(normalized(&root)),
                 filter_mode: Some(FilterMode::All),
                 sort: Some(SortMode::Path),

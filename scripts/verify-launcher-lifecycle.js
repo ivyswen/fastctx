@@ -786,18 +786,18 @@ async function main() {
   if (invalid.status !== 2) {
     throw new Error(`native exit code was not preserved: expected 2, got ${invalid.status}`);
   }
-  await assertMcpTools(['serve'], ['read', 'grep', 'glob', 'replace']);
+  await assertMcpTools(['serve'], ['inspect_local_file', 'grep', 'glob', 'replace']);
   await assertMcpTools(
     ['serve', '--enable-shell'],
-    ['read', 'grep', 'glob', 'replace', 'run', 'run_background', 'job_output', 'job_kill', 'job_list'],
+    ['inspect_local_file', 'grep', 'glob', 'replace', 'run', 'run_background', 'job_output', 'job_kill', 'job_list'],
   );
   await assertMcpTools(
     ['serve', '--enable-edit'],
-    ['read', 'grep', 'glob', 'replace'],
+    ['inspect_local_file', 'grep', 'glob', 'replace'],
   );
   await assertMcpTools(
     ['serve', '--enable-shell', '--enable-edit'],
-    ['read', 'grep', 'glob', 'replace', 'run', 'run_background', 'job_output', 'job_kill', 'job_list'],
+    ['inspect_local_file', 'grep', 'glob', 'replace', 'run', 'run_background', 'job_output', 'job_kill', 'job_list'],
   );
   await assertStdinEofClosesNativeChild();
   await assertHardParentDeathClosesNativeChild();

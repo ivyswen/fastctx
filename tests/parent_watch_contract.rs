@@ -1,6 +1,6 @@
 mod common;
 
-use common::{McpSession, TEST_HOST_IDLE_MS, mcp_text, normalized};
+use common::{McpSession, TEST_HOST_IDLE_MS, isolate_command, mcp_text, normalized};
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -376,6 +376,7 @@ fn spawn_controlled_parent(root: &Path, label: &str, enable_shell: bool) -> Cont
     std::fs::create_dir_all(&temp).unwrap();
     let (stdin_reader, stdin_writer) = anonymous_pipe();
     let mut helper = Command::new(std::env::current_exe().unwrap());
+    isolate_command(&mut helper, root);
     helper
         .args([
             "--ignored",
@@ -453,6 +454,7 @@ fn shell_server_command(root: &Path) -> Command {
     let temp = root.join("tmp");
     std::fs::create_dir_all(&temp).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    isolate_command(&mut command, root);
     command
         .args(["serve", "--enable-shell"])
         .current_dir(root)
@@ -527,6 +529,7 @@ fn spawn_through_short_lived_parent(
     let response_path = root.join(format!("{label}-response.jsonl"));
     let (stdin_reader, mut stdin_writer) = anonymous_pipe();
     let mut helper = Command::new(std::env::current_exe().unwrap());
+    isolate_command(&mut helper, root);
     helper
         .args([
             "--ignored",

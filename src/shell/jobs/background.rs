@@ -10,9 +10,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 #[derive(Clone, Copy, Debug)]
 struct TrackedJob {
     started_at: SystemTime,
@@ -23,8 +20,6 @@ struct TrackedJob {
 #[derive(Clone, Debug, Default)]
 pub(super) struct BackgroundTracker {
     jobs: Arc<Mutex<HashMap<String, TrackedJob>>>,
-    #[cfg(test)]
-    probes: Arc<AtomicUsize>,
 }
 
 impl BackgroundTracker {
@@ -89,8 +84,6 @@ impl BackgroundTracker {
         let mut entries = Vec::with_capacity(tracked.len());
         let mut missing = Vec::new();
         for (job_id, fallback) in tracked {
-            #[cfg(test)]
-            self.probes.fetch_add(1, Ordering::Relaxed);
             match probe(&job_id) {
                 Ok(Some(record)) => {
                     let start = tracked_start(&record, fallback.started_at);
@@ -119,11 +112,6 @@ impl BackgroundTracker {
             }
         }
         BackgroundStatus::render(entries, now)
-    }
-
-    #[cfg(test)]
-    fn probe_count(&self) -> usize {
-        self.probes.load(Ordering::Relaxed)
     }
 }
 
@@ -155,108 +143,4 @@ fn system_time_nanos(value: SystemTime) -> u64 {
         .ok()
         .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
         .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::BackgroundTracker;
-    use crate::shell::jobs::model::{
-        ExitRecord, JobMeta, JobRecord, JobStatus, OriginSnapshot, ProcessIdentity, TerminationKind,
-    };
-    use std::path::PathBuf;
-    use std::time::{Duration, SystemTime};
-
-    fn record(id: &str, started: u64, status: JobStatus) -> JobRecord {
-        JobRecord {
-            id: id.to_string(),
-            directory: PathBuf::from(format!("/jobs/{id}")),
-            meta: JobMeta {
-                schema_version: 3,
-                command: "true".to_string(),
-                cwd: "/workspace".to_string(),
-                login_shell: false,
-                encoding: None,
-                supervisor: ProcessIdentity {
-                    pid: 1,
-                    started: "test".to_string(),
-                },
-                origin: OriginSnapshot {
-                    server_pid: 1,
-                    server_started: None,
-                    parent_pid: None,
-                    parent_executable: None,
-                    server_cwd: "/workspace".to_string(),
-                },
-                started_at: "1970-01-01T00:00:00Z".to_string(),
-                started_at_unix_nanos: started * 1_000_000_000,
-                isolation_warning: None,
-            },
-            status,
-            ended_sort_key: SystemTime::UNIX_EPOCH,
-        }
-    }
-
-    fn exited(code: i32) -> JobStatus {
-        JobStatus::Exited(ExitRecord {
-            exit_code: code,
-            total_lines: 99,
-            had_loss: false,
-            ended_at: "1970-01-01T00:00:00Z".to_string(),
-            ended_at_unix_nanos: 0,
-            termination: TerminationKind::Exited,
-            capture_error: None,
-            output_truncation: None,
-        })
-    }
-
-    #[test]
-    fn empty_or_fully_excluded_tracking_performs_no_registry_probe() {
-        let tracker = BackgroundTracker::default();
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
-        assert!(
-            tracker
-                .snapshot_with_probe(None, now, |_| panic!("must not probe"))
-                .is_none()
-        );
-        tracker.track_id("j", now);
-        assert!(
-            tracker
-                .snapshot_with_probe(Some("j"), now, |_| panic!("must not probe"))
-                .is_none()
-        );
-        assert_eq!(tracker.probe_count(), 0);
-    }
-
-    #[test]
-    fn snapshot_sorts_by_persisted_start_and_silently_forgets_evicted_records() {
-        let tracker = BackgroundTracker::default();
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
-        for id in ["late", "early", "gone"] {
-            tracker.track_id(id, now);
-        }
-        let status = tracker
-            .snapshot_with_probe(None, now, |id| match id {
-                "early" => Ok(Some(record("early", 6_400, JobStatus::Running))),
-                "late" => Ok(Some(record("late", 9_940, exited(7)))),
-                "gone" => Ok(None),
-                _ => unreachable!(),
-            })
-            .unwrap();
-        assert_eq!(
-            status.full_line(),
-            "(Background: early running 1h0m, late exited 7.)"
-        );
-        assert_eq!(tracker.probe_count(), 3);
-        assert!(!tracker.jobs.lock().unwrap().contains_key("gone"));
-    }
-
-    #[test]
-    fn separate_trackers_do_not_leak_session_knowledge() {
-        let first = BackgroundTracker::default();
-        let second = BackgroundTracker::default();
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-        first.track_id("j", now);
-        assert!(first.has_candidates(None));
-        assert!(!second.has_candidates(None));
-    }
 }

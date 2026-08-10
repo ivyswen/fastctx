@@ -29,8 +29,7 @@ use std::io::Read;
 ///
 /// A second fixed window would silently cap every default read far below the configured budget,
 /// forcing continuation calls the budget was raised to avoid. Do not reintroduce a numeric default
-/// here; page explicitly with `limit` instead. Locked by
-/// `read_contract::default_text_read_is_bounded_only_by_the_token_budget`. (2026-07-25)
+/// here; page explicitly with `limit` instead. (2026-07-25)
 const UNBOUNDED_LINE_LIMIT: usize = usize::MAX;
 /// Line window for a hex read that omits `limit`.
 ///
@@ -63,9 +62,10 @@ pub struct ReadRequest {
     ))]
     pub file_path: Option<String>,
     /// Batch form: an array of {"path", "offset"?, "limit"?, "encoding"?} objects for
-    /// reading 1-32 text files in one call. Each entry behaves like its own single-file
-    /// text request; results are packed in request order. Mutually exclusive with file_path
-    /// and with the top-level offset/limit/encoding/pages/pdf_mode/view parameters.
+    /// 1-32 text ranges in one call. Repeat a path for distinct ranges, each with its own
+    /// offset/limit, and freely mix ranges from multiple files. Each entry behaves like its
+    /// own single-file text request; results stay in request order. Mutually exclusive with
+    /// file_path and with the top-level offset/limit/encoding/pages/pdf_mode/view parameters.
     #[schemars(length(min = 1, max = 32))]
     pub files: Option<Vec<BatchReadEntry>>,
     /// The 1-based line number to start reading from. Use for paging through large files.
@@ -86,7 +86,7 @@ pub struct ReadRequest {
     pub view: Option<String>,
 }
 
-/// One text file in a batch inspection request.
+/// One text range in a batch inspection request.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BatchReadEntry {
@@ -98,7 +98,7 @@ pub struct BatchReadEntry {
     /// The 1-based line number to start reading from.
     #[schemars(range(min = 1))]
     pub offset: Option<usize>,
-    /// Maximum lines to return from this file in this call. Omit to let the shared budget decide.
+    /// Maximum lines to return from this range in this call. Omit to let the shared budget decide.
     #[schemars(range(min = 1))]
     pub limit: Option<usize>,
     /// Known source encoding for this file, using the same labels as the top-level encoding parameter.

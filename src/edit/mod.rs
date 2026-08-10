@@ -6,6 +6,7 @@ pub(crate) mod private_storage;
 mod replace;
 
 use crate::budget::token_budget;
+use crate::glob_filter::GlobPatterns;
 use crate::model::ToolResponse;
 use locks::PathIdentity;
 use schemars::JsonSchema;
@@ -25,8 +26,8 @@ pub struct ReplaceRequest {
         "File or directory to edit."
     ))]
     pub path: String,
-    /// Glob filter for directory targets, e.g. "*.rs", "**/*.{ts,tsx}".
-    pub glob: Option<String>,
+    /// One glob or a list of globs for directory targets. Prefix exclusions with `!`, e.g. ["**/*.rs", "!tests/**"]; negative-only lists include every other file.
+    pub glob: Option<GlobPatterns>,
     /// Treat pattern as a literal string, not a regex.
     pub literal: Option<bool>,
     /// Case-insensitive matching.

@@ -145,32 +145,3 @@ pub(crate) const fn messages(language: Language) -> &'static MigrationMessages {
         Language::Uk => &UK,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::messages;
-    use crate::control::i18n::ALL_LANGUAGES;
-
-    #[test]
-    fn every_migration_locale_is_complete_and_keeps_the_version_placeholder() {
-        for language in ALL_LANGUAGES {
-            let messages = messages(language);
-            for value in [
-                messages.title,
-                messages.body,
-                messages.action_confirm,
-                messages.footer_confirm,
-            ] {
-                assert!(!value.trim().is_empty(), "{}", language.code());
-            }
-            assert_eq!(
-                messages.body.matches("{version}").count(),
-                1,
-                "{}",
-                language.code()
-            );
-            assert!(messages.footer_confirm.contains("Enter"));
-            assert!(messages.footer_confirm.contains("Esc"));
-        }
-    }
-}

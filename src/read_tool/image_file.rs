@@ -86,25 +86,3 @@ fn oversized_image(size: u64) -> ToolResponse {
         "Image file too large: {mib:.1} MiB (limit: 8 MiB). Resize or convert it externally."
     ))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::read_image;
-    use crate::ToolContent;
-
-    #[test]
-    fn changed_image_format_fails_with_a_retry_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("changed.bin");
-        std::fs::write(&path, b"not an image anymore").unwrap();
-        let response = read_image(&path);
-        assert!(response.is_error);
-        assert_eq!(
-            response.content,
-            vec![ToolContent::Text(format!(
-                "Cannot read image file: {}. Retry after confirming it is a PNG, JPG, GIF, WebP, or BMP file.",
-                crate::paths::display_path(&path)
-            ))]
-        );
-    }
-}

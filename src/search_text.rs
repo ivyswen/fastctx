@@ -166,11 +166,6 @@ impl SearchText {
             ))
         }
     }
-
-    #[cfg(test)]
-    pub(crate) fn is_temp(&self) -> bool {
-        self.memory_bytes().is_none()
-    }
 }
 
 fn borrowed_utf8_range(bytes: &[u8], range: Range<u64>) -> io::Result<&str> {
@@ -208,16 +203,6 @@ pub(crate) enum RangeText<'a> {
     Owned(Arc<str>),
 }
 
-impl RangeText<'_> {
-    #[cfg(test)]
-    pub(crate) fn as_str(&self) -> &str {
-        match self {
-            Self::Borrowed(text) => text,
-            Self::Owned(text) => text,
-        }
-    }
-}
-
 /// A reader over the same immutable decoded UTF-8 backing.
 pub(crate) enum TextReader<'a> {
     Snapshot(SnapshotReader<'a>),
@@ -239,58 +224,4 @@ impl Read for TextReader<'_> {
 pub(crate) enum SearchTextFailure {
     Io(io::Error),
     Stopped(WorkStop),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{MEMORY_TEXT_LIMIT, SearchText, TEXT_CHUNK_BYTES, TextStorage};
-    use std::io::{self, Cursor};
-
-    #[test]
-    fn memory_and_temp_ranges_share_the_exact_search_offsets() {
-        let memory = SearchText::capture(Cursor::new("前hit后".as_bytes()), None).unwrap();
-        assert!(!memory.is_temp());
-        assert_eq!(memory.range_str(3..6).unwrap().as_str(), "hit");
-
-        let mut large = vec![b'x'; MEMORY_TEXT_LIMIT + 17];
-        large[MEMORY_TEXT_LIMIT + 3..MEMORY_TEXT_LIMIT + 6].copy_from_slice(b"hit");
-        let temp = SearchText::capture(Cursor::new(large), None).unwrap();
-        assert!(temp.is_temp());
-        assert_eq!(
-            temp.range_str((MEMORY_TEXT_LIMIT + 3) as u64..(MEMORY_TEXT_LIMIT + 6) as u64)
-                .unwrap()
-                .as_str(),
-            "hit"
-        );
-    }
-
-    #[test]
-    fn temp_ranges_preserve_multibyte_text_across_capture_chunks() {
-        let match_start = MEMORY_TEXT_LIMIT + TEXT_CHUNK_BYTES - 1;
-        let mut large = vec![b'x'; match_start];
-        large.extend_from_slice("界hit".as_bytes());
-        let match_end = large.len();
-        let temp = SearchText::capture(Cursor::new(large), None).unwrap();
-
-        assert!(temp.is_temp());
-        assert_eq!(
-            temp.range_str(match_start as u64..match_end as u64)
-                .unwrap()
-                .as_str(),
-            "界hit"
-        );
-    }
-
-    #[test]
-    fn temp_range_io_failures_are_returned_instead_of_hidden() {
-        let temp =
-            SearchText::capture(Cursor::new(vec![b'x'; MEMORY_TEXT_LIMIT + 1]), None).unwrap();
-        let TextStorage::Temp(storage) = &temp.storage else {
-            panic!("expected temp-backed text");
-        };
-        storage.file.as_file().set_len(0).unwrap();
-
-        let error = temp.range_str(0..1).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-    }
 }

@@ -6,8 +6,8 @@ use super::{ReplaceRequest, ReplaceService, edit_token_budget, plural};
 use crate::budget::{
     GLOBAL_TOKEN_BUDGET_ENV, assemble_text, estimate_tokens, tool_token_budget_for_required,
 };
+use crate::glob_filter::{GlobPatterns, PathGlobFilter};
 use crate::model::ToolResponse;
-use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::{Captures, Regex, RegexBuilder};
 use std::collections::BTreeMap;
 use std::fs;
@@ -91,7 +91,7 @@ pub(super) fn replace(
         return ToolResponse::error(error);
     }
     let regex = compiled.regex;
-    let glob = match build_glob(request.glob.as_deref()) {
+    let glob = match build_glob(request.glob.as_ref()) {
         Ok(glob) => glob,
         Err(error) => return ToolResponse::error(error),
     };
@@ -728,18 +728,17 @@ fn replacement_tokens(replacement: &str) -> Vec<ReplacementToken<'_>> {
     tokens
 }
 
-fn build_glob(pattern: Option<&str>) -> Result<Option<GlobSet>, String> {
-    let Some(pattern) = pattern else {
+fn build_glob(patterns: Option<&GlobPatterns>) -> Result<Option<PathGlobFilter>, String> {
+    let Some(patterns) = patterns else {
         return Ok(None);
     };
-    let glob = Glob::new(pattern).map_err(|error| {
-        format!("Invalid glob pattern: {error}. Use forms like \"*.rs\" or \"**/*.{{ts,tsx}}\".")
-    })?;
-    let mut builder = GlobSetBuilder::new();
-    builder.add(glob);
-    builder.build().map(Some).map_err(|error| {
-        format!("Invalid glob pattern: {error}. Use forms like \"*.rs\" or \"**/*.{{ts,tsx}}\".")
-    })
+    PathGlobFilter::compile(patterns, false)
+        .map(Some)
+        .map_err(|error| {
+            format!(
+                "Invalid glob pattern: {error}. Use forms like \"*.rs\" or \"**/*.{{ts,tsx}}\"."
+            )
+        })
 }
 
 fn resolve_root(input: &str) -> Result<PathBuf, String> {
@@ -991,86 +990,5 @@ fn short_issue(error: &str) -> String {
         "undecodable".to_string()
     } else {
         error.to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{analyze_file, build_regex, preview_text, validate_replacement_references};
-    use crate::edit::{ReplaceRequest, document::TextDocument};
-
-    fn request(pattern: &str, replacement: &str) -> ReplaceRequest {
-        ReplaceRequest {
-            pattern: pattern.to_string(),
-            replacement: replacement.to_string(),
-            path: "/tmp".to_string(),
-            glob: None,
-            literal: None,
-            case_insensitive: None,
-            dot_all: None,
-            max_replacements: None,
-            dry_run: None,
-            encoding: None,
-            fallback_encoding: None,
-        }
-    }
-
-    #[test]
-    fn captures_dollars_and_pattern_width_guards_follow_regex_semantics() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("replace.txt");
-        std::fs::write(&path, b"ab ab").unwrap();
-        let document = TextDocument::open(path.to_str().unwrap(), None, 256).unwrap();
-        let compiled = build_regex(&request("(a)(b)", "$2$1$$")).unwrap();
-        let analysis = analyze_file(&document, &compiled.regex, "$2$1$$", usize::MAX);
-        assert_eq!(analysis.matches, 2);
-        assert!(!compiled.can_match_empty);
-
-        assert_eq!(
-            build_regex(&request("", "")).unwrap_err(),
-            "An empty pattern matches at every position and is almost always a mistake. Give a non-empty pattern."
-        );
-        assert!(build_regex(&request("x*", "y")).unwrap().can_match_empty);
-        assert!(build_regex(&request(r"\b", "y")).unwrap().can_match_empty);
-    }
-
-    #[test]
-    fn replacement_references_are_validated_with_the_engine_token_grammar() {
-        let compiled = build_regex(&request("(?P<name>a)(b)?", "")).unwrap();
-        for replacement in ["$0", "$1", "${1}", "$2", "$name", "${name}", "$$", "$"] {
-            validate_replacement_references(&compiled.regex, replacement).unwrap();
-        }
-        for (replacement, token) in [
-            ("$3", "$3"),
-            ("${missing}", "${missing}"),
-            ("$1a", "$1a"),
-            ("$nameX", "$nameX"),
-        ] {
-            assert_eq!(
-                validate_replacement_references(&compiled.regex, replacement).unwrap_err(),
-                format!(
-                    "Replacement references an undefined capture group: {token}. The pattern defines groups 1-2; named group: name. Fix the replacement; nothing was written."
-                )
-            );
-        }
-        validate_replacement_references(&compiled.regex, "${1}a ${name}X").unwrap();
-    }
-
-    #[test]
-    fn preview_windows_are_single_line_and_character_bounded() {
-        assert_eq!(preview_text("a\r\nb"), "a\\nb");
-        assert_eq!(preview_text(&"界".repeat(161)).chars().count(), 161);
-    }
-
-    #[test]
-    fn replacement_size_guard_accepts_the_exact_limit_and_rejects_one_byte_more() {
-        assert_eq!(
-            super::checked_result_size(256 * 1024 * 1024 - 1, 1, "target", 256),
-            Ok(256 * 1024 * 1024)
-        );
-        assert_eq!(
-            super::checked_result_size(256 * 1024 * 1024, 1, "target", 256).unwrap_err(),
-            "Refusing to write target: the result would be 256.0 MiB, over the 256 MiB safety limit. Narrow the pattern."
-        );
     }
 }

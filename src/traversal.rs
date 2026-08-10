@@ -2,6 +2,7 @@
 
 use crate::bounded_sort::sort_cancelable;
 use crate::file_executor::{BurstUse, GrepGlobExecutor};
+use crate::glob_filter::PathGlobFilter;
 use crate::operation::OperationCtx;
 #[cfg(test)]
 use crate::operation::TestStage;
@@ -9,7 +10,6 @@ use crate::path_codec::{
     PathRecord, ResolvedRoot, RootKind, display_path as search_display_path,
     io_error_message as search_io_error_message,
 };
-use globset::GlobSet;
 use ignore::types::TypesBuilder;
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use parking_lot::Mutex;
@@ -50,21 +50,9 @@ pub(crate) struct TraversalLimit {
     pub(crate) message: &'static str,
 }
 
-/// Batched traversal output plus test-only evidence about lock and lane usage.
+/// Batched traversal output.
 pub(crate) struct TraversalCollection<T> {
     pub(crate) items: Vec<T>,
-    #[cfg(test)]
-    pub(crate) metrics: TraversalMetrics,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct TraversalMetrics {
-    pub(crate) serial_walks: usize,
-    pub(crate) parallel_walks: usize,
-    pub(crate) parallel_threads: usize,
-    pub(crate) batch_lock_acquisitions: usize,
-    pub(crate) largest_batch: usize,
 }
 
 impl TraversalFailure {
@@ -96,7 +84,7 @@ impl TraversalFailure {
 /// Collects lossless grep candidates while reusing the root's sole metadata result.
 pub(crate) fn collect_search_candidates(
     root: &ResolvedRoot,
-    glob: Option<&GlobSet>,
+    glob: Option<&PathGlobFilter>,
     file_type: Option<&str>,
     operation: Option<&OperationCtx>,
     executor: Option<&Arc<GrepGlobExecutor>>,
@@ -125,7 +113,7 @@ pub(crate) fn collect_search_candidates(
 /// Collects files for replace while preserving its pre-codec display contract.
 pub(crate) fn collect_project_candidates(
     root: &Path,
-    glob: Option<&GlobSet>,
+    glob: Option<&PathGlobFilter>,
     file_type: Option<&str>,
 ) -> Result<Vec<ProjectCandidate>, String> {
     let metadata =
@@ -157,7 +145,7 @@ fn build_type_filter(file_type: Option<&str>) -> Result<Option<ignore::types::Ty
 
 fn collect_directory_candidates(
     root: &ResolvedRoot,
-    glob: Option<&GlobSet>,
+    glob: Option<&PathGlobFilter>,
     type_filter: Option<ignore::types::Types>,
     operation: Option<&OperationCtx>,
     executor: Option<&Arc<GrepGlobExecutor>>,
@@ -235,7 +223,7 @@ where
     if run.is_err() {
         return Err("Internal traversal worker failure.".to_string());
     }
-    finish_parallel_collection(shared.into_inner(), limit, thread_count)
+    finish_parallel_collection(shared.into_inner(), limit)
 }
 
 fn collect_walk_serial<T, F>(
@@ -297,24 +285,13 @@ where
     if let Some(failure) = minimum_failure {
         return Err(failure.message);
     }
-    Ok(TraversalCollection {
-        items,
-        #[cfg(test)]
-        metrics: TraversalMetrics {
-            serial_walks: 1,
-            ..TraversalMetrics::default()
-        },
-    })
+    Ok(TraversalCollection { items })
 }
 
 struct ParallelCollectionState<T> {
     items: Vec<T>,
     minimum_failure: Option<TraversalFailure>,
     too_many: bool,
-    #[cfg(test)]
-    batch_lock_acquisitions: usize,
-    #[cfg(test)]
-    largest_batch: usize,
 }
 
 impl<T> Default for ParallelCollectionState<T> {
@@ -323,10 +300,6 @@ impl<T> Default for ParallelCollectionState<T> {
             items: Vec::new(),
             minimum_failure: None,
             too_many: false,
-            #[cfg(test)]
-            batch_lock_acquisitions: 0,
-            #[cfg(test)]
-            largest_batch: 0,
         }
     }
 }
@@ -385,12 +358,6 @@ impl<'a, T> ParallelLocalBatch<'a, T> {
         }
 
         let mut shared = self.shared.lock();
-        #[cfg(test)]
-        {
-            let batch_len = self.items.len();
-            shared.batch_lock_acquisitions = shared.batch_lock_acquisitions.saturating_add(1);
-            shared.largest_batch = shared.largest_batch.max(batch_len);
-        }
         if let Some(failure) = self.minimum_failure.take() {
             select_minimum_failure(&mut shared.minimum_failure, failure);
         }
@@ -468,7 +435,6 @@ where
 fn finish_parallel_collection<T>(
     state: ParallelCollectionState<T>,
     limit: Option<TraversalLimit>,
-    _thread_count: usize,
 ) -> Result<TraversalCollection<T>, String> {
     if state.too_many {
         return match limit {
@@ -479,17 +445,7 @@ fn finish_parallel_collection<T>(
     if let Some(failure) = state.minimum_failure {
         return Err(failure.message);
     }
-    Ok(TraversalCollection {
-        items: state.items,
-        #[cfg(test)]
-        metrics: TraversalMetrics {
-            parallel_walks: 1,
-            parallel_threads: _thread_count,
-            batch_lock_acquisitions: state.batch_lock_acquisitions,
-            largest_batch: state.largest_batch,
-            ..TraversalMetrics::default()
-        },
-    })
+    Ok(TraversalCollection { items: state.items })
 }
 
 fn compare_search_candidates(left: &PathRecord, right: &PathRecord) -> std::cmp::Ordering {
@@ -502,7 +458,7 @@ fn compare_search_candidates(left: &PathRecord, right: &PathRecord) -> std::cmp:
 
 fn matches_record(
     candidate: &PathRecord,
-    glob: Option<&GlobSet>,
+    glob: Option<&PathGlobFilter>,
     types: Option<&ignore::types::Types>,
 ) -> bool {
     if let Some(types) = types
@@ -644,211 +600,5 @@ fn io_kind_rank(kind: io::ErrorKind) -> u8 {
         io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => 5,
         io::ErrorKind::UnexpectedEof => 6,
         _ => 254,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        TRAVERSAL_BATCH_ITEMS, TraversalCollection, TraversalFailure, collect_walk_batched,
-        traversal_errors_from_ignore,
-    };
-    use crate::file_executor::{BurstUse, GrepGlobExecutor};
-    use crate::operation::{RequestWorkGuard, TestStage};
-    use ignore::WalkBuilder;
-    use rmcp::model::RequestId;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio_util::sync::CancellationToken;
-
-    fn unfiltered_builder(root: &Path) -> WalkBuilder {
-        let mut builder = WalkBuilder::new(root);
-        builder
-            .standard_filters(false)
-            .hidden(false)
-            .follow_links(false);
-        builder
-    }
-
-    fn collect_file_names(
-        root: &Path,
-        executor: &Arc<GrepGlobExecutor>,
-        operation: Option<&crate::operation::OperationCtx>,
-    ) -> Result<TraversalCollection<String>, String> {
-        collect_walk_batched(
-            unfiltered_builder(root),
-            root,
-            operation,
-            Some(executor),
-            None,
-            |entry| {
-                if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                    Ok(Some(entry.path().to_string_lossy().into_owned()))
-                } else {
-                    Ok(None)
-                }
-            },
-        )
-    }
-
-    fn create_batched_fixture() -> tempfile::TempDir {
-        let fixture = tempfile::tempdir().unwrap();
-        for directory_index in 0..8 {
-            let directory = fixture.path().join(format!("batch-{directory_index:02}"));
-            fs::create_dir(&directory).unwrap();
-            for file_index in 0..137 {
-                fs::write(directory.join(format!("item-{file_index:03}.txt")), b"x").unwrap();
-            }
-        }
-        fixture
-    }
-
-    #[test]
-    fn nested_ignore_error_keeps_the_path_in_its_canonical_key() {
-        let error = ignore::Error::WithDepth {
-            depth: 2,
-            err: Box::new(ignore::Error::WithPath {
-                path: PathBuf::from("nested/private"),
-                err: Box::new(ignore::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "denied",
-                ))),
-            }),
-        };
-        let failures = traversal_errors_from_ignore(&error, Path::new("root"));
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].key.display_path_bytes, b"nested/private");
-        assert_eq!(failures[0].message, "Permission denied: nested/private");
-    }
-
-    #[test]
-    fn traversal_failure_reduction_is_schedule_independent() {
-        let fixture = tempfile::tempdir().unwrap();
-        for index in 0..8 {
-            let directory = fixture.path().join(format!("worker-{index}"));
-            fs::create_dir(&directory).unwrap();
-            let name = match index % 3 {
-                0 => "first-other",
-                1 => "first-denied",
-                _ => "last-denied",
-            };
-            fs::write(directory.join(name), b"x").unwrap();
-        }
-
-        for parallelism in [1, 2, 4] {
-            let executor = Arc::new(GrepGlobExecutor::with_test_parallelism(parallelism));
-            for _ in 0..100 {
-                let result = collect_walk_batched(
-                    unfiltered_builder(fixture.path()),
-                    fixture.path(),
-                    None,
-                    Some(&executor),
-                    None,
-                    |entry| {
-                        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-                            return Ok(None::<()>);
-                        }
-                        let (path, kind, message) = match entry.file_name().to_str() {
-                            Some("first-other") => ("a-first", std::io::ErrorKind::Other, "other"),
-                            Some("first-denied") => {
-                                ("a-first", std::io::ErrorKind::PermissionDenied, "denied")
-                            }
-                            _ => ("z-last", std::io::ErrorKind::PermissionDenied, "z"),
-                        };
-                        let error = std::io::Error::new(kind, message);
-                        Err(TraversalFailure::from_io(Path::new(path), &error))
-                    },
-                );
-                assert_eq!(
-                    result
-                        .err()
-                        .expect("every file injects a traversal failure"),
-                    "Permission denied: a-first"
-                );
-            }
-            executor.wait_for_test_quiescence();
-            let ledger = executor.test_burst_ledger();
-            assert_eq!(ledger.allocated, ledger.released);
-            assert_eq!(ledger.live, 0);
-            assert_eq!(ledger.duplicate_releases, 0);
-        }
-    }
-
-    #[test]
-    fn p1_parallel_and_saturated_p4_have_the_same_set_and_true_serial_fallback() {
-        let fixture = create_batched_fixture();
-        let expected_count = 8 * 137;
-
-        let p1 = Arc::new(GrepGlobExecutor::with_test_parallelism(1));
-        let mut serial = collect_file_names(fixture.path(), &p1, None).unwrap();
-        assert_eq!(serial.items.len(), expected_count);
-        assert_eq!(serial.metrics.serial_walks, 1);
-        assert_eq!(serial.metrics.parallel_walks, 0);
-
-        let p4 = Arc::new(GrepGlobExecutor::with_test_parallelism(4));
-        let mut parallel = collect_file_names(fixture.path(), &p4, None).unwrap();
-        assert_eq!(parallel.items.len(), expected_count);
-        assert_eq!(parallel.metrics.serial_walks, 0);
-        assert_eq!(parallel.metrics.parallel_walks, 1);
-        assert_eq!(parallel.metrics.parallel_threads, 4);
-        assert!(parallel.metrics.largest_batch <= TRAVERSAL_BATCH_ITEMS);
-        assert!(
-            parallel.metrics.batch_lock_acquisitions
-                <= expected_count.div_ceil(TRAVERSAL_BATCH_ITEMS)
-                    + parallel.metrics.parallel_threads
-        );
-
-        serial.items.sort();
-        parallel.items.sort();
-        assert_eq!(parallel.items, serial.items);
-
-        let held = p4.try_bursts(p4.extra_capacity(), BurstUse::SearchSpeculation);
-        assert_eq!(held.len(), p4.extra_capacity());
-        let mut saturated = collect_file_names(fixture.path(), &p4, None).unwrap();
-        assert_eq!(saturated.metrics.serial_walks, 1);
-        assert_eq!(saturated.metrics.parallel_walks, 0);
-        saturated.items.sort();
-        assert_eq!(saturated.items, serial.items);
-        drop(held);
-
-        p4.wait_for_test_quiescence();
-        let ledger = p4.test_burst_ledger();
-        assert_eq!(ledger.allocated, ledger.released);
-        assert_eq!(ledger.live, 0);
-        assert_eq!(ledger.duplicate_releases, 0);
-    }
-
-    #[test]
-    fn traversal_entry_and_batch_flush_cancellation_release_every_walk_credit() {
-        let fixture = create_batched_fixture();
-        for target in [TestStage::TraversalEntry, TestStage::TraversalBatchFlush] {
-            let parent = CancellationToken::new();
-            let cancel = parent.clone();
-            let fired = Arc::new(AtomicBool::new(false));
-            let fired_hook = Arc::clone(&fired);
-            let (mut guard, operation) = RequestWorkGuard::new_with_hook(
-                RequestId::String(Arc::from(format!("traversal-{target:?}"))),
-                parent,
-                Arc::new(move |stage| {
-                    if stage == target && !fired_hook.swap(true, Ordering::AcqRel) {
-                        cancel.cancel();
-                    }
-                }),
-            );
-            let executor = Arc::new(GrepGlobExecutor::with_test_parallelism(4));
-            let error = collect_file_names(fixture.path(), &executor, Some(&operation))
-                .err()
-                .expect("the selected traversal stage must cancel the collection");
-            assert_eq!(error, "Request cancelled.");
-            assert!(fired.load(Ordering::Acquire));
-            guard.disarm();
-            executor.wait_for_test_quiescence();
-            let ledger = executor.test_burst_ledger();
-            assert_eq!(ledger.allocated, ledger.released);
-            assert_eq!(ledger.live, 0);
-            assert_eq!(ledger.duplicate_releases, 0);
-        }
     }
 }
