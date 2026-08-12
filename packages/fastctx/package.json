@@ -23,6 +23,7 @@
   ],
   "optionalDependencies": {
     "@fastctx/win32-x64": "0.2.5",
+    "@fastctx/win32-arm64": "0.2.5",
     "@fastctx/linux-x64": "0.2.5",
     "@fastctx/darwin-x64": "0.2.5",
     "@fastctx/darwin-arm64": "0.2.5"

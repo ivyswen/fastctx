@@ -143,7 +143,7 @@ max_file_size_mib = 512
 cargo install fastctx --locked
 ```
 
-GitHub Releases provides a zip archive for Windows x64 and executable-preserving tar.gz archives for Linux x64, macOS x64, and macOS arm64. Every archive includes the binary and license notices; verify it with the release's aggregate `SHA256SUMS`.
+GitHub Releases provides zip archives for Windows x64 and Windows arm64, and executable-preserving tar.gz archives for Linux x64, macOS x64, and macOS arm64. Every archive includes the binary and license notices; verify it with the release's aggregate `SHA256SUMS`.
 
 ## Tools
 

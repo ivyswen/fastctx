@@ -11,6 +11,20 @@ const launcher = process.argv[2];
 if (!launcher) throw new Error('usage: verify-launcher-lifecycle.js <launcher.js>');
 const SIGNAL_FORWARD_DEADLINE_MS = 3000;
 
+// Mirrors the launcher's own platform map. Declared once here so that adding a
+// release platform cannot leave a check silently skipping the host it runs on.
+const PLATFORM_TARGETS = {
+  'win32-x64': ['@fastctx/win32-x64', 'fastctx.exe'],
+  'win32-arm64': ['@fastctx/win32-arm64', 'fastctx.exe'],
+  'linux-x64': ['@fastctx/linux-x64', 'fastctx'],
+  'darwin-x64': ['@fastctx/darwin-x64', 'fastctx'],
+  'darwin-arm64': ['@fastctx/darwin-arm64', 'fastctx'],
+};
+
+function hostTarget() {
+  return PLATFORM_TARGETS[`${process.platform}-${process.arch}`];
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -220,13 +234,7 @@ function linkOrCopyExecutable(source, target) {
 function assertNpmInvocationProvenanceAcrossLayouts() {
   const workspace = canonicalTempWorkspace('fastctx-npm-driver-');
   try {
-    const targets = {
-      'win32-x64': ['@fastctx/win32-x64', 'fastctx.exe'],
-      'linux-x64': ['@fastctx/linux-x64', 'fastctx'],
-      'darwin-x64': ['@fastctx/darwin-x64', 'fastctx'],
-      'darwin-arm64': ['@fastctx/darwin-arm64', 'fastctx'],
-    };
-    const target = targets[`${process.platform}-${process.arch}`];
+    const target = hostTarget();
     if (!target) return;
     const inputLauncher = fs.readFileSync(launcher, 'utf8');
     const mainLauncher = inputLauncher.includes("require('fastctx/launcher.js')")
@@ -483,13 +491,7 @@ require(${JSON.stringify(fixtureLauncher)});
 }
 
 function assertMissingPlatformPackageUsesStableCopyOrGivesAnActionableExit() {
-  const targets = {
-    'win32-x64': ['@fastctx/win32-x64', 'fastctx.exe'],
-    'linux-x64': ['@fastctx/linux-x64', 'fastctx'],
-    'darwin-x64': ['@fastctx/darwin-x64', 'fastctx'],
-    'darwin-arm64': ['@fastctx/darwin-arm64', 'fastctx'],
-  };
-  const target = targets[`${process.platform}-${process.arch}`];
+  const target = hostTarget();
   if (!target) return;
   const workspace = canonicalTempWorkspace('fastctx-platform-fallback-');
   try {
@@ -584,13 +586,7 @@ function assertUpdateHandoffKeepsLauncherAlive() {
       fs.copyFileSync(launcher, fixtureLauncher);
     }
     const expectedPackage = isAlias ? 'codex-fastctx' : 'fastctx';
-    const targets = {
-      'win32-x64': ['@fastctx/win32-x64', 'fastctx.exe'],
-      'linux-x64': ['@fastctx/linux-x64', 'fastctx'],
-      'darwin-x64': ['@fastctx/darwin-x64', 'fastctx'],
-      'darwin-arm64': ['@fastctx/darwin-arm64', 'fastctx'],
-    };
-    const target = targets[`${process.platform}-${process.arch}`];
+    const target = hostTarget();
     if (!target) return;
     const platformRoot = path.join(workspace, 'node_modules', target[0]);
     const binRoot = path.join(platformRoot, 'bin');

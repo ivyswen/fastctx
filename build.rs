@@ -43,7 +43,7 @@ fn main() {
 
     let artifact = artifact_for_target(&target).unwrap_or_else(|| {
         panic!(
-            "bundled PDF support does not have a pinned Pdfium artifact for target {target}; supported targets are Windows x64, Linux x64, macOS x64, and macOS arm64"
+            "bundled PDF support does not have a pinned Pdfium artifact for target {target}; supported targets are Windows x64, Windows arm64, Linux x64, macOS x64, and macOS arm64"
         )
     });
     let archive_bytes = load_archive(&artifact, &target_env);
@@ -129,6 +129,13 @@ fn artifact_for_target(target: &str) -> Option<Artifact> {
             archive_sha256: "45c4cc5d052ef8ec6380b946b548a76100f4675e38362000a4c732e16d5e8eda",
             member: "bin/pdfium.dll",
             library_sha256: "a63949dc46a7314bba619ac6cc1b3849627e137f542ae31b2b36b302841f77ae",
+            filename: "pdfium.dll",
+        },
+        "aarch64-pc-windows-msvc" => Artifact {
+            asset: "pdfium-win-arm64.tgz",
+            archive_sha256: "e99570d74211a88d41589feb8861ef9b40d78c8d26825270ad4fb7a9a1d02f6d",
+            member: "bin/pdfium.dll",
+            library_sha256: "682ee648af5629c1194bb3649e67252d162bdab06e00cded3e2ebbe88be7bf49",
             filename: "pdfium.dll",
         },
         "x86_64-unknown-linux-gnu" => Artifact {

@@ -141,7 +141,7 @@ max_file_size_mib = 512
 cargo install fastctx --locked
 ```
 
-GitHub Releases 为 Windows x64 提供 zip，为 Linux x64、macOS x64 和 macOS arm64 提供保留执行位的 tar.gz。每个归档都包含二进制与许可声明，并由 Release 的汇总 `SHA256SUMS` 校验。
+GitHub Releases 为 Windows x64 与 Windows arm64 提供 zip，为 Linux x64、macOS x64 和 macOS arm64 提供保留执行位的 tar.gz。每个归档都包含二进制与许可声明，并由 Release 的汇总 `SHA256SUMS` 校验。
 
 ## 工具
 

@@ -5,6 +5,7 @@ $author = "yc-duan <dy2958830371@gmail.com>"
 $license = "Apache-2.0"
 $platforms = [ordered]@{
     "fastctx-win32-x64" = "@fastctx/win32-x64"
+    "fastctx-win32-arm64" = "@fastctx/win32-arm64"
     "fastctx-linux-x64" = "@fastctx/linux-x64"
     "fastctx-darwin-x64" = "@fastctx/darwin-x64"
     "fastctx-darwin-arm64" = "@fastctx/darwin-arm64"
@@ -43,7 +44,7 @@ foreach ($manifest in $allManifests) {
 $optionalNames = @($main.optionalDependencies.PSObject.Properties.Name | Sort-Object)
 $expectedOptionalNames = @($platforms.Values | Sort-Object)
 if ((Compare-Object -ReferenceObject $expectedOptionalNames -DifferenceObject $optionalNames).Count -ne 0) {
-    throw "fastctx optionalDependencies must be exactly the four scoped platform packages"
+    throw "fastctx optionalDependencies must be exactly the scoped platform packages that release publishes"
 }
 foreach ($name in $expectedOptionalNames) {
     if ($main.optionalDependencies.$name -ne $cargoVersion) {

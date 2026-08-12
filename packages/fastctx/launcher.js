@@ -11,6 +11,7 @@ const fastctxHome = process.platform === 'win32'
 
 const targets = {
   'win32-x64': ['@fastctx/win32-x64', 'fastctx.exe'],
+  'win32-arm64': ['@fastctx/win32-arm64', 'fastctx.exe'],
   'linux-x64': ['@fastctx/linux-x64', 'fastctx'],
   'darwin-x64': ['@fastctx/darwin-x64', 'fastctx'],
   'darwin-arm64': ['@fastctx/darwin-arm64', 'fastctx'],

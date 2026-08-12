@@ -14,6 +14,11 @@ $mapping = @{
         Binary = "fastctx.exe"
         Format = "zip"
     }
+    "aarch64-pc-windows-msvc" = @{
+        Archive = "fastctx-aarch64-pc-windows-msvc.zip"
+        Binary = "fastctx.exe"
+        Format = "zip"
+    }
     "x86_64-unknown-linux-gnu" = @{
         Archive = "fastctx-x86_64-unknown-linux-gnu.tar.gz"
         Binary = "fastctx"

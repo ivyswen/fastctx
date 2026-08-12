@@ -27,6 +27,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             binary: fastctx.exe
             archive: fastctx-x86_64-pc-windows-msvc.zip
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            binary: fastctx.exe
+            archive: fastctx-aarch64-pc-windows-msvc.zip
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             zig_target: x86_64-unknown-linux-gnu.2.31
@@ -304,6 +308,7 @@ jobs:
           $version = (Select-String -LiteralPath Cargo.toml -Pattern '^version = "([^"]+)"$').Matches[0].Groups[1].Value
           $package = switch ("${{ matrix.target }}") {
             "x86_64-pc-windows-msvc" { "fastctx-win32-x64-$version.tgz" }
+            "aarch64-pc-windows-msvc" { "fastctx-win32-arm64-$version.tgz" }
             "x86_64-unknown-linux-gnu" { "fastctx-linux-x64-$version.tgz" }
             "x86_64-apple-darwin" { "fastctx-darwin-x64-$version.tgz" }
             "aarch64-apple-darwin" { "fastctx-darwin-arm64-$version.tgz" }
@@ -480,6 +485,7 @@ jobs:
 
           # Dependents last: the launcher's optionalDependencies must resolve.
           publish_package "@fastctx/win32-x64" "fastctx-win32-x64"
+          publish_package "@fastctx/win32-arm64" "fastctx-win32-arm64"
           publish_package "@fastctx/linux-x64" "fastctx-linux-x64"
           publish_package "@fastctx/darwin-x64" "fastctx-darwin-x64"
           publish_package "@fastctx/darwin-arm64" "fastctx-darwin-arm64"
@@ -492,6 +498,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           packages=(
             "@fastctx/win32-x64"
+            "@fastctx/win32-arm64"
             "@fastctx/linux-x64"
             "@fastctx/darwin-x64"
             "@fastctx/darwin-arm64"
@@ -528,6 +535,7 @@ jobs:
           # response only acknowledges the request, not its completion.
           for name in \
             "%40fastctx%2Fwin32-x64" \
+            "%40fastctx%2Fwin32-arm64" \
             "%40fastctx%2Flinux-x64" \
             "%40fastctx%2Fdarwin-x64" \
             "%40fastctx%2Fdarwin-arm64" \

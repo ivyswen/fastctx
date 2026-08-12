@@ -1738,6 +1738,7 @@ fn wait_for_parent_exit(parent_pid: u32) -> Result<(), String> {
 fn expected_release_archive_name() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => Some("fastctx-x86_64-pc-windows-msvc.zip"),
+        ("windows", "aarch64") => Some("fastctx-aarch64-pc-windows-msvc.zip"),
         ("linux", "x86_64") => Some("fastctx-x86_64-unknown-linux-gnu.tar.gz"),
         ("macos", "x86_64") => Some("fastctx-x86_64-apple-darwin.tar.gz"),
         ("macos", "aarch64") => Some("fastctx-aarch64-apple-darwin.tar.gz"),
@@ -1748,6 +1749,7 @@ fn expected_release_archive_name() -> Option<&'static str> {
 fn expected_npm_platform_package() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => Some("@fastctx/win32-x64"),
+        ("windows", "aarch64") => Some("@fastctx/win32-arm64"),
         ("linux", "x86_64") => Some("@fastctx/linux-x64"),
         ("macos", "x86_64") => Some("@fastctx/darwin-x64"),
         ("macos", "aarch64") => Some("@fastctx/darwin-arm64"),
