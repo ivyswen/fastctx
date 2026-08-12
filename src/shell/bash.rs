@@ -141,6 +141,14 @@ fn automatic_candidates(environment: &crate::session::SessionEnvironment) -> Vec
     if let Some(root) = environment.var_os("LocalAppData") {
         candidates.push(PathBuf::from(root).join("Programs/Git/usr/bin/bash.exe"));
     }
+    // Scoop exposes only a shim directory on PATH, so walking up from its
+    // git.exe never reaches the Git root that carries usr/bin.
+    if let Some(root) = environment.var_os("SCOOP") {
+        candidates.push(PathBuf::from(root).join("apps/git/current/usr/bin/bash.exe"));
+    }
+    if let Some(profile) = environment.var_os("USERPROFILE") {
+        candidates.push(PathBuf::from(profile).join("scoop/apps/git/current/usr/bin/bash.exe"));
+    }
     candidates.extend(path_candidates(environment, "bash.exe"));
     candidates
 }
