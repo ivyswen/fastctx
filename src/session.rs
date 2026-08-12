@@ -280,7 +280,7 @@ impl SessionContext {
             &provider,
         );
         let tool_environment = Arc::new(environment.with_guarded_output(effective_output));
-        let guarded_burst = guarded_burst_for(&environment, effective_output);
+        let guarded_burst = guarded_burst_for(effective_output);
         let command_environment =
             Arc::new(crate::os_environment::command_environment(&environment));
         let environment = Arc::new(environment);
@@ -322,7 +322,7 @@ impl SessionContext {
                 &provider,
             );
             let tool_environment = Arc::new(environment.with_guarded_output(effective_output));
-            let guarded_burst = guarded_burst_for(&environment, effective_output);
+            let guarded_burst = guarded_burst_for(effective_output);
             let command_environment =
                 Arc::new(crate::os_environment::command_environment(&environment));
             Arc::new(Self {
@@ -354,21 +354,11 @@ impl SessionContext {
     }
 }
 
-fn guarded_burst_for(
-    environment: &SessionEnvironment,
-    output: EffectiveOutput,
-) -> Option<Arc<GuardedBurstPool>> {
+fn guarded_burst_for(output: EffectiveOutput) -> Option<Arc<GuardedBurstPool>> {
     if output.mode != EffectiveOutputMode::Guarded {
         return None;
     }
-    let mut gap = BURST_GAP;
-    #[cfg(debug_assertions)]
-    if let Ok(value) = environment.var("FASTCTX_TEST_BURST_GAP_MS")
-        && let Ok(milliseconds) = value.parse::<u64>()
-    {
-        gap = std::time::Duration::from_millis(milliseconds);
-    }
-    Some(GuardedBurstPool::new(output.fastctx_budget, gap))
+    Some(GuardedBurstPool::new(output.fastctx_budget, BURST_GAP))
 }
 
 struct SessionEnvironmentScope {

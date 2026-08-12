@@ -204,6 +204,15 @@ jobs:
       - name: Lint without PDF support
         run: cargo clippy --locked --no-default-features --all-targets --target ${{ matrix.target }} -- -D warnings
 
+      # The lints above run in debug, so anything gated on `debug_assertions`
+      # compiles out of the release profile unseen: a parameter used only by a
+      # test hook reads as unused, and its `mut` as unnecessary. That blind spot
+      # has now produced warnings twice, in two different modules. One platform
+      # closes it, because `debug_assertions` has nothing to do with the target.
+      - name: Lint the release profile
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo clippy --locked --release --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+
       - name: Set up Node.js for npm packaging
         uses: actions/setup-node@v6
         with:
