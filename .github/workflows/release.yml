@@ -15,6 +15,14 @@ on:
 permissions:
   contents: read
 
+# The pinned Pdfium archive is a build input rather than a build output, so it belongs
+# in its own cache instead of the Cargo one. A tag build cannot be shrugged off and
+# retried the way a branch build can, and the release CDN it comes from does go down,
+# so this job fetches it once per pinning. Absolute, so every step resolves the same
+# directory whatever working directory Cargo hands the build script.
+env:
+  FASTCTX_PDFIUM_CACHE_DIR: ${{ github.workspace }}/.pdfium-archive-cache
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -157,6 +165,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+
+      - name: Cache the pinned Pdfium archive
+        uses: actions/cache@v4
+        with:
+          path: .pdfium-archive-cache
+          key: pdfium-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.rs') }}
 
       - name: Test release contracts
         run: cargo test --locked --release --target ${{ matrix.target }}

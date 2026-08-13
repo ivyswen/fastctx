@@ -1,6 +1,7 @@
 # Rust
 /target
 /tools/compat-v011-capture/target/
+/.pdfium-archive-cache
 /dist
 /packages/fastctx-*/bin/
 /packages/*/licenses/
