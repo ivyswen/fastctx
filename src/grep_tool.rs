@@ -72,13 +72,15 @@ pub struct GrepRequest {
         "File or directory to search. Omit for the session working directory."
     ))]
     pub path: Option<String>,
-    /// One glob or a list of globs to filter files. Prefix exclusions with `!`, e.g. ["**/*.rs", "!tests/**"]; negative-only lists include every other file.
+    /// Globs to filter files, e.g. ["**/*.rs", "!tests/**"]. A leading `!` excludes and always wins; negative-only lists include every other file.
+    // Published as a plain string array; see the note on GlobRequest::pattern. (2026-08-17)
+    #[schemars(with = "Option<Vec<String>>")]
     pub glob: Option<GlobPatterns>,
     /// File type filter, e.g. "js", "py", "rust" (equivalent to rg --type; more efficient than glob for standard types).
     #[serde(rename = "type")]
     #[schemars(rename = "type")]
     pub file_type: Option<String>,
-    /// "content", "files_with_matches", "count", or "summary" (global totals from a full scan; ignores head_limit/offset).
+    /// "content" = matching lines with optional context; "files_with_matches" (default) = matching paths only; "count" = per-file counts plus their total; "summary" = global totals from a full scan (ignores head_limit/offset).
     pub output_mode: Option<OutputMode>,
     /// Case-insensitive search (rg -i).
     pub case_insensitive: Option<bool>,

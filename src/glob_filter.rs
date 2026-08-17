@@ -9,6 +9,10 @@ use std::path::Path;
 ///
 /// A leading `!` marks an exclusion. Exclusions always veto a match; when at
 /// least one inclusion is present, a path must match an inclusion first.
+///
+/// Parameters of this type publish the array form alone, because a union is the
+/// one construct no provider's tool-schema subset accepts; see `crate::tool_schema`.
+/// Both forms still deserialize, so callers written against either keep working.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum GlobPatterns {

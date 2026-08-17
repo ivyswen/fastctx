@@ -309,9 +309,7 @@ mod tests {
 
     /// Underscore-shaped identifiers model-visible prose may cite even though no tool,
     /// parameter, or schema enum vouches for them.
-    const DOCUMENTED_PROSE_LITERALS: [&str; 3] = [
-        // grep's output_mode is a free-form string, so its default value exists only in prose.
-        "files_with_matches",
+    const DOCUMENTED_PROSE_LITERALS: [&str; 2] = [
         // The job_list page-size setting cited by the limit parameter's description.
         "job_list_limit",
         // A WHATWG encoding label used as an example value in encoding parameters.

@@ -291,7 +291,7 @@ V:/repo/Cargo.toml
   "pattern": "old_name\\(",
   "replacement": "new_name(",
   "path": "V:/repo/src",
-  "glob": "**/*.rs",
+  "glob": ["**/*.rs"],
   "dry_run": true
 }
 ```

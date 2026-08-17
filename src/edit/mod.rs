@@ -26,7 +26,9 @@ pub struct ReplaceRequest {
         "File or directory to edit."
     ))]
     pub path: String,
-    /// One glob or a list of globs for directory targets. Prefix exclusions with `!`, e.g. ["**/*.rs", "!tests/**"]; negative-only lists include every other file.
+    /// Globs for directory targets, e.g. ["**/*.rs", "!tests/**"]. A leading `!` excludes and always wins; negative-only lists include every other file.
+    // Published as a plain string array; see the note on GlobRequest::pattern. (2026-08-17)
+    #[schemars(with = "Option<Vec<String>>")]
     pub glob: Option<GlobPatterns>,
     /// Treat pattern as a literal string, not a regex.
     pub literal: Option<bool>,

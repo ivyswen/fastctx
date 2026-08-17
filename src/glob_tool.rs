@@ -52,7 +52,12 @@ pub enum SortMode {
 /// Parameters for the glob tool.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 pub struct GlobRequest {
-    /// One glob or a list of globs to match files. Prefix exclusions with `!`, e.g. ["**/*.rs", "!tests/**"]; negative-only patterns list every other file.
+    /// Globs to match files, e.g. ["**/*.rs", "!tests/**"]. A leading `!` excludes and always wins; negative-only patterns list every other file.
+    // Published as a plain string array rather than the string-or-array union the type
+    // accepts. A union is the one construct no provider subset takes: Gemini rejects a
+    // node that carries `anyOf` beside a `description`, and every parameter here has
+    // one. Deserialization is unchanged — a bare string still parses. (2026-08-17)
+    #[schemars(with = "Vec<String>")]
     pub pattern: GlobPatterns,
     /// Directory to search; omit for the session working directory.
     #[schemars(description = crate::model_guidance::local_path_description(

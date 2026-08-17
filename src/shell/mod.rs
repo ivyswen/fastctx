@@ -102,7 +102,7 @@ pub struct JobKillRequest {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JobListRequest {
-    /// Lifecycle subset to list. Omit for currently running jobs.
+    /// Lifecycle subset to list: "running" (default, still-alive process trees), "finished" (retained exited and interrupted records), or "all". Omit for currently running jobs.
     #[serde(default)]
     #[schemars(default)]
     pub status: JobListStatus,

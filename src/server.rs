@@ -133,6 +133,16 @@ impl FastCtxServer {
                 tool_router.remove_route(entry.name);
             }
         }
+        // Every consumer of a tool definition reads it back out of this router — the
+        // stdio `tools/list` answer, `tool_definitions`, and the contract hashes doctor
+        // compares across processes. Normalizing here keeps all of them on one shape;
+        // doing it in `tool_definitions` instead would make doctor compare a normalized
+        // expectation against an underived wire answer.
+        for route in tool_router.map.values_mut() {
+            route.attr.input_schema = Arc::new(crate::tool_schema::normalize_published_schema(
+                &route.attr.input_schema,
+            ));
+        }
         let definitions = tool_router.list_all();
         ToolManifest::validate(&definitions, options.enable_shell)
             .expect("the compiled tool router must match ToolManifest");
