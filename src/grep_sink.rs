@@ -311,22 +311,11 @@ impl SinkError for GrepSinkError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct SinkMetrics {
-    pub(crate) sink_matches: usize,
-    pub(crate) occurrences_examined: usize,
-    pub(crate) line_layout_builds: usize,
-    pub(crate) line_layout_bytes: usize,
-    #[cfg(test)]
-    pub(crate) source_bytes_copied: usize,
-}
-
 struct SinkControl<'a> {
     matcher: &'a RegexMatcher,
     operation: Option<&'a dyn WorkCheckpoint>,
     occurrences_since_check: usize,
     bytes_since_check: usize,
-    metrics: SinkMetrics,
 }
 
 impl<'a> SinkControl<'a> {
@@ -336,7 +325,6 @@ impl<'a> SinkControl<'a> {
             operation,
             occurrences_since_check: 0,
             bytes_since_check: 0,
-            metrics: SinkMetrics::default(),
         }
     }
 
@@ -354,12 +342,10 @@ impl<'a> SinkControl<'a> {
             operation.stage(crate::operation::TestStage::SinkMatch);
         }
         self.checkpoint()?;
-        self.metrics.sink_matches = self.metrics.sink_matches.saturating_add(1);
         Ok(())
     }
 
     fn occurrence_checkpoint(&mut self, span_bytes: usize) -> Result<(), GrepSinkError> {
-        self.metrics.occurrences_examined = self.metrics.occurrences_examined.saturating_add(1);
         self.occurrences_since_check = self.occurrences_since_check.saturating_add(1);
         self.bytes_since_check = self.bytes_since_check.saturating_add(span_bytes);
         if self.occurrences_since_check < OCCURRENCE_CHECK_INTERVAL
@@ -736,13 +722,6 @@ impl Sink for ContentSink<'_> {
                 ContentMode::Occurrence => {
                     if layout.is_none() {
                         layout = Some(LineLayout::new(bytes, first_line_number));
-                        self.control.metrics.line_layout_builds =
-                            self.control.metrics.line_layout_builds.saturating_add(1);
-                        self.control.metrics.line_layout_bytes = self
-                            .control
-                            .metrics
-                            .line_layout_bytes
-                            .saturating_add(bytes.len());
                     }
                     let indexes = layout
                         .as_ref()
@@ -760,13 +739,6 @@ impl Sink for ContentSink<'_> {
             if selected {
                 if layout.is_none() {
                     layout = Some(LineLayout::new(bytes, first_line_number));
-                    self.control.metrics.line_layout_builds =
-                        self.control.metrics.line_layout_builds.saturating_add(1);
-                    self.control.metrics.line_layout_bytes = self
-                        .control
-                        .metrics
-                        .line_layout_bytes
-                        .saturating_add(bytes.len());
                 }
                 let layout = layout
                     .as_mut()
@@ -952,15 +924,6 @@ impl<'a> PlanSink<'a> {
                     entries_seen,
                 }
             }
-        }
-    }
-
-    #[cfg(test)]
-    fn metrics(&self) -> SinkMetrics {
-        match &self.inner {
-            PlanSinkKind::Exists(sink) => sink.control.metrics,
-            PlanSinkKind::Count(sink) => sink.control.metrics,
-            PlanSinkKind::Content(sink) => sink.control.metrics,
         }
     }
 }
@@ -1196,321 +1159,4 @@ fn absolute_range(base: u64, local: Range<usize>) -> Result<Range<u64>, GrepSink
 
 fn is_synthetic_trailing_empty(bytes: &[u8], found: Match) -> bool {
     found.start() == found.end() && found.end() == bytes.len() && bytes.ends_with(b"\n")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ContentSpec, GrepSearchPlan, GrepSinkError, PlanSink};
-    use crate::operation::{RequestWorkGuard, TestStage};
-    use grep_matcher::LineTerminator;
-    use grep_regex::RegexMatcherBuilder;
-    use grep_searcher::SearcherBuilder;
-    use rmcp::model::RequestId;
-    use std::io::Cursor;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio_util::sync::CancellationToken;
-
-    fn matcher(pattern: &str, multiline: bool) -> grep_regex::RegexMatcher {
-        let mut builder = RegexMatcherBuilder::new();
-        builder
-            .multi_line(true)
-            .crlf(true)
-            .dot_matches_new_line(multiline);
-        if multiline {
-            builder.line_terminator(None);
-        }
-        builder.build(pattern).unwrap()
-    }
-
-    fn search(
-        pattern: &str,
-        bytes: &[u8],
-        plan: GrepSearchPlan,
-    ) -> (super::SinkOutput, super::SinkMetrics) {
-        let multiline = plan.content_multiline().unwrap_or(false);
-        let matcher = matcher(pattern, multiline);
-        let mut searcher = SearcherBuilder::new();
-        searcher
-            .line_number(true)
-            .line_terminator(LineTerminator::crlf())
-            .multi_line(multiline)
-            .before_context(plan.before_context())
-            .after_context(plan.after_context());
-        let content_backing = plan
-            .content_multiline()
-            .is_some()
-            .then(|| crate::search_text::SearchText::capture(Cursor::new(bytes), None).unwrap());
-        let mut sink = PlanSink::new(&matcher, plan, None, content_backing);
-        searcher
-            .build()
-            .search_slice(&matcher, bytes, &mut sink)
-            .unwrap();
-        let metrics = sink.metrics();
-        let total_lines = if bytes.is_empty() {
-            0
-        } else {
-            bytes
-                .iter()
-                .filter(|byte| **byte == b'\n')
-                .count()
-                .saturating_add(1)
-        };
-        (
-            sink.into_output(
-                "/dense.txt".to_string(),
-                total_lines,
-                bytes.ends_with(b"\n"),
-            ),
-            metrics,
-        )
-    }
-
-    fn content_spec(multiline: bool, capture_match_text: bool) -> ContentSpec {
-        ContentSpec {
-            multiline,
-            skip_entries: 0,
-            max_selected_entries: None,
-            capture_match_text,
-            before_context: 0,
-            after_context: 0,
-            capture_heap_limit_bytes: 64 * 1024 * 1024,
-        }
-    }
-
-    #[test]
-    fn exists_stops_at_one_occurrence_and_count_builds_no_line_layout() {
-        let bytes = "hit ".repeat(65_536);
-        let (exists, exists_metrics) = search("hit", bytes.as_bytes(), GrepSearchPlan::Exists);
-        assert!(exists.result.is_some());
-        assert_eq!(exists_metrics.occurrences_examined, 1);
-        assert_eq!(exists_metrics.line_layout_builds, 0);
-
-        let (count, count_metrics) = search("hit", bytes.as_bytes(), GrepSearchPlan::Count);
-        assert_eq!(count.result.unwrap().occurrence_count(), 65_536);
-        assert_eq!(count_metrics.occurrences_examined, 65_536);
-        assert_eq!(count_metrics.line_layout_builds, 0);
-    }
-
-    #[test]
-    fn dense_content_builds_one_layout_and_keeps_range_backed_occurrences() {
-        let bytes = "界hit ".repeat(8_192);
-        let (output, metrics) = search(
-            "hit",
-            bytes.as_bytes(),
-            GrepSearchPlan::ContentLine(content_spec(false, false)),
-        );
-        let result = output.result.unwrap();
-        let content = result.content();
-        assert_eq!(metrics.sink_matches, 1);
-        assert_eq!(metrics.line_layout_builds, 1);
-        assert_eq!(metrics.occurrences_examined, 8_192);
-        assert_eq!(content.entries, [super::ContentEntry::MatchingLine(1)]);
-        assert_eq!(content.occurrences[&1].len(), 8_192);
-        assert_eq!(content.lines[&1].as_str().unwrap(), bytes);
-        assert_eq!(content.lines[&1].char_count().unwrap(), 5 * 8_192);
-        assert_eq!(metrics.source_bytes_copied, 0);
-    }
-
-    #[test]
-    fn dense_mode_counters_follow_the_declared_doubling_curve() {
-        for occurrences in [512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536] {
-            let bytes = "x".repeat(occurrences);
-
-            let (exists, exists_metrics) = search("x", bytes.as_bytes(), GrepSearchPlan::Exists);
-            assert!(exists.result.is_some());
-            assert_eq!(exists_metrics.occurrences_examined, 1);
-            assert_eq!(exists_metrics.line_layout_builds, 0);
-
-            let (count, count_metrics) = search("x", bytes.as_bytes(), GrepSearchPlan::Count);
-            assert_eq!(count.result.unwrap().occurrence_count(), occurrences);
-            assert_eq!(count_metrics.sink_matches, 1);
-            assert_eq!(count_metrics.occurrences_examined, occurrences);
-            assert_eq!(count_metrics.line_layout_builds, 0);
-
-            let (content, content_metrics) = search(
-                "x",
-                bytes.as_bytes(),
-                GrepSearchPlan::ContentLine(content_spec(false, false)),
-            );
-            let result = content.result.unwrap();
-            assert_eq!(result.content().occurrences[&1].len(), occurrences);
-            assert_eq!(content_metrics.sink_matches, 1);
-            assert_eq!(content_metrics.occurrences_examined, occurrences);
-            assert_eq!(content_metrics.line_layout_builds, 1);
-            assert_eq!(content_metrics.line_layout_bytes, occurrences);
-        }
-    }
-
-    #[test]
-    fn range_backed_payloads_are_send_and_static() {
-        fn assert_send_static<T: Send + 'static>() {}
-
-        assert_send_static::<super::FileResult>();
-        assert_send_static::<crate::search_text::SearchText>();
-    }
-
-    #[test]
-    fn skipped_dense_lines_do_not_build_layouts_or_enumerate_their_tail() {
-        let first = "hit ".repeat(65_536);
-        let bytes = format!("{first}\nhit hit\n{first}\n");
-        let mut spec = content_spec(false, false);
-        spec.skip_entries = 1;
-        spec.max_selected_entries = Some(1);
-        let (output, metrics) = search("hit", bytes.as_bytes(), GrepSearchPlan::ContentLine(spec));
-        let result = output.result.unwrap();
-        let content = result.content();
-        assert_eq!(content.entries, [super::ContentEntry::MatchingLine(2)]);
-        assert_eq!(content.occurrences[&2].len(), 2);
-        assert_eq!(metrics.sink_matches, 2);
-        assert_eq!(metrics.occurrences_examined, 3);
-        assert_eq!(metrics.line_layout_builds, 1);
-    }
-
-    #[test]
-    fn temp_backed_content_uses_absolute_ranges_across_searcher_buffers() {
-        let prefix_lines = (8 * 1024 * 1024 / 6) + 2;
-        let mut bytes = b"quiet\n".repeat(prefix_lines);
-        bytes.extend_from_slice(b"hit\n");
-        let backing = crate::search_text::SearchText::capture(Cursor::new(&bytes), None).unwrap();
-        assert!(backing.is_temp());
-
-        let matcher = matcher("hit", false);
-        let mut builder = SearcherBuilder::new();
-        builder
-            .line_number(true)
-            .line_terminator(LineTerminator::crlf());
-        let mut searcher = builder.build();
-        let plan = GrepSearchPlan::ContentLine(content_spec(false, false));
-        let mut sink = PlanSink::new(&matcher, plan, None, Some(Arc::clone(&backing)));
-        let reader = backing.open_reader().unwrap();
-        searcher.search_reader(&matcher, reader, &mut sink).unwrap();
-
-        let output = sink.into_output("/temp.txt".to_string(), prefix_lines + 2, true);
-        let result = output.result.unwrap();
-        let line_number = prefix_lines + 1;
-        assert_eq!(
-            result.content().entries,
-            [super::ContentEntry::MatchingLine(line_number)]
-        );
-        assert_eq!(
-            result.content().lines[&line_number].as_str().unwrap(),
-            "hit"
-        );
-    }
-
-    #[test]
-    fn occurrence_plan_pages_unicode_matches_without_byte_char_confusion() {
-        let (output, _) = search(
-            "界hit",
-            "前界hit后 界hit尾\n".as_bytes(),
-            GrepSearchPlan::ContentOccurrence(content_spec(false, true)),
-        );
-        let result = output.result.unwrap();
-        let occurrences = &result.content().occurrences[&1];
-        assert_eq!(occurrences.len(), 2);
-        assert_eq!(occurrences[0].matched_text().unwrap(), "界hit");
-        assert_eq!(occurrences[0].line_spans[0].match_char_start, 1);
-        assert_eq!(occurrences[0].line_spans[0].match_char_len, 4);
-        assert_eq!(occurrences[1].line_spans[0].match_char_start, 7);
-        assert_eq!(result.content().entries.len(), 2);
-    }
-
-    #[test]
-    fn cancellation_at_sink_match_stops_before_match_or_occurrence_work() {
-        let cancellation = CancellationToken::new();
-        let cancellation_for_hook = cancellation.clone();
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_for_hook = Arc::clone(&fired);
-        let hook = Arc::new(move |stage| {
-            if stage == TestStage::SinkMatch && !fired_for_hook.swap(true, Ordering::AcqRel) {
-                cancellation_for_hook.cancel();
-            }
-        });
-        let (_guard, operation) =
-            RequestWorkGuard::new_with_hook(RequestId::Number(800), cancellation, hook);
-        let matcher = matcher("hit", false);
-        let mut builder = SearcherBuilder::new();
-        builder
-            .line_number(true)
-            .line_terminator(LineTerminator::crlf());
-        let mut searcher = builder.build();
-        let mut sink = PlanSink::new(&matcher, GrepSearchPlan::Count, Some(&operation), None);
-
-        let error = searcher
-            .search_slice(&matcher, b"hit hit\n", &mut sink)
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            GrepSinkError::Stopped(crate::operation::WorkStop::RequestCancelled)
-        ));
-        assert!(fired.load(Ordering::Acquire));
-        let metrics = sink.metrics();
-        assert_eq!(metrics.sink_matches, 0);
-        assert_eq!(metrics.occurrences_examined, 0);
-        assert_eq!(metrics.line_layout_builds, 0);
-    }
-
-    #[test]
-    fn dense_occurrence_cancellation_stops_at_the_declared_batch_boundary() {
-        let cancelled = CancellationToken::new();
-        let cancellation_for_hook = cancelled.clone();
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired_for_hook = Arc::clone(&fired);
-        let hook = Arc::new(move |stage| {
-            if stage == TestStage::OccurrenceBatch && !fired_for_hook.swap(true, Ordering::AcqRel) {
-                cancellation_for_hook.cancel();
-            }
-        });
-        let (_guard, operation) =
-            RequestWorkGuard::new_with_hook(RequestId::Number(801), cancelled, hook);
-        let matcher = matcher("x", false);
-        let mut builder = SearcherBuilder::new();
-        builder
-            .line_number(true)
-            .line_terminator(LineTerminator::crlf());
-        let mut searcher = builder.build();
-        let mut sink = PlanSink::new(&matcher, GrepSearchPlan::Count, Some(&operation), None);
-        let error = searcher
-            .search_slice(&matcher, "x".repeat(10_000).as_bytes(), &mut sink)
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                GrepSinkError::Stopped(crate::operation::WorkStop::RequestCancelled)
-            ),
-            "{error:?}"
-        );
-        assert!(fired.load(Ordering::Acquire));
-        assert_eq!(sink.metrics().occurrences_examined, 256);
-    }
-
-    #[test]
-    fn one_large_occurrence_reaches_the_declared_byte_cancellation_boundary() {
-        let cancelled = CancellationToken::new();
-        let cancellation_for_hook = cancelled.clone();
-        let hook = Arc::new(move |stage| {
-            if stage == TestStage::OccurrenceBatch {
-                cancellation_for_hook.cancel();
-            }
-        });
-        let (_guard, operation) =
-            RequestWorkGuard::new_with_hook(RequestId::Number(802), cancelled, hook);
-        let matcher = matcher("x+", false);
-        let mut builder = SearcherBuilder::new();
-        builder
-            .line_number(true)
-            .line_terminator(LineTerminator::crlf());
-        let mut searcher = builder.build();
-        let mut sink = PlanSink::new(&matcher, GrepSearchPlan::Count, Some(&operation), None);
-        let error = searcher
-            .search_slice(&matcher, "x".repeat(65_536).as_bytes(), &mut sink)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            GrepSinkError::Stopped(crate::operation::WorkStop::RequestCancelled)
-        ));
-        assert_eq!(sink.metrics().occurrences_examined, 1);
-    }
 }

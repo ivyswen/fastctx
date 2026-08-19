@@ -13,6 +13,109 @@ pub fn parse_input_path(input: &str) -> PathBuf {
     }
 }
 
+/// Accepts either a plain path or a strictly local file URI and returns a native path.
+///
+/// URI normalization is deliberately limited to the `file` scheme. Other schemes and
+/// ambiguous file-URI shapes fail before filesystem lookup so callers never guess a path.
+pub(crate) fn parse_local_path_input(input: &str) -> Result<PathBuf, String> {
+    let Some(scheme) = uri_scheme(input) else {
+        return Ok(parse_input_path(input));
+    };
+    if !scheme.eq_ignore_ascii_case("file") {
+        return Err(format!(
+            "Unsupported URI scheme \"{}\" for a local filesystem path.",
+            scheme.to_ascii_lowercase()
+        ));
+    }
+    if !input[scheme.len() + 1..].starts_with("//") {
+        return Err(
+            "Invalid local file URI: expected an absolute URI with a local authority.".to_string(),
+        );
+    }
+    if !has_valid_percent_escapes(input) {
+        return Err("Invalid local file URI: malformed percent escape.".to_string());
+    }
+
+    let authority = input[scheme.len() + 3..]
+        .split(['/', '\\', '?', '#'])
+        .next()
+        .unwrap_or_default();
+
+    let uri =
+        url::Url::parse(input).map_err(|error| format!("Invalid local file URI: {error}."))?;
+    if !uri.username().is_empty() || uri.password().is_some() || uri.port().is_some() {
+        return Err(
+            "Invalid local file URI: user information and ports are not supported.".to_string(),
+        );
+    }
+    if uri.query().is_some() || uri.fragment().is_some() {
+        return Err(
+            "Invalid local file URI: query and fragment components are not supported.".to_string(),
+        );
+    }
+    // url intentionally erases a file URL's host when the path begins with a Windows drive
+    // designator. Inspect the original authority so a remote URI can never become a local path.
+    if (!authority.is_empty() && !authority.eq_ignore_ascii_case("localhost"))
+        || uri
+            .host_str()
+            .is_some_and(|host| !host.eq_ignore_ascii_case("localhost"))
+    {
+        return Err("Invalid local file URI: remote authorities are not supported.".to_string());
+    }
+
+    let path = uri.to_file_path().map_err(|_| {
+        "Invalid local file URI: it cannot be represented as a local filesystem path.".to_string()
+    })?;
+    if path.as_os_str().to_string_lossy().contains('\0') {
+        return Err("Invalid local file URI: the decoded path contains a NUL byte.".to_string());
+    }
+    if !path.is_absolute() {
+        return Err("Invalid local file URI: the decoded path is not absolute.".to_string());
+    }
+    Ok(path)
+}
+
+pub(crate) fn is_local_file_uri_input(input: &str) -> bool {
+    uri_scheme(input).is_some_and(|scheme| scheme.eq_ignore_ascii_case("file"))
+}
+
+/// Returns the RFC 3986 scheme of an input that cannot instead be a Windows drive designator.
+///
+/// One-character schemes are reported as absent: no registered scheme is that short, while
+/// `C:\repo`, `C:/repo`, and the drive-relative `C:repo` all open with one. Reading those as
+/// schemes would reject real paths as unsupported protocols.
+fn uri_scheme(input: &str) -> Option<&str> {
+    let end = input.find(':')?;
+    let scheme = &input[..end];
+    if scheme.len() < 2 {
+        return None;
+    }
+    let mut bytes = scheme.bytes();
+    bytes.next()?.is_ascii_alphabetic().then_some(())?;
+    bytes
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+        .then_some(scheme)
+}
+
+fn has_valid_percent_escapes(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        let Some(pair) = bytes.get(index + 1..index + 3) else {
+            return false;
+        };
+        if !pair.iter().all(u8::is_ascii_hexdigit) {
+            return false;
+        }
+        index += 3;
+    }
+    true
+}
+
 /// Returns an absolute display path that never depends on platform backslashes.
 pub fn display_path(path: &Path) -> String {
     let mut value = path.to_string_lossy().replace('\\', "/");
@@ -75,57 +178,6 @@ pub fn nearest_existing_name(path: &Path) -> Option<PathBuf> {
     candidates.into_iter().next().map(|(_, _, path)| path)
 }
 
-/// Recovery note for an input written as a `file://` URL instead of a filesystem path.
-///
-/// Hosts hand the model file URLs of their own (resource reads, editor selections), so a caller
-/// that has just been redirected to these tools often keeps the URL form; naming the plain path is
-/// what turns a second failure into a working call. Returns `None` for anything else.
-fn file_url_note(input: &str) -> Option<String> {
-    let rest = input
-        .get(..7)
-        .filter(|scheme| scheme.eq_ignore_ascii_case("file://"))
-        .map(|_| &input[7..])?;
-    // Strip an empty or "localhost" authority, then the slash that precedes a Windows drive letter.
-    let rest = rest.strip_prefix("localhost/").unwrap_or(rest);
-    let decoded = percent_decoded(rest);
-    let path = decoded
-        .strip_prefix('/')
-        .filter(|tail| {
-            let mut characters = tail.chars();
-            characters
-                .next()
-                .is_some_and(|first| first.is_ascii_alphabetic())
-                && characters.next() == Some(':')
-        })
-        .unwrap_or(&decoded);
-    (!path.is_empty())
-        .then(|| format!("\nNote: this is a file:// URL, not a path. Use {path} instead."))
-}
-
-/// Decodes `%XX` escapes, leaving malformed escapes as written.
-fn percent_decoded(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        let escape = (bytes[index] == b'%')
-            .then(|| value.get(index + 1..index + 3))
-            .flatten()
-            .and_then(|digits| u8::from_str_radix(digits, 16).ok());
-        match escape {
-            Some(byte) => {
-                decoded.push(byte);
-                index += 3;
-            }
-            None => {
-                decoded.push(bytes[index]);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8(decoded).unwrap_or_else(|_| value.to_string())
-}
-
 /// Builds the read error for missing or relative paths, including a recovery step when possible.
 pub fn missing_file_message(input: &str) -> String {
     let cwd = crate::session::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -150,10 +202,6 @@ pub fn missing_file_message(input: &str) -> String {
         ));
     }
     let mut message = format!("File does not exist: {requested}\n{note}");
-    if let Some(url_note) = file_url_note(input) {
-        message.push_str(&url_note);
-        return message;
-    }
     if let Some(candidate) = nearest_existing_name(&resolved) {
         let candidate = canonical_existing(&candidate).unwrap_or(candidate);
         message.push_str(&format!("\nDid you mean: {}?", display_path(&candidate)));
@@ -192,62 +240,5 @@ pub fn missing_search_path_message(input: &str) -> String {
             display_path(&absolute)
         ));
     }
-    let mut message = format!("Path does not exist: {}\n{note}", input.replace('\\', "/"));
-    if let Some(url_note) = file_url_note(input) {
-        message.push_str(&url_note);
-    }
-    message
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{file_url_note, missing_file_message, missing_search_path_message};
-
-    #[test]
-    fn file_urls_are_translated_to_the_plain_path() {
-        for (input, expected) in [
-            ("file:///V:/repo/AGENTS.md", "V:/repo/AGENTS.md"),
-            ("FILE:///V:/repo/AGENTS.md", "V:/repo/AGENTS.md"),
-            ("file://localhost/V:/repo/AGENTS.md", "V:/repo/AGENTS.md"),
-            ("file:///home/user/notes.md", "/home/user/notes.md"),
-            ("file:///V:/repo/my%20notes.md", "V:/repo/my notes.md"),
-            ("file:///V:/repo/%E4%B8%AD%E6%96%87.md", "V:/repo/中文.md"),
-        ] {
-            let note = file_url_note(input).unwrap_or_else(|| panic!("no note for {input}"));
-            assert_eq!(
-                note,
-                format!("\nNote: this is a file:// URL, not a path. Use {expected} instead."),
-                "{input}"
-            );
-        }
-    }
-
-    #[test]
-    fn plain_paths_and_other_schemes_get_no_url_note() {
-        // A leading slash that is not a drive letter must survive, and non-file schemes are
-        // somebody else's problem — guessing at them would invent a path that does not exist.
-        for input in [
-            "V:/repo/AGENTS.md",
-            "/home/user/notes.md",
-            "https://example.com/a.md",
-            "notafile://x",
-            "file://",
-        ] {
-            assert!(file_url_note(input).is_none(), "{input}");
-        }
-    }
-
-    #[test]
-    fn missing_file_and_search_errors_carry_the_recovery_path() {
-        let read = missing_file_message("file:///V:/definitely/missing.md");
-        assert!(
-            read.ends_with("Use V:/definitely/missing.md instead."),
-            "{read}"
-        );
-        let search = missing_search_path_message("file:///V:/definitely/missing");
-        assert!(
-            search.ends_with("Use V:/definitely/missing instead."),
-            "{search}"
-        );
-    }
+    format!("Path does not exist: {}\n{note}", input.replace('\\', "/"))
 }

@@ -10,12 +10,21 @@ $npmPath = Join-Path $root $NpmDirectory
 $version = (Select-String -LiteralPath (Join-Path $root "Cargo.toml") -Pattern '^version = "([^"]+)"$').Matches[0].Groups[1].Value
 $archives = [ordered]@{
     "fastctx-x86_64-pc-windows-msvc.zip" = "fastctx.exe"
+    "fastctx-aarch64-pc-windows-msvc.zip" = "fastctx.exe"
     "fastctx-x86_64-unknown-linux-gnu.tar.gz" = "fastctx"
     "fastctx-x86_64-apple-darwin.tar.gz" = "fastctx"
     "fastctx-aarch64-apple-darwin.tar.gz" = "fastctx"
 }
 $releaseFiles = @($archives.Keys) + @("SHA256SUMS")
-$licenseFiles = @("LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")
+# Declared independently of the staging scripts on purpose: sharing one source
+# would make this check confirm the packer against itself instead of against the
+# distribution contract.
+$licenseFiles = @(
+    "LICENSE-APACHE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.md",
+    "THIRD_PARTY_LICENSES_RUST.md"
+)
 $tarCommand = if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )) {
@@ -53,7 +62,7 @@ foreach ($line in $checksumLines) {
     $checksums[$Matches[2]] = $Matches[1]
 }
 if ((Compare-Object -ReferenceObject @($archives.Keys | Sort-Object) -DifferenceObject @($checksums.Keys | Sort-Object)).Count -ne 0) {
-    throw "SHA256SUMS does not cover exactly the four release archives"
+    throw "SHA256SUMS does not cover exactly the published release archives"
 }
 foreach ($name in $archives.Keys) {
     $actualHash = (Get-FileHash -LiteralPath (Join-Path $releasePath $name) -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -108,6 +117,7 @@ try {
 
 $npmPackages = [ordered]@{
     "fastctx-win32-x64-$version.tgz" = "@fastctx/win32-x64"
+    "fastctx-win32-arm64-$version.tgz" = "@fastctx/win32-arm64"
     "fastctx-linux-x64-$version.tgz" = "@fastctx/linux-x64"
     "fastctx-darwin-x64-$version.tgz" = "@fastctx/darwin-x64"
     "fastctx-darwin-arm64-$version.tgz" = "@fastctx/darwin-arm64"

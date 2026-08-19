@@ -120,10 +120,28 @@ impl FastCtxServer {
         let mut tool_router = Self::file_tool_router();
         tool_router.merge(Self::shell_tool_router());
         tool_router.merge(Self::edit_tool_router());
+        // rmcp's attribute accepts only a literal. Replace its inert placeholder before the router
+        // is observable so the positive route still has one production source.
+        tool_router
+            .map
+            .get_mut("inspect_local_file")
+            .expect("the compiled file router must contain inspect_local_file")
+            .attr
+            .description = Some(crate::model_guidance::inspect_tool_description().into());
         for entry in ToolManifest::entries() {
             if !entry.group.enabled(options.enable_shell) {
                 tool_router.remove_route(entry.name);
             }
+        }
+        // Every consumer of a tool definition reads it back out of this router — the
+        // stdio `tools/list` answer, `tool_definitions`, and the contract hashes doctor
+        // compares across processes. Normalizing here keeps all of them on one shape;
+        // doing it in `tool_definitions` instead would make doctor compare a normalized
+        // expectation against an underived wire answer.
+        for route in tool_router.map.values_mut() {
+            route.attr.input_schema = Arc::new(crate::tool_schema::normalize_published_schema(
+                &route.attr.input_schema,
+            ));
         }
         let definitions = tool_router.list_all();
         ToolManifest::validate(&definitions, options.enable_shell)
@@ -168,29 +186,19 @@ impl Default for FastCtxServer {
 #[tool_router(router = file_tool_router, vis = "pub(crate)")]
 impl FastCtxServer {
     #[tool(
-        name = "read",
-        description = "Read one file (text, image, or PDF) or a batch of text files from the local
-filesystem. Paths must be absolute. Text returns 1-based `N<tab>content`
-lines, as much of the file as the output budget holds. For several text
-files in one call, pass files=[{\"path\": ...}, ...] instead of file_path:
-one token budget, per-file problems reported inline without failing the
-batch, and a Partial note returns the exact files array for the next call.
-Images (PNG/JPG/GIF/WebP/BMP) are shown to you visually. PDFs return the
-selected pages' text layer or those pages rendered as images; image mode
-defaults to 4 pages. view=\"hex\" dumps any file's raw bytes. PDFs, images,
-and hex view are single-file only. Text output is always UTF-8; when
-auto-detection is not confident it returns an error listing candidate
-encodings instead of guessed text, so pass encoding only then. Text, PDF,
-and hex responses end with a Complete or Partial status — continue only
-with the exact parameters a Partial note provides.",
+        name = "inspect_local_file",
+        description = "Inspect local files.",
         annotations(
-            title = "Read local file",
+            title = "Inspect local file",
             read_only_hint = true,
             destructive_hint = false,
             open_world_hint = false
         )
     )]
-    async fn read(&self, Parameters(request): Parameters<ReadRequest>) -> CallToolResult {
+    async fn inspect_local_file(
+        &self,
+        Parameters(request): Parameters<ReadRequest>,
+    ) -> CallToolResult {
         let _activity = self.activity.request();
         let status_shell = self.shell.clone();
         run_blocking(
@@ -240,7 +248,7 @@ with the exact parameters a Partial note provides.",
 
     #[tool(
         name = "glob",
-        description = "Find files by glob pattern, e.g. \"**/*.rs\" or \"src/**/*.ts\". Returns absolute\npaths sorted by path (or newest first with sort=\"modified\"), 100 per page by\ndefault. filter_mode defaults to \"project\" (respects .gitignore, skips .git);\n\"all\" lists everything. Omit `path` entirely for the session working directory\n— never pass \"null\" or \"undefined\". A path component of the form ~fastctx~b...~\n(reversible bytes/UTF-8) or ~fastctx~w...~ (Windows UTF-16) is a filename\nescape; copy that whole component verbatim in later calls and do not decode or\nrewrite it. The last line of every successful result states Complete or Partial\n— continue only with the exact offset a Partial note provides; errors are\nself-contained.",
+        description = "Find files by glob pattern, e.g. \"**/*.rs\" or \"src/**/*.ts\". Matches files\nonly, never directories. Returns absolute\npaths sorted by path (or newest first with sort=\"modified\"), 100 per page by\ndefault. filter_mode defaults to \"project\" (respects .gitignore, skips .git);\n\"all\" lists everything. Omit `path` entirely for the session working directory\n— never pass \"null\" or \"undefined\". A path component of the form ~fastctx~b...~\n(reversible bytes/UTF-8) or ~fastctx~w...~ (Windows UTF-16) is a filename\nescape; copy that whole component verbatim in later calls and do not decode or\nrewrite it. The last line of every successful result states Complete or Partial\n— continue only with the exact offset a Partial note provides; errors are\nself-contained.",
         annotations(
             title = "Match file paths",
             read_only_hint = true,
@@ -286,11 +294,9 @@ impl ServerHandler for FastCtxServer {
             // blurb and may keep only its first line and first 250 characters, so this text
             // has to introduce the toolset within that budget. Behavioural rules belong in
             // the host guidance file, which has no such limit.
-            .with_instructions(if self.options.enable_shell {
-                "Local-file tools: read (one file or a batch), grep (content search), glob (find paths), replace (mechanical find-and-replace), plus POSIX-bash shell tools. Pass absolute paths."
-            } else {
-                "Local-file tools: read (one file or a batch), grep (content search), glob (find paths), and replace (mechanical find-and-replace). Pass absolute paths."
-            })
+            .with_instructions(crate::model_guidance::server_instructions(
+                self.options.enable_shell,
+            ))
     }
 
     // The three `resources/*` methods stay on the rmcp defaults on purpose: both list methods

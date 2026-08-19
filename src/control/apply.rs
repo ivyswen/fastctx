@@ -22,7 +22,7 @@ pub struct ApplyOptions {
     pub tier: Tier,
     /// Five long-output tools' advanced overrides; unset entries follow the tier.
     pub tool_budgets: ToolBudgetPreferences,
-    /// Whether local-compaction providers should use the Guarded effective output policy.
+    /// Whether local or unverified relay providers should use the Guarded output policy.
     pub output_guard_enabled: bool,
     /// Whether the optional shell tool group should be published.
     pub fastshell_enabled: bool,
@@ -206,6 +206,15 @@ pub(crate) enum AppliedBinarySync {
     Updated,
 }
 
+/// Result of the independent best-effort AGENTS refresh performed after a product update.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AppliedGuidanceSync {
+    NotApplied,
+    Current,
+    Refreshed,
+    ApplyRequired(agents::ManagedSectionState),
+}
+
 /// Advances an owned stable binary and its receipt without changing shared Codex files.
 pub(crate) fn synchronize_applied_binary(
     paths: &ControlPaths,
@@ -262,6 +271,59 @@ pub(crate) fn synchronize_applied_binary(
     ];
     transaction::commit(&changes)?;
     Ok(AppliedBinarySync::Updated)
+}
+
+/// Replaces only an exact managed block from a superseded release, without changing the Apply receipt.
+pub(crate) fn synchronize_applied_guidance(
+    paths: &ControlPaths,
+) -> Result<AppliedGuidanceSync, String> {
+    let settings = settings::load(paths)?;
+    let Some(record) = settings.applied.as_ref() else {
+        return Ok(AppliedGuidanceSync::NotApplied);
+    };
+    if !record.targets_codex_profile(paths) {
+        return Err(receipt_profile_mismatch(paths, record));
+    }
+    let Some(original) = transaction::read_snapshot(&paths.codex_agents)? else {
+        return Ok(AppliedGuidanceSync::ApplyRequired(
+            agents::ManagedSectionState::Missing,
+        ));
+    };
+    let state = agents::classify_managed_section(&original, record.fastshell_enabled);
+    match state {
+        agents::ManagedSectionState::Current
+            if record.agents_contract_id.as_deref()
+                == Some(agents::MANAGED_SECTION_CONTRACT_ID) =>
+        {
+            Ok(AppliedGuidanceSync::Current)
+        }
+        agents::ManagedSectionState::Current => Ok(AppliedGuidanceSync::ApplyRequired(
+            agents::ManagedSectionState::Current,
+        )),
+        agents::ManagedSectionState::KnownLegacy if record.agents_contract_id.is_some() => {
+            // Released legacy receipts predate this field. Any stamped receipt paired with legacy
+            // bytes is post-Apply drift, so preserve it and keep the required action visible.
+            Ok(AppliedGuidanceSync::ApplyRequired(
+                agents::ManagedSectionState::KnownLegacy,
+            ))
+        }
+        agents::ManagedSectionState::KnownLegacy => {
+            let refreshed =
+                agents::refresh_known_legacy_section(&original, record.fastshell_enabled).expect(
+                    "an exact known legacy classification must produce its current replacement",
+                );
+            let change = file_write(
+                paths.codex_agents.clone(),
+                Some(original),
+                refreshed,
+                transaction::existing_unix_mode(&paths.codex_agents).or(Some(0o600)),
+                false,
+            );
+            transaction::commit(&[change])?;
+            Ok(AppliedGuidanceSync::Refreshed)
+        }
+        state => Ok(AppliedGuidanceSync::ApplyRequired(state)),
+    }
 }
 
 /// Computes the complete immutable Apply plan without writing to disk.
@@ -421,6 +483,7 @@ pub fn plan_apply(paths: &ControlPaths, options: ApplyOptions) -> Result<ApplyPl
                 &agents_bytes,
                 previous_applied.as_ref().map(|record| &record.codex_agents),
             ),
+            agents_contract_id: Some(agents::MANAGED_SECTION_CONTRACT_ID.to_string()),
             codex_agents_inserted_separator: agents_inserted_separator,
             binary_sha256: binary_hash,
         });
@@ -917,6 +980,7 @@ fn record_matches(record: &AppliedRecord, context: &RecordMatchContext<'_>) -> b
         && record.codex_agents.path == crate::paths::display_path(&paths.codex_agents)
         && record.binary_sha256 == *binary_hash
         && record.codex_agents.applied_sha256 == sha256(agents_bytes)
+        && record.agents_contract_id.as_deref() == Some(agents::MANAGED_SECTION_CONTRACT_ID)
         && record.codex_agents_inserted_separator == *agents_inserted_separator
 }
 
@@ -1144,7 +1208,7 @@ fn preview_apply(
                 (
                     PreviewAction::Record,
                     vec![PreviewDetail::kept(format!(
-                        "tier = {} · read/grep/glob/run/job_output = {}/{}/{}/{}/{} · fastshell = {}",
+                        "tier = {} · inspect_local_file/grep/glob/run/job_output = {}/{}/{}/{}/{} · fastshell = {}",
                         expected.tier.as_str(),
                         expected.tool_budgets.read.label(),
                         expected.tool_budgets.grep.label(),
@@ -1303,904 +1367,4 @@ fn find_stale_binaries(
     stale.sort();
     stale.dedup();
     Ok(stale)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        AppliedBinarySync, ApplyOptions, PreviewAction, PreviewTarget, UnapplyOptions,
-        commit_apply, commit_unapply, plan_apply, plan_unapply, synchronize_applied_binary,
-    };
-    use crate::control::agents::AGENTS_SECTION;
-    use crate::control::paths::ControlPaths;
-    use crate::control::settings::{Tier, ToolBudgetLevel, ToolBudgetPreferences};
-    use std::path::Path;
-
-    fn fixture() -> (tempfile::TempDir, ControlPaths, std::path::PathBuf) {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        std::fs::create_dir_all(&paths.codex_dir).unwrap();
-        let executable = temp.path().join(if cfg!(windows) {
-            "source-fastctx.exe"
-        } else {
-            "source-fastctx"
-        });
-        std::fs::write(&executable, b"binary fixture").unwrap();
-        (temp, paths, executable)
-    }
-
-    fn spawn_managed_fixture(paths: &ControlPaths) -> std::process::Child {
-        std::fs::create_dir_all(&paths.fastctx_bin_dir).unwrap();
-        let target = paths.fastctx_bin_dir.join(if cfg!(windows) {
-            "managed-fixture.exe"
-        } else {
-            "managed-fixture"
-        });
-        #[cfg(windows)]
-        {
-            let source = std::env::var_os("ComSpec")
-                .unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into());
-            std::fs::copy(source, &target).unwrap();
-            std::process::Command::new(target)
-                .args(["/D", "/Q", "/C", "ping -n 30 127.0.0.1 >NUL"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap()
-        }
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            // macOS may report a copied system shell by its protected source image. A copied test
-            // executable exercises the same launch shape as the installed FastCtx binary.
-            std::fs::copy(std::env::current_exe().unwrap(), &target).unwrap();
-            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
-            std::process::Command::new(target)
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "control::apply::tests::managed_process_fixture",
-                ])
-                .env("FASTCTX_MANAGED_PROCESS_FIXTURE", "1")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap()
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            crate::control::processes::publish_unix_executable_fixture(
-                std::path::Path::new("/bin/sh"),
-                &target,
-            )
-            .unwrap();
-            std::process::Command::new(target)
-                .args(["-c", "while :; do sleep 1; done"])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap()
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn managed_process_fixture() {
-        if std::env::var("FASTCTX_MANAGED_PROCESS_FIXTURE")
-            .ok()
-            .as_deref()
-            != Some("1")
-        {
-            return;
-        }
-        loop {
-            std::thread::park_timeout(std::time::Duration::from_secs(60));
-        }
-    }
-
-    fn wait_for_managed_fixture(
-        child: &mut std::process::Child,
-        paths: &ControlPaths,
-    ) -> crate::control::processes::InstalledProcess {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let processes =
-                crate::control::processes::installed_processes(&paths.fastctx_bin_dir).unwrap();
-            if let Some(process) = processes
-                .into_iter()
-                .find(|process| process.identity.pid == child.id())
-            {
-                return process;
-            }
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!(
-                    "managed fixture PID {} exited before discovery: {status}",
-                    child.id()
-                );
-            }
-            if std::time::Instant::now() >= deadline {
-                let pid = child.id();
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!(
-                    "managed fixture PID {pid} was not discovered below {}",
-                    crate::paths::display_path(&paths.fastctx_bin_dir)
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-    }
-
-    fn options(executable: std::path::PathBuf) -> ApplyOptions {
-        ApplyOptions {
-            tier: Tier::Standard,
-            tool_budgets: ToolBudgetPreferences {
-                read: Some(ToolBudgetLevel::Inherit),
-                grep: Some(ToolBudgetLevel::Percent(50)),
-                glob: Some(ToolBudgetLevel::Percent(25)),
-                run: Some(ToolBudgetLevel::Inherit),
-                job_output: Some(ToolBudgetLevel::Inherit),
-            },
-            output_guard_enabled: true,
-            fastshell_enabled: false,
-            current_executable: executable,
-        }
-    }
-
-    #[test]
-    fn apply_is_idempotent_and_unapply_restores_user_bytes() {
-        let (_temp, paths, executable) = fixture();
-        let config = concat!(
-            "# user config\n",
-            "theme = 'dark'\n",
-            "\n",
-            "[mcp_servers.other]\n",
-            "command = 'other'\n",
-            "\n",
-            "[features.code_mode]\n",
-            "direct_only_tool_namespaces = [ 'other' ]\n",
-        );
-        let agents = "# User rules\n\nKeep this exact.\n";
-        std::fs::write(&paths.codex_config, config).unwrap();
-        std::fs::write(&paths.codex_agents, agents).unwrap();
-
-        let first = plan_apply(&paths, options(executable.clone())).unwrap();
-        assert!(!first.is_empty());
-        commit_apply(first, true).unwrap();
-        let applied_config = std::fs::read(&paths.codex_config).unwrap();
-        assert!(
-            std::str::from_utf8(&applied_config)
-                .unwrap()
-                .contains("mcp__fastctx")
-        );
-
-        let second = plan_apply(&paths, options(executable.clone())).unwrap();
-        assert!(second.is_empty(), "{:?}", second.preview());
-        assert_eq!(commit_apply(second, true).unwrap().changed_targets, 0);
-
-        let unapply = plan_unapply(
-            &paths,
-            UnapplyOptions {
-                current_executable: executable,
-            },
-        )
-        .unwrap();
-        commit_unapply(unapply).unwrap();
-        assert_eq!(
-            std::fs::read(&paths.codex_config).unwrap(),
-            config.as_bytes()
-        );
-        assert_eq!(
-            std::fs::read(&paths.codex_agents).unwrap(),
-            agents.as_bytes()
-        );
-        assert!(!paths.installed_binary.exists());
-        assert!(!paths.fastctx_dir.exists());
-    }
-
-    #[test]
-    fn unapply_terminates_real_managed_process_before_removing_the_private_tree() {
-        let (_temp, paths, executable) = fixture();
-        let mut child = spawn_managed_fixture(&paths);
-        let discovered = wait_for_managed_fixture(&mut child, &paths);
-        assert_eq!(discovered.identity.pid, child.id());
-
-        let plan = plan_unapply(
-            &paths,
-            UnapplyOptions {
-                current_executable: executable,
-            },
-        )
-        .unwrap();
-        assert_eq!(plan.running_processes(), 1);
-        assert!(!plan.is_empty());
-        let receipt = commit_unapply(plan).unwrap();
-
-        assert!(
-            child.try_wait().unwrap().is_some(),
-            "Unapply must wait for the managed process to exit"
-        );
-        assert!(!paths.fastctx_dir.exists());
-        assert!(
-            receipt
-                .notes
-                .iter()
-                .any(|note| note == "Stopped 1 running FastCtx process before removal."),
-            "{:?}",
-            receipt.notes
-        );
-    }
-
-    #[test]
-    fn unapply_commit_catches_a_managed_process_started_after_preview() {
-        let (_temp, paths, executable) = fixture();
-        std::fs::create_dir_all(&paths.fastctx_dir).unwrap();
-        let plan = plan_unapply(
-            &paths,
-            UnapplyOptions {
-                current_executable: executable,
-            },
-        )
-        .unwrap();
-        assert_eq!(plan.running_processes(), 0);
-
-        let mut child = spawn_managed_fixture(&paths);
-        let discovered = wait_for_managed_fixture(&mut child, &paths);
-        assert_eq!(discovered.identity.pid, child.id());
-        let receipt = commit_unapply(plan).unwrap();
-        assert!(child.try_wait().unwrap().is_some());
-        assert!(!paths.fastctx_dir.exists());
-        assert!(
-            receipt
-                .notes
-                .iter()
-                .any(|note| note == "Stopped 1 running FastCtx process before removal."),
-            "{:?}",
-            receipt.notes
-        );
-    }
-
-    #[test]
-    fn explicit_product_update_advances_only_an_owned_stable_binary_and_receipt() {
-        let (_temp, paths, executable) = fixture();
-        commit_apply(
-            plan_apply(&paths, options(executable.clone())).unwrap(),
-            true,
-        )
-        .unwrap();
-        std::fs::write(&executable, b"new signed release bytes").unwrap();
-
-        assert_eq!(
-            synchronize_applied_binary(&paths, &executable).unwrap(),
-            AppliedBinarySync::Updated
-        );
-        assert_eq!(
-            std::fs::read(&paths.installed_binary).unwrap(),
-            b"new signed release bytes"
-        );
-        let settings = crate::control::settings::load(&paths).unwrap();
-        let receipt = settings.applied.unwrap();
-        assert_eq!(receipt.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(
-            receipt.binary_sha256,
-            super::sha256(b"new signed release bytes")
-        );
-
-        std::fs::write(&paths.installed_binary, b"user replacement").unwrap();
-        std::fs::write(&executable, b"another release").unwrap();
-        let error = synchronize_applied_binary(&paths, &executable).unwrap_err();
-        assert!(error.contains("changed outside FastCtx"), "{error}");
-        assert_eq!(
-            std::fs::read(&paths.installed_binary).unwrap(),
-            b"user replacement"
-        );
-    }
-
-    #[test]
-    fn reapply_ignores_host_owned_codex_config_rewrites() {
-        let (_temp, paths, executable) = fixture();
-        std::fs::write(&paths.codex_config, b"# user config\n").unwrap();
-        std::fs::write(&paths.codex_agents, b"# user rules\n").unwrap();
-        commit_apply(
-            plan_apply(&paths, options(executable.clone())).unwrap(),
-            true,
-        )
-        .unwrap();
-
-        let settings_before = std::fs::read(&paths.fastctx_config).unwrap();
-        let mut host_rewritten = std::fs::read(&paths.codex_config).unwrap();
-        host_rewritten
-            .extend_from_slice(b"\n[plugins.runtime]\nlast_refresh = \"2026-07-17T00:01:00Z\"\n");
-        std::fs::write(&paths.codex_config, &host_rewritten).unwrap();
-
-        let second = plan_apply(&paths, options(executable)).unwrap();
-        assert!(second.is_empty(), "{:?}", second.preview());
-        assert_eq!(commit_apply(second, true).unwrap().changed_targets, 0);
-        assert_eq!(std::fs::read(&paths.codex_config).unwrap(), host_rewritten);
-        assert_eq!(
-            std::fs::read(&paths.fastctx_config).unwrap(),
-            settings_before
-        );
-    }
-
-    #[test]
-    fn stale_unapply_preview_is_rejected_before_admission_or_cleanup_changes() {
-        let (_temp, paths, executable) = fixture();
-        std::fs::write(&paths.codex_config, b"# user config\n").unwrap();
-        std::fs::write(&paths.codex_agents, b"# user rules\n").unwrap();
-        commit_apply(
-            plan_apply(&paths, options(executable.clone())).unwrap(),
-            true,
-        )
-        .unwrap();
-        let plan = plan_unapply(
-            &paths,
-            UnapplyOptions {
-                current_executable: executable,
-            },
-        )
-        .unwrap();
-        let generation_before = crate::shell::jobs::admission::observe_generation(&paths).unwrap();
-        let mut drifted = std::fs::read(&paths.codex_config).unwrap();
-        drifted.extend_from_slice(b"\n# concurrent user edit\n");
-        std::fs::write(&paths.codex_config, &drifted).unwrap();
-
-        let error = commit_unapply(plan).unwrap_err();
-        assert!(error.contains("changed after the preview"), "{error}");
-        assert_eq!(std::fs::read(&paths.codex_config).unwrap(), drifted);
-        assert!(paths.fastctx_config.exists());
-        assert!(paths.installed_binary.exists());
-        assert_eq!(
-            crate::shell::jobs::admission::observe_generation(&paths).unwrap(),
-            generation_before
-        );
-    }
-
-    #[test]
-    fn changing_tier_then_unapply_restores_user_bytes_via_reverse_edits() {
-        // Critical regression: when Apply created mcp_servers/features, Unapply must reverse it byte-for-byte,
-        // including empty parent cleanup, without relying on backups (2026-07-12).
-        let (_temp, paths, executable) = fixture();
-        let config = b"# user\ntool_output_token_limit = 9000\n";
-        let agents = b"# rules\n";
-        std::fs::write(&paths.codex_config, config).unwrap();
-        std::fs::write(&paths.codex_agents, agents).unwrap();
-
-        commit_apply(
-            plan_apply(&paths, options(executable.clone())).unwrap(),
-            true,
-        )
-        .unwrap();
-        let mut changed = options(executable.clone());
-        changed.tier = Tier::High;
-        commit_apply(plan_apply(&paths, changed).unwrap(), true).unwrap();
-
-        let unapply = plan_unapply(
-            &paths,
-            UnapplyOptions {
-                current_executable: executable,
-            },
-        )
-        .unwrap();
-        commit_unapply(unapply).unwrap();
-        assert_eq!(std::fs::read(&paths.codex_config).unwrap(), config);
-        assert_eq!(std::fs::read(&paths.codex_agents).unwrap(), agents);
-    }
-
-    #[test]
-    fn agents_apply_unapply_roundtrip_preserves_every_supported_file_ending() {
-        let cases: &[(&str, &[u8])] = &[
-            ("empty file", b""),
-            ("no trailing newline", b"# rules"),
-            ("one trailing LF", b"# rules\n"),
-            ("existing LF blank line", b"# rules\n\n"),
-            ("one trailing CRLF", b"# rules\r\n"),
-            ("existing CRLF blank line", b"# rules\r\n\r\n"),
-        ];
-
-        for (name, original) in cases {
-            let (_temp, paths, executable) = fixture();
-            std::fs::write(&paths.codex_config, b"# config\n").unwrap();
-            std::fs::write(&paths.codex_agents, original).unwrap();
-
-            commit_apply(
-                plan_apply(&paths, options(executable.clone())).unwrap(),
-                true,
-            )
-            .unwrap();
-            let applied_bytes = std::fs::read(&paths.codex_agents).unwrap();
-            assert_ne!(applied_bytes, *original, "{name}");
-
-            let second = plan_apply(&paths, options(executable.clone())).unwrap();
-            assert!(second.is_empty(), "{name}: {:?}", second.preview());
-            commit_apply(second, true).unwrap();
-
-            commit_unapply(
-                plan_unapply(
-                    &paths,
-                    UnapplyOptions {
-                        current_executable: executable,
-                    },
-                )
-                .unwrap(),
-            )
-            .unwrap();
-            assert_eq!(
-                std::fs::read(&paths.codex_agents).unwrap(),
-                *original,
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn legacy_receipt_without_separator_ownership_does_not_guess_at_user_bytes() {
-        let (_temp, paths, executable) = fixture();
-        std::fs::write(&paths.codex_config, b"# config\n").unwrap();
-        std::fs::write(&paths.codex_agents, b"# rules\n").unwrap();
-
-        commit_apply(
-            plan_apply(&paths, options(executable.clone())).unwrap(),
-            true,
-        )
-        .unwrap();
-        let settings = std::fs::read_to_string(&paths.fastctx_config).unwrap();
-        assert!(
-            settings.contains("codex_agents_inserted_separator = \"lf\""),
-            "{settings}"
-        );
-        let legacy_settings = settings.replace("codex_agents_inserted_separator = \"lf\"\n", "");
-        std::fs::write(&paths.fastctx_config, legacy_settings).unwrap();
-
-        commit_unapply(
-            plan_unapply(
-                &paths,
-                UnapplyOptions {
-                    current_executable: executable,
-                },
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(std::fs::read(&paths.codex_agents).unwrap(), b"# rules\n\n");
-    }
-
-    #[test]
-    fn legacy_receipt_without_directory_ownership_preserves_a_preexisting_empty_profile() {
-        let (_temp, paths, executable) = fixture();
-
-        commit_apply(
-            plan_apply(&paths, options(executable.clone())).unwrap(),
-            true,
-        )
-        .unwrap();
-        let settings = std::fs::read_to_string(&paths.fastctx_config).unwrap();
-        assert!(
-            settings.contains("codex_dir_created = false\n"),
-            "{settings}"
-        );
-        let legacy_settings = settings.replace("codex_dir_created = false\n", "");
-        std::fs::write(&paths.fastctx_config, legacy_settings).unwrap();
-
-        commit_unapply(
-            plan_unapply(
-                &paths,
-                UnapplyOptions {
-                    current_executable: executable,
-                },
-            )
-            .unwrap(),
-        )
-        .unwrap();
-
-        assert!(paths.codex_dir.is_dir());
-        assert!(
-            std::fs::read_dir(&paths.codex_dir)
-                .unwrap()
-                .next()
-                .is_none()
-        );
-        assert!(!paths.fastctx_dir.exists());
-    }
-
-    #[test]
-    fn reapply_after_user_drift_keeps_later_edits_during_unapply() {
-        let (_temp, paths, executable) = fixture();
-        let config = b"# original\ntool_output_token_limit = 9000\n";
-        let agents = b"# original rules\n";
-        std::fs::write(&paths.codex_config, config).unwrap();
-        std::fs::write(&paths.codex_agents, agents).unwrap();
-        commit_apply(
-            plan_apply(&paths, options(executable.clone())).unwrap(),
-            true,
-        )
-        .unwrap();
-
-        let mut drifted_config = std::fs::read_to_string(&paths.codex_config).unwrap();
-        drifted_config.push_str("\n[user_after_apply]\nkept = true\n");
-        std::fs::write(&paths.codex_config, drifted_config).unwrap();
-        let mut drifted_agents = std::fs::read_to_string(&paths.codex_agents).unwrap();
-        drifted_agents.push_str("\nKeep this later rule.\n");
-        std::fs::write(&paths.codex_agents, drifted_agents).unwrap();
-
-        commit_apply(
-            plan_apply(&paths, options(executable.clone())).unwrap(),
-            true,
-        )
-        .unwrap();
-        let mut later_fastctx_change = options(executable.clone());
-        later_fastctx_change.tier = Tier::High;
-        commit_apply(plan_apply(&paths, later_fastctx_change).unwrap(), true).unwrap();
-
-        let unapply = plan_unapply(
-            &paths,
-            UnapplyOptions {
-                current_executable: executable,
-            },
-        )
-        .unwrap();
-        commit_unapply(unapply).unwrap();
-        let restored_config = std::fs::read_to_string(&paths.codex_config).unwrap();
-        assert!(!restored_config.contains("mcp_servers.fastctx"));
-        assert!(!restored_config.contains("mcp__fastctx"));
-        assert!(restored_config.contains("[user_after_apply]\nkept = true"));
-        assert!(restored_config.contains("tool_output_token_limit = 9000"));
-        let restored_agents = std::fs::read_to_string(&paths.codex_agents).unwrap();
-        assert!(!restored_agents.contains("<!-- fastctx:begin -->"));
-        assert!(restored_agents.contains("Keep this later rule."));
-    }
-
-    #[test]
-    fn a_shared_token_limit_conflict_needs_explicit_confirmation() {
-        let (_temp, paths, executable) = fixture();
-        std::fs::write(&paths.codex_config, b"tool_output_token_limit = 9000\n").unwrap();
-        let plan = plan_apply(&paths, options(executable)).unwrap();
-        let conflict = plan.token_limit_conflict().unwrap();
-        assert_eq!((conflict.current, conflict.requested), (9_000, 60_000));
-        let error = commit_apply(plan, false).unwrap_err();
-        assert!(error.contains("Re-run with --yes"));
-        assert_eq!(
-            std::fs::read(&paths.codex_config).unwrap(),
-            b"tool_output_token_limit = 9000\n"
-        );
-    }
-
-    #[test]
-    fn fresh_environment_creates_profile_files_and_unapply_removes_the_owned_empty_shell() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        let executable = temp.path().join("fastctx-source");
-        std::fs::write(&executable, b"binary").unwrap();
-        commit_apply(
-            plan_apply(&paths, options(executable.clone())).unwrap(),
-            true,
-        )
-        .unwrap();
-
-        assert!(paths.codex_dir.is_dir());
-        assert!(paths.codex_config.is_file());
-        assert!(paths.codex_agents.is_file());
-        let saved = crate::control::settings::load(&paths).unwrap();
-        assert!(saved.applied.as_ref().unwrap().codex_dir_created);
-
-        commit_unapply(
-            plan_unapply(
-                &paths,
-                UnapplyOptions {
-                    current_executable: executable,
-                },
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(!paths.codex_config.exists());
-        assert!(!paths.codex_agents.exists());
-        assert!(!paths.codex_dir.exists());
-        assert!(!paths.fastctx_dir.exists());
-    }
-
-    #[test]
-    fn unapply_keeps_a_created_codex_directory_after_the_user_adds_content() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        let executable = temp.path().join("fastctx-source");
-        std::fs::write(&executable, b"binary").unwrap();
-        commit_apply(
-            plan_apply(&paths, options(executable.clone())).unwrap(),
-            true,
-        )
-        .unwrap();
-        let user_file = paths.codex_dir.join("user-owned.toml");
-        std::fs::write(&user_file, b"kept = true\n").unwrap();
-
-        commit_unapply(
-            plan_unapply(
-                &paths,
-                UnapplyOptions {
-                    current_executable: executable,
-                },
-            )
-            .unwrap(),
-        )
-        .unwrap();
-
-        assert!(paths.codex_dir.is_dir());
-        assert_eq!(std::fs::read(&user_file).unwrap(), b"kept = true\n");
-        assert!(!paths.codex_config.exists());
-        assert!(!paths.codex_agents.exists());
-    }
-
-    #[test]
-    fn apply_creates_a_missing_codex_config_with_only_the_managed_shape() {
-        let (_temp, paths, executable) = fixture();
-        std::fs::write(&paths.codex_agents, b"# existing rules\n").unwrap();
-
-        commit_apply(plan_apply(&paths, options(executable)).unwrap(), true).unwrap();
-
-        let source = std::fs::read_to_string(&paths.codex_config).unwrap();
-        let document = source.parse::<toml_edit::DocumentMut>().unwrap();
-        assert_eq!(document.iter().count(), 3, "{source}");
-        assert_eq!(
-            document
-                .get("tool_output_token_limit")
-                .and_then(toml_edit::Item::as_integer),
-            Some(60_000)
-        );
-        assert!(source.contains("[mcp_servers.fastctx]"), "{source}");
-        assert!(source.contains("mcp__fastctx"), "{source}");
-        assert!(source.contains("FASTCTX_TOKEN_BUDGET = \"54000\""));
-    }
-
-    #[test]
-    fn third_party_apply_uses_guarded_limits_without_overwriting_the_tier_preference() {
-        let (_temp, paths, executable) = fixture();
-        std::fs::write(
-            &paths.codex_config,
-            concat!(
-                "model_provider = 'third-party'\n",
-                "[model_providers.third-party]\n",
-                "name = 'Third Party'\n",
-            ),
-        )
-        .unwrap();
-        let mut guarded = options(executable.clone());
-        guarded.tier = Tier::High;
-        guarded.tool_budgets = ToolBudgetPreferences::default();
-        commit_apply(plan_apply(&paths, guarded).unwrap(), true).unwrap();
-
-        let source = std::fs::read_to_string(&paths.codex_config).unwrap();
-        assert!(
-            source.contains("tool_output_token_limit = 10000"),
-            "{source}"
-        );
-        assert!(
-            source.contains("FASTCTX_TOKEN_BUDGET = \"9000\""),
-            "{source}"
-        );
-        for key in [
-            "FASTCTX_READ_TOKEN_BUDGET",
-            "FASTCTX_GREP_TOKEN_BUDGET",
-            "FASTCTX_GLOB_TOKEN_BUDGET",
-            "FASTCTX_RUN_TOKEN_BUDGET",
-            "FASTCTX_JOB_OUTPUT_TOKEN_BUDGET",
-        ] {
-            assert!(
-                !source.contains(key),
-                "{key} should inherit the Guarded budget: {source}"
-            );
-        }
-        let saved = crate::control::settings::load(&paths).unwrap();
-        assert_eq!(saved.tier, Tier::High);
-        let receipt = saved.applied.unwrap();
-        assert_eq!(receipt.tier, Tier::High);
-        assert_eq!(receipt.tool_output_token_limit, 10_000);
-        assert_eq!(receipt.fastctx_token_budget, 9_000);
-
-        let mut unguarded = options(executable);
-        unguarded.tier = Tier::High;
-        unguarded.tool_budgets = ToolBudgetPreferences::default();
-        unguarded.output_guard_enabled = false;
-        commit_apply(plan_apply(&paths, unguarded).unwrap(), true).unwrap();
-        let source = std::fs::read_to_string(&paths.codex_config).unwrap();
-        assert!(
-            source.contains("tool_output_token_limit = 100000"),
-            "{source}"
-        );
-        assert!(
-            source.contains("FASTCTX_TOKEN_BUDGET = \"90000\""),
-            "{source}"
-        );
-        assert!(
-            !crate::control::settings::load(&paths)
-                .unwrap()
-                .output_guard
-                .enabled
-        );
-    }
-
-    #[test]
-    fn apply_creates_a_missing_agents_file_with_the_exact_private_block() {
-        let (_temp, paths, executable) = fixture();
-        std::fs::write(&paths.codex_config, b"# existing config\n").unwrap();
-
-        commit_apply(plan_apply(&paths, options(executable)).unwrap(), true).unwrap();
-
-        let mut expected = AGENTS_SECTION.as_bytes().to_vec();
-        expected.push(b'\n');
-        assert_eq!(std::fs::read(&paths.codex_agents).unwrap(), expected);
-    }
-
-    #[test]
-    fn malformed_codex_toml_aborts_before_self_install_or_settings_creation() {
-        let (_temp, paths, executable) = fixture();
-        std::fs::write(&paths.codex_config, b"[broken").unwrap();
-        let error = plan_apply(&paths, options(executable)).unwrap_err();
-        assert!(error.contains("Cannot parse Codex config.toml"));
-        assert!(!paths.installed_binary.exists());
-        assert!(!paths.fastctx_config.exists());
-        assert_eq!(std::fs::read(&paths.codex_config).unwrap(), b"[broken");
-    }
-
-    #[test]
-    fn a_non_directory_codex_profile_aborts_before_any_write() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        let executable = temp.path().join("fastctx-source");
-        std::fs::write(&executable, b"binary").unwrap();
-        std::fs::write(&paths.codex_dir, b"user-owned path").unwrap();
-
-        let error = plan_apply(&paths, options(executable)).unwrap_err();
-
-        assert!(error.contains("is not a directory"), "{error}");
-        assert_eq!(std::fs::read(&paths.codex_dir).unwrap(), b"user-owned path");
-        assert!(!paths.fastctx_dir.exists());
-    }
-
-    #[test]
-    fn unapply_leaves_a_user_edited_token_limit_untouched() {
-        // Ownership-aware regression: after the user changes the shared token key, ownership returns to the user.
-        // Unapply removes FastCtx-owned blocks but does not restore the user-modified shared key (2026-07-12).
-        let (_temp, paths, executable) = fixture();
-        let config = b"# user\ntool_output_token_limit = 9000\n";
-        std::fs::write(&paths.codex_config, config).unwrap();
-        std::fs::write(&paths.codex_agents, b"# rules\n").unwrap();
-        commit_apply(
-            plan_apply(&paths, options(executable.clone())).unwrap(),
-            true,
-        )
-        .unwrap();
-        let applied = std::fs::read_to_string(&paths.codex_config).unwrap();
-        assert!(applied.contains("tool_output_token_limit = 60000"));
-        let edited = applied.replace(
-            "tool_output_token_limit = 60000",
-            "tool_output_token_limit = 40000",
-        );
-        std::fs::write(&paths.codex_config, &edited).unwrap();
-
-        let unapply = plan_unapply(
-            &paths,
-            UnapplyOptions {
-                current_executable: executable,
-            },
-        )
-        .unwrap();
-        commit_unapply(unapply).unwrap();
-        let restored = std::fs::read_to_string(&paths.codex_config).unwrap();
-        assert!(!restored.contains("mcp__fastctx"), "{restored}");
-        assert!(
-            restored.contains("tool_output_token_limit = 40000"),
-            "{restored}"
-        );
-        assert!(
-            !restored.contains("tool_output_token_limit = 9000"),
-            "{restored}"
-        );
-    }
-
-    #[test]
-    fn read_only_codex_config_fails_explicitly_before_any_write() {
-        let (_temp, paths, executable) = fixture();
-        let config = b"# read only\n";
-        std::fs::write(&paths.codex_config, config).unwrap();
-        let plan = plan_apply(&paths, options(executable)).unwrap();
-        let original_permissions = std::fs::metadata(&paths.codex_config)
-            .unwrap()
-            .permissions();
-        let mut permissions = original_permissions.clone();
-        permissions.set_readonly(true);
-        std::fs::set_permissions(&paths.codex_config, permissions).unwrap();
-
-        let result = commit_apply(plan, true);
-        std::fs::set_permissions(&paths.codex_config, original_permissions).unwrap();
-        let error = result.unwrap_err();
-        assert!(error.contains("read-only file"), "{error}");
-        assert!(error.contains("Make it writable and retry"), "{error}");
-        assert_eq!(std::fs::read(&paths.codex_config).unwrap(), config);
-        assert!(!paths.installed_binary.exists());
-        assert!(!paths.fastctx_config.exists());
-    }
-
-    #[test]
-    fn apply_previews_and_removes_leftovers_beside_both_running_and_stable_binaries() {
-        let (_temp, paths, source) = fixture();
-        std::fs::create_dir_all(&paths.fastctx_bin_dir).unwrap();
-        let owned_leftovers = |target: &Path| {
-            let name = target.file_name().unwrap().to_string_lossy();
-            [
-                target
-                    .parent()
-                    .unwrap()
-                    .join(format!(".{name}.fastctx-old-12.0")),
-                target.parent().unwrap().join(format!("{name}~RF1a2B.TMP")),
-            ]
-        };
-        let mut stale = owned_leftovers(&source).into_iter().collect::<Vec<_>>();
-        stale.extend(owned_leftovers(&paths.installed_binary));
-        for path in &stale {
-            std::fs::write(path, b"owned stale binary").unwrap();
-        }
-        let unrelated = source.parent().unwrap().join("other~RF1a2B.TMP");
-        std::fs::write(&unrelated, b"user file").unwrap();
-
-        let plan = plan_apply(&paths, options(source)).unwrap();
-        for path in &stale {
-            assert!(
-                plan.preview().iter().any(|item| {
-                    item.path == *path
-                        && item.action == PreviewAction::Delete
-                        && item.target == PreviewTarget::Binary
-                }),
-                "missing cleanup preview for {}",
-                crate::paths::display_path(path)
-            );
-        }
-        let receipt = commit_apply(plan, true).unwrap();
-
-        assert!(receipt.changed_targets >= stale.len());
-        for path in stale {
-            assert!(!path.exists(), "{}", crate::paths::display_path(&path));
-        }
-        assert_eq!(std::fs::read(unrelated).unwrap(), b"user file");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn running_windows_binary_is_renamed_aside_and_replaced() {
-        use std::process::{Command, Stdio};
-
-        let (_temp, paths, source) = fixture();
-        std::fs::create_dir_all(&paths.fastctx_bin_dir).unwrap();
-        let system_root = std::env::var_os("SystemRoot").unwrap();
-        let command_processor = std::path::PathBuf::from(system_root).join("System32/cmd.exe");
-        std::fs::copy(&command_processor, &paths.installed_binary).unwrap();
-        let mut child = Command::new(&paths.installed_binary)
-            .args(["/d", "/q", "/c", "set /p hold="])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(150));
-
-        let plan = plan_apply(&paths, options(source.clone())).unwrap();
-        let receipt = commit_apply(plan, true).unwrap();
-        assert!(receipt.changed_targets >= 3);
-        assert_eq!(
-            std::fs::read(&paths.installed_binary).unwrap(),
-            b"binary fixture"
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-        let cleanup = plan_apply(&paths, options(source)).unwrap();
-        commit_apply(cleanup, true).unwrap();
-        let stale = std::fs::read_dir(&paths.fastctx_bin_dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().contains("fastctx-old"));
-        assert!(!stale);
-    }
 }

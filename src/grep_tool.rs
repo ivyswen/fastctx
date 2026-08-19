@@ -10,6 +10,7 @@ use crate::encoding::{
 };
 use crate::file_executor::GrepGlobExecutor;
 use crate::file_snapshot::{CaptureDisposition, CaptureFailure, capture_classify};
+use crate::glob_filter::{GlobPatterns, PathGlobFilter};
 use crate::grep_sink::{
     CapturedLine, ContentEntry, ContentSpec, FileResult, GrepSearchPlan, GrepSinkError,
     LineMatchSpan, PlanSink,
@@ -26,8 +27,8 @@ use crate::render_plan::{
     DetailRenderGraph, LineRenderGraph, LineRenderView, RenderPlanError, SharedLineRenderGraph,
 };
 use crate::search_text::{SearchText, SearchTextFailure};
-use crate::traversal::collect_search_candidates;
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use crate::skip_report::{SkipTally, detail_line};
+use crate::traversal::{SkippedPaths, collect_search_candidates};
 use grep_matcher::LineTerminator;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::SearcherBuilder;
@@ -37,8 +38,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::ops::ControlFlow;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_HEAD_LIMIT: usize = 250;
@@ -68,15 +67,20 @@ pub enum OutputMode {
 pub struct GrepRequest {
     /// The regular expression to search for (Rust regex syntax; escape literal braces like `interface\{\}`).
     pub pattern: String,
-    /// Absolute path of the file or directory to search in. Omit for the session working directory.
+    /// File or directory to search; omit for the session working directory.
+    #[schemars(description = crate::model_guidance::local_path_description(
+        "File or directory to search. Omit for the session working directory."
+    ))]
     pub path: Option<String>,
-    /// Glob pattern to filter files, e.g. "*.rs", "**/*.{ts,tsx}" (equivalent to rg --glob).
-    pub glob: Option<String>,
+    /// Globs to filter files, e.g. ["**/*.rs", "!tests/**"]. A leading `!` excludes and always wins; negative-only lists include every other file.
+    // Published as a plain string array; see the note on GlobRequest::pattern. (2026-08-17)
+    #[schemars(with = "Option<Vec<String>>")]
+    pub glob: Option<GlobPatterns>,
     /// File type filter, e.g. "js", "py", "rust" (equivalent to rg --type; more efficient than glob for standard types).
     #[serde(rename = "type")]
     #[schemars(rename = "type")]
     pub file_type: Option<String>,
-    /// "content", "files_with_matches", "count", or "summary" (global totals from a full scan; ignores head_limit/offset).
+    /// "content" = matching lines with optional context; "files_with_matches" (default) = matching paths only; "count" = per-file counts plus their total; "summary" = global totals from a full scan (ignores head_limit/offset).
     pub output_mode: Option<OutputMode>,
     /// Case-insensitive search (rg -i).
     pub case_insensitive: Option<bool>,
@@ -96,7 +100,7 @@ pub struct GrepRequest {
     pub head_limit: Option<usize>,
     /// Skip the first N entries before applying head_limit.
     pub offset: Option<usize>,
-    /// Single-file target only: decode that file with this WHATWG encoding label (e.g. "gbk"), same semantics as read's encoding. On a directory target use fallback_encoding instead.
+    /// Single-file target only: decode that file with this WHATWG encoding label (e.g. "gbk"), same semantics as inspect_local_file's encoding. On a directory target use fallback_encoding instead.
     pub encoding: Option<String>,
     /// Directory target: WHATWG encoding to assume only for files auto-detection can't determine — never overrides BOM, valid UTF-8, or already-resolved files. Strict-decoded; files that also fail under it stay in the skip report.
     pub fallback_encoding: Option<String>,
@@ -215,14 +219,46 @@ struct PageFormat<'a> {
 #[derive(Default)]
 struct SkippedFiles {
     entries: Vec<SkippedFile>,
+    /// Leading entries contributed by traversal rather than by searching.
+    unreachable_listed: usize,
+    /// Unreachable paths the traversal detail cap counted but dropped.
+    unreachable_unlisted: usize,
 }
 
 impl SkippedFiles {
+    /// Seeds the report with paths the walk never entered. Traversal happens
+    /// before any file is searched, so its entries lead the detail list and the
+    /// split point stays a simple prefix length.
+    fn from_traversal(skipped: &SkippedPaths) -> Self {
+        let entries = skipped
+            .listed()
+            .map(|path| SkippedFile {
+                path: path.display.to_string(),
+                reason: path.reason.to_string(),
+            })
+            .collect::<Vec<_>>();
+        Self {
+            unreachable_listed: entries.len(),
+            unreachable_unlisted: skipped.unlisted(),
+            entries,
+        }
+    }
+
     fn record(&mut self, path: &str, skip: &CandidateSkip) {
         self.entries.push(SkippedFile {
             path: path.to_string(),
             reason: skip.reason(),
         });
+    }
+
+    fn tally(&self) -> SkipTally {
+        SkipTally {
+            files: self.entries.len().saturating_sub(self.unreachable_listed),
+            unreachable: self
+                .unreachable_listed
+                .saturating_add(self.unreachable_unlisted),
+            listed: self.entries.len(),
+        }
     }
 }
 
@@ -250,12 +286,6 @@ impl FallbackUsage {
             counted(self.count, "file", "files")
         ))
     }
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct GrepExecutionProbe {
-    exact_retries: AtomicUsize,
 }
 
 #[derive(Clone, Debug)]
@@ -289,8 +319,6 @@ pub fn grep_files(request: GrepRequest, cancellation: CancellationToken) -> Tool
         budget.value,
         budget.variable,
         CAPTURE_HEAP_LIMIT_BYTES,
-        #[cfg(test)]
-        None,
         operation,
         GrepGlobExecutor::shared(),
     );
@@ -321,8 +349,6 @@ pub(crate) fn grep_files_cancellable(
         budget.value,
         budget.variable,
         CAPTURE_HEAP_LIMIT_BYTES,
-        #[cfg(test)]
-        None,
         operation.clone(),
         executor,
     );
@@ -330,128 +356,11 @@ pub(crate) fn grep_files_cancellable(
     Ok(response)
 }
 
-#[cfg(test)]
-fn grep_files_with_budget(request: GrepRequest, budget: usize) -> ToolResponse {
-    let (mut guard, operation) = RequestWorkGuard::new(
-        rmcp::model::RequestId::String(Arc::from("test-grep")),
-        CancellationToken::new(),
-    );
-    let response = grep_files_with_budget_source_and_execution(
-        request,
-        budget,
-        "FASTCTX_TOKEN_BUDGET",
-        CAPTURE_HEAP_LIMIT_BYTES,
-        None,
-        operation,
-        Arc::new(GrepGlobExecutor::with_test_parallelism(1)),
-    );
-    guard.disarm();
-    response
-}
-
-#[cfg(test)]
-fn grep_files_with_budget_source_and_operation(
-    request: GrepRequest,
-    budget: usize,
-    budget_variable: &str,
-    operation: Option<&OperationCtx>,
-) -> ToolResponse {
-    if let Some(operation) = operation {
-        return grep_files_with_budget_source_and_execution(
-            request,
-            budget,
-            budget_variable,
-            CAPTURE_HEAP_LIMIT_BYTES,
-            None,
-            operation.clone(),
-            Arc::new(GrepGlobExecutor::with_test_parallelism(1)),
-        );
-    }
-    let (mut guard, operation) = RequestWorkGuard::new(
-        rmcp::model::RequestId::String(Arc::from("test-grep-operation")),
-        CancellationToken::new(),
-    );
-    let response = grep_files_with_budget_source_and_execution(
-        request,
-        budget,
-        budget_variable,
-        CAPTURE_HEAP_LIMIT_BYTES,
-        None,
-        operation,
-        Arc::new(GrepGlobExecutor::with_test_parallelism(1)),
-    );
-    guard.disarm();
-    response
-}
-
-#[cfg(test)]
-fn grep_files_with_budget_and_parallelism(
-    request: GrepRequest,
-    budget: usize,
-    parallelism: usize,
-) -> ToolResponse {
-    let (mut guard, operation) = RequestWorkGuard::new(
-        rmcp::model::RequestId::String(Arc::from(format!("test-grep-p{parallelism}"))),
-        CancellationToken::new(),
-    );
-    let response = grep_files_with_budget_source_and_execution(
-        request,
-        budget,
-        "FASTCTX_TOKEN_BUDGET",
-        CAPTURE_HEAP_LIMIT_BYTES,
-        None,
-        operation,
-        Arc::new(GrepGlobExecutor::with_test_parallelism(parallelism)),
-    );
-    guard.disarm();
-    response
-}
-
-#[cfg(test)]
-fn grep_files_with_parallelism_and_capture_limit(
-    request: GrepRequest,
-    budget: usize,
-    parallelism: usize,
-    capture_heap_limit_bytes: usize,
-) -> (
-    ToolResponse,
-    usize,
-    crate::file_executor::LedgerSnapshot,
-    crate::file_executor::LedgerSnapshot,
-) {
-    let (mut guard, operation) = RequestWorkGuard::new(
-        rmcp::model::RequestId::String(Arc::from(format!(
-            "test-grep-p{parallelism}-capture-limit"
-        ))),
-        CancellationToken::new(),
-    );
-    let executor = Arc::new(GrepGlobExecutor::with_test_parallelism(parallelism));
-    let probe = Arc::new(GrepExecutionProbe::default());
-    let response = grep_files_with_budget_source_and_execution(
-        request,
-        budget,
-        "FASTCTX_TOKEN_BUDGET",
-        capture_heap_limit_bytes,
-        Some(Arc::clone(&probe)),
-        operation,
-        Arc::clone(&executor),
-    );
-    guard.disarm();
-    executor.wait_for_test_quiescence();
-    (
-        response,
-        probe.exact_retries.load(Ordering::Acquire),
-        executor.test_burst_ledger(),
-        executor.test_ticket_ledger(),
-    )
-}
-
 fn grep_files_with_budget_source_and_execution(
     request: GrepRequest,
     budget: usize,
     budget_variable: &str,
     capture_heap_limit_bytes: usize,
-    #[cfg(test)] execution_probe: Option<Arc<GrepExecutionProbe>>,
     operation: OperationCtx,
     executor: Arc<GrepGlobExecutor>,
 ) -> ToolResponse {
@@ -461,8 +370,6 @@ fn grep_files_with_budget_source_and_execution(
         budget,
         budget_variable,
         capture_heap_limit_bytes,
-        #[cfg(test)]
-        execution_probe,
         operation,
         executor,
     ))
@@ -473,7 +380,6 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     budget: usize,
     budget_variable: &str,
     capture_heap_limit_bytes: usize,
-    #[cfg(test)] execution_probe: Option<Arc<GrepExecutionProbe>>,
     operation: OperationCtx,
     executor: Arc<GrepGlobExecutor>,
 ) -> ToolResponse {
@@ -529,20 +435,22 @@ fn grep_files_with_budget_source_and_execution_unadapted(
             ));
         }
     };
-    let glob = match build_glob(request.glob.as_deref()) {
+    let glob = match build_glob(request.glob.as_ref()) {
         Ok(glob) => glob,
         Err(message) => return ToolResponse::error(message),
     };
-    let candidates = match collect_search_candidates(
+    let collected = match collect_search_candidates(
         &root,
         glob.as_ref(),
         request.file_type.as_deref(),
         Some(&operation),
         Some(&executor),
     ) {
-        Ok(candidates) => Arc::<[Candidate]>::from(candidates),
+        Ok(collected) => collected,
         Err(message) => return ToolResponse::error(message),
     };
+    let traversal_skips = collected.skipped;
+    let candidates = Arc::<[Candidate]>::from(collected.items);
     let offset = request.offset.unwrap_or(0);
     let head_limit = request.head_limit.unwrap_or(DEFAULT_HEAD_LIMIT);
     let mode = request.output_mode.unwrap_or_default();
@@ -562,7 +470,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     if mode == OutputMode::Summary {
         let mut occurrence_total = 0_usize;
         let mut file_total = 0_usize;
-        let mut skipped_files = SkippedFiles::default();
+        let mut skipped_files = SkippedFiles::from_traversal(&traversal_skips);
         let mut transcoding_notes = BTreeSet::new();
         let mut fallback_usage = FallbackUsage::default();
         let plan = GrepSearchPlan::Count;
@@ -661,7 +569,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     let mut skip_remaining = offset;
     let mut total_entries_seen = 0_usize;
     let mut scan_complete = true;
-    let mut skipped_files = SkippedFiles::default();
+    let mut skipped_files = SkippedFiles::from_traversal(&traversal_skips);
     let mut transcoding_notes = BTreeSet::new();
     let mut fallback_usage = FallbackUsage::default();
     // Every candidate is searched with identical options so files can run in
@@ -719,10 +627,6 @@ fn grep_files_with_budget_source_and_execution_unadapted(
             let (outcome, exact_form) = match outcome {
                 Ok(outcome) => (outcome, false),
                 Err(SearchFailure::CaptureOverflow) => {
-                    #[cfg(test)]
-                    if let Some(probe) = &execution_probe {
-                        probe.exact_retries.fetch_add(1, Ordering::AcqRel);
-                    }
                     // The over-capture cap can cross the 64 MiB capture valve
                     // where the live window would not; retry with the exact
                     // sequential options before surfacing the error.
@@ -865,13 +769,7 @@ fn grep_files_with_budget_source_and_execution_unadapted(
     match mode {
         OutputMode::FilesWithMatches => format_files_mode(&results, &page),
         OutputMode::Count => format_count_mode(&results, &page),
-        OutputMode::Content => format_content_mode(
-            &results,
-            &request,
-            &page,
-            #[cfg(test)]
-            None,
-        ),
+        OutputMode::Content => format_content_mode(&results, &request, &page),
         OutputMode::Summary => unreachable!("summary is handled before paging"),
     }
 }
@@ -893,23 +791,17 @@ fn build_matcher(
     builder.build(pattern)
 }
 
-fn build_glob(pattern: Option<&str>) -> Result<Option<GlobSet>, String> {
-    let Some(pattern) = pattern else {
+fn build_glob(patterns: Option<&GlobPatterns>) -> Result<Option<PathGlobFilter>, String> {
+    let Some(patterns) = patterns else {
         return Ok(None);
     };
-    let glob = GlobBuilder::new(pattern)
-        .literal_separator(true)
-        .build()
+    PathGlobFilter::compile(patterns, true)
+        .map(Some)
         .map_err(|error| {
             format!(
                 "Invalid glob pattern: {error}. Use forms like \"*.rs\" or \"**/*.{{ts,tsx}}\"."
             )
-        })?;
-    let mut builder = GlobSetBuilder::new();
-    builder.add(glob);
-    builder.build().map(Some).map_err(|error| {
-        format!("Invalid glob pattern: {error}. Use forms like \"*.rs\" or \"**/*.{{ts,tsx}}\".")
-    })
+        })
 }
 
 fn search_candidate(
@@ -1259,6 +1151,7 @@ struct GrepNoteUnits {
     fixed: Vec<Arc<str>>,
     details: Vec<Arc<str>>,
     fallback: Option<Arc<str>>,
+    tally: SkipTally,
 }
 
 impl GrepNoteUnits {
@@ -1272,13 +1165,14 @@ impl GrepNoteUnits {
             .skipped_files
             .entries
             .iter()
-            .map(|entry| Arc::<str>::from(format!("{} — {}", entry.path, entry.reason)))
+            .map(|entry| Arc::<str>::from(detail_line(&entry.path, &entry.reason)))
             .collect();
         let fallback = page.fallback_usage.note().map(Arc::<str>::from);
         Self {
             fixed,
             details,
             fallback,
+            tally: page.skipped_files.tally(),
         }
     }
 
@@ -1308,7 +1202,7 @@ impl GrepNoteUnits {
     }
 
     fn baseline_notes(&self, terminal: &str) -> Result<Vec<Arc<str>>, RenderPlanError> {
-        let terminal = Arc::<str>::from(terminal_with_skips(terminal, self.details.len(), 0)?);
+        let terminal = Arc::<str>::from(terminal_with_skips(terminal, &self.tally, 0)?);
         Ok(self.final_notes(0, terminal))
     }
 }
@@ -1450,13 +1344,13 @@ fn select_grep_notes(
     let total_skipped = notes.details.len();
 
     let full_terminal =
-        Arc::<str>::from(terminal_with_skips(terminal, total_skipped, total_skipped)?);
+        Arc::<str>::from(terminal_with_skips(terminal, &notes.tally, total_skipped)?);
     let full_tail = notes.tail(Arc::clone(&full_terminal));
     let full_tokens = details.probe_tail(total_skipped, &full_tail, page.work())?;
     let (shown_skips, selected_terminal, selected_tokens) = if full_tokens <= page.budget {
         (total_skipped, full_terminal, full_tokens)
     } else {
-        let baseline_terminal = Arc::<str>::from(terminal_with_skips(terminal, total_skipped, 0)?);
+        let baseline_terminal = Arc::<str>::from(terminal_with_skips(terminal, &notes.tally, 0)?);
         let baseline_tail = notes.tail(Arc::clone(&baseline_terminal));
         let baseline_tokens = details.probe_tail(0, &baseline_tail, page.work())?;
         if baseline_tokens > page.budget {
@@ -1473,7 +1367,7 @@ fn select_grep_notes(
                 Some(baseline.clone()),
                 |middle| -> Result<Option<(usize, Arc<str>, usize)>, RenderPlanError> {
                     let candidate_terminal =
-                        Arc::<str>::from(terminal_with_skips(terminal, total_skipped, middle)?);
+                        Arc::<str>::from(terminal_with_skips(terminal, &notes.tally, middle)?);
                     let candidate_tail = notes.tail(Arc::clone(&candidate_terminal));
                     let candidate_tokens =
                         details.probe_tail(middle, &candidate_tail, page.work())?;
@@ -1575,7 +1469,6 @@ fn format_content_mode(
     results: &[FileResult],
     request: &GrepRequest,
     page: &PageFormat<'_>,
-    #[cfg(test)] metrics_out: Option<&mut ContentFormatMetrics>,
 ) -> ToolResponse {
     let entries = results
         .iter()
@@ -1616,7 +1509,7 @@ fn format_content_mode(
             terminal,
         )
     };
-    let response = match fit_largest_content_output(initial, render_page) {
+    match fit_largest_content_output(initial, render_page) {
         Ok(Some(candidate)) => {
             match finish_content_grep_view(
                 &mut render_cache.token_graph,
@@ -1633,18 +1526,7 @@ fn format_content_mode(
         Ok(None) => budget_too_small(page.budget, page.budget_variable),
         Err(ContentFormatError::Source(message)) => ToolResponse::error(message),
         Err(ContentFormatError::Render(error)) => grep_render_failure(error),
-    };
-    #[cfg(test)]
-    if let Some(metrics_out) = metrics_out {
-        let (render_units_built, render_bytes_built, plan_builds) = render_cache.metrics();
-        *metrics_out = ContentFormatMetrics {
-            render_units_built,
-            render_bytes_built,
-            plan_builds,
-            token: render_cache.token_graph.metrics(),
-        };
     }
-    response
 }
 
 struct ContentBodyCandidate {
@@ -1784,21 +1666,6 @@ struct ContentRenderCache {
     matches: HashMap<MatchRenderKey, Arc<str>>,
     only_matches: HashMap<OnlyMatchRenderKey, Arc<str>>,
     literals: HashMap<&'static str, Arc<str>>,
-    #[cfg(test)]
-    render_units_built: usize,
-    #[cfg(test)]
-    render_bytes_built: usize,
-    #[cfg(test)]
-    plan_builds: usize,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ContentFormatMetrics {
-    render_units_built: usize,
-    render_bytes_built: usize,
-    plan_builds: usize,
-    token: crate::render_plan::RenderPlanMetrics,
 }
 
 impl ContentRenderCache {
@@ -1811,23 +1678,7 @@ impl ContentRenderCache {
             matches: HashMap::new(),
             only_matches: HashMap::new(),
             literals: HashMap::new(),
-            #[cfg(test)]
-            render_units_built: 0,
-            #[cfg(test)]
-            render_bytes_built: 0,
-            #[cfg(test)]
-            plan_builds: 0,
         }
-    }
-
-    fn record_unit(&mut self, line: &str) {
-        #[cfg(test)]
-        {
-            self.render_units_built = self.render_units_built.saturating_add(1);
-            self.render_bytes_built = self.render_bytes_built.saturating_add(line.len());
-        }
-        #[cfg(not(test))]
-        let _ = line;
     }
 
     fn literal(&mut self, value: &'static str) -> Arc<str> {
@@ -1835,7 +1686,6 @@ impl ContentRenderCache {
             return Arc::clone(line);
         }
         let line = Arc::<str>::from(value);
-        self.record_unit(&line);
         self.literals.insert(value, Arc::clone(&line));
         line
     }
@@ -1845,7 +1695,6 @@ impl ContentRenderCache {
             return Arc::clone(line);
         }
         let line = Arc::<str>::from(result.path());
-        self.record_unit(&line);
         self.headers.insert(file_index, Arc::clone(&line));
         line
     }
@@ -1869,7 +1718,6 @@ impl ContentRenderCache {
         })?;
         let rendered = format_context_line(context_prefix(line_number, line_numbers), source)?;
         let line = Arc::<str>::from(rendered);
-        self.record_unit(&line);
         self.contexts.insert(key, Arc::clone(&line));
         Ok(line)
     }
@@ -1911,7 +1759,6 @@ impl ContentRenderCache {
             match_window,
         )?;
         let line = Arc::<str>::from(rendered);
-        self.record_unit(&line);
         self.matches.insert(key, Arc::clone(&line));
         Ok(line)
     }
@@ -1934,18 +1781,8 @@ impl ContentRenderCache {
             key.match_window,
         );
         let line = Arc::<str>::from(rendered);
-        self.record_unit(&line);
         self.only_matches.insert(key, Arc::clone(&line));
         Ok(line)
-    }
-
-    #[cfg(test)]
-    fn metrics(&self) -> (usize, usize, usize) {
-        (
-            self.render_units_built,
-            self.render_bytes_built,
-            self.plan_builds,
-        )
     }
 }
 
@@ -1981,10 +1818,6 @@ fn render_content_lines(
             only_matching,
             single_file_target,
         ));
-        #[cfg(test)]
-        {
-            cache.plan_builds = cache.plan_builds.saturating_add(1);
-        }
         cache.plans.insert(key, Arc::clone(&plan));
         plan
     };
@@ -2453,26 +2286,11 @@ fn format_context_line(prefix: String, line: ResultLine<'_>) -> io::Result<Strin
 
 fn terminal_with_skips(
     terminal: &str,
-    skipped: usize,
+    tally: &SkipTally,
     shown: usize,
 ) -> Result<String, RenderPlanError> {
-    if skipped == 0 {
-        return Ok(terminal.to_string());
-    }
-    let stem = terminal
-        .strip_suffix(".)")
-        .ok_or(RenderPlanError::InvalidTerminal)?;
-    if shown == skipped {
-        Ok(format!(
-            "{stem}; {} skipped.)",
-            counted(skipped, "file", "files")
-        ))
-    } else {
-        Ok(format!(
-            "{stem}; {} skipped, showing {shown} — narrow path/glob to inspect the rest.)",
-            counted(skipped, "file", "files")
-        ))
-    }
+    crate::skip_report::terminal_with_skips(terminal, tally, shown)
+        .ok_or(RenderPlanError::InvalidTerminal)
 }
 
 fn format_summary(occurrences: usize, files: usize, page: &PageFormat<'_>) -> ToolResponse {
@@ -2628,992 +2446,4 @@ fn normalize_multiline_pattern(pattern: &str) -> String {
         }
     }
     output
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        CAPTURE_HEAP_LIMIT_BYTES, Candidate, ContentFormatMetrics, ContentRenderCache, ContentSpec,
-        FallbackUsage, FileResult, GrepNoteUnits, GrepRequest, GrepSearchPlan, LineRenderGraph,
-        OutputMode, PageFormat, SearchEncoding, SkippedFile, SkippedFiles, budget_too_small,
-        build_matcher, capture_limit_error, finish_grep_graph, format_content_mode,
-        format_files_mode, grep_files_with_budget, grep_files_with_budget_and_parallelism,
-        grep_files_with_budget_source_and_operation, grep_files_with_parallelism_and_capture_limit,
-        normalize_multiline_pattern, replay_compat_binary_probes, search_candidate,
-        search_error_message, snapshot_error_message,
-    };
-    use crate::operation::{RequestWorkGuard, TestStage};
-    use crate::{ToolContent, ToolResponse};
-    use filetime::{FileTime, set_file_mtime};
-    use rmcp::model::RequestId;
-    use std::collections::BTreeSet;
-    use std::io;
-    use std::path::Path;
-    use std::process::Command;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
-    use tokio_util::sync::CancellationToken;
-
-    #[test]
-    fn normalizes_regex_newlines_but_not_literal_backslashes() {
-        assert_eq!(normalize_multiline_pattern(r"one\ntwo"), r"one\r?\ntwo");
-        assert_eq!(normalize_multiline_pattern(r"one\\ntwo"), r"one\\ntwo");
-        assert_eq!(normalize_multiline_pattern("one\ntwo"), r"one\r?\ntwo");
-    }
-
-    #[test]
-    fn compatibility_binary_search_replays_v011_inclusive_probe_order() {
-        let mut all_fit_probes = Vec::new();
-        let best = replay_compat_binary_probes(1, 4, None, |middle| {
-            all_fit_probes.push(middle);
-            Ok::<_, ()>(Some(middle))
-        })
-        .unwrap();
-        assert_eq!(all_fit_probes, [2, 3, 4]);
-        assert_eq!(best, Some(4));
-
-        let mut none_fit_probes = Vec::new();
-        let best = replay_compat_binary_probes(1, 4, None, |middle| {
-            none_fit_probes.push(middle);
-            Ok::<_, ()>(None::<usize>)
-        })
-        .unwrap();
-        assert_eq!(none_fit_probes, [2, 1]);
-        assert_eq!(best, None);
-
-        let mut non_monotonic_probes = Vec::new();
-        let best = replay_compat_binary_probes(1, 4, Some(0), |middle| {
-            non_monotonic_probes.push(middle);
-            Ok::<_, ()>((middle == 1 || middle == 4).then_some(middle))
-        })
-        .unwrap();
-        assert_eq!(non_monotonic_probes, [2, 1]);
-        assert_eq!(best, Some(1));
-    }
-
-    #[test]
-    fn content_render_cache_builds_each_literal_unit_once() {
-        let mut cache = ContentRenderCache::new();
-        let first = cache.literal("--");
-        let second = cache.literal("--");
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(cache.metrics(), (1, 2, 0));
-    }
-
-    #[test]
-    fn content_render_work_is_stable_when_head_limit_grows_beyond_the_same_page() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("content.txt");
-        std::fs::write(&path, "hit\n".repeat(64)).unwrap();
-        let candidate = Candidate::without_metadata(&path, temp.path());
-        let matcher = build_matcher("hit", false, false).unwrap();
-        let outcome = match search_candidate(
-            &candidate,
-            &matcher,
-            GrepSearchPlan::ContentLine(ContentSpec {
-                multiline: false,
-                skip_entries: 0,
-                max_selected_entries: Some(64),
-                capture_match_text: false,
-                before_context: 0,
-                after_context: 0,
-                capture_heap_limit_bytes: CAPTURE_HEAP_LIMIT_BYTES,
-            }),
-            false,
-            &SearchEncoding {
-                explicit: None,
-                fallback: None,
-            },
-            None,
-        ) {
-            Ok(outcome) => outcome,
-            Err(_) => panic!("fixture content search failed"),
-        };
-        let results = vec![outcome.result.unwrap()];
-        let skipped_files = SkippedFiles::default();
-        let transcoding_notes = BTreeSet::new();
-        let fallback_usage = FallbackUsage::default();
-        let request = GrepRequest {
-            pattern: "hit".to_string(),
-            path: Some(crate::paths::display_path(&path)),
-            glob: None,
-            file_type: None,
-            output_mode: Some(OutputMode::Content),
-            case_insensitive: None,
-            line_numbers: None,
-            only_matching: None,
-            before_context: None,
-            after_context: None,
-            context: None,
-            multiline: None,
-            head_limit: None,
-            offset: None,
-            encoding: None,
-            fallback_encoding: None,
-        };
-        let render = |head_limit, metrics: &mut ContentFormatMetrics| {
-            let page = PageFormat {
-                offset: 0,
-                head_limit,
-                budget: usize::MAX,
-                budget_variable: "FASTCTX_TOKEN_BUDGET",
-                scan_complete: true,
-                total_entries_seen: 64,
-                skipped_files: &skipped_files,
-                transcoding_notes: &transcoding_notes,
-                fallback_usage: &fallback_usage,
-                single_file_target: true,
-                operation: None,
-            };
-            format_content_mode(&results, &request, &page, Some(metrics))
-        };
-        let mut at_250 = ContentFormatMetrics::default();
-        let mut at_1000 = ContentFormatMetrics::default();
-        let response_250 = render(250, &mut at_250);
-        let response_1000 = render(1_000, &mut at_1000);
-        assert_eq!(response_250, response_1000);
-        assert_eq!(at_250, at_1000);
-        assert_eq!(at_250.plan_builds, 1);
-        assert_eq!(at_250.render_units_built, 64);
-        assert_eq!(at_250.token.full_tokenizer_calls, 1);
-        assert!(at_250.token.token_prefix_appends <= at_250.render_units_built * 2);
-    }
-
-    #[test]
-    fn tiny_skip_budgets_terminate_for_every_mode_under_a_hard_deadline() {
-        const CHILD_MARKER: &str = "FASTCTX_TEST_TINY_SKIP_BUDGET_CHILD";
-        if std::env::var_os(CHILD_MARKER).is_some() {
-            for skipped_count in [1_usize, 2, 100] {
-                let skipped_files = SkippedFiles {
-                    entries: (0..skipped_count)
-                        .map(|index| SkippedFile {
-                            path: format!("/skip/{index:03}.txt"),
-                            reason: "undecodable".to_string(),
-                        })
-                        .collect(),
-                };
-                let transcoding_notes = BTreeSet::new();
-                let fallback_usage = FallbackUsage::default();
-                for budget in [1_usize, 2] {
-                    let page = PageFormat {
-                        offset: 0,
-                        head_limit: 1,
-                        budget,
-                        budget_variable: "FASTCTX_TOKEN_BUDGET",
-                        scan_complete: true,
-                        total_entries_seen: 1,
-                        skipped_files: &skipped_files,
-                        transcoding_notes: &transcoding_notes,
-                        fallback_usage: &fallback_usage,
-                        single_file_target: false,
-                        operation: None,
-                    };
-                    let result = FileResult::count("/match.txt".to_string(), 1);
-                    let files = format_files_mode(std::slice::from_ref(&result), &page);
-                    let count = super::format_count_mode(std::slice::from_ref(&result), &page);
-                    let summary = super::terminal_only_response(
-                        "(Complete: 1 occurrence across 1 file.)".to_string(),
-                        &page,
-                    );
-                    let mut graph =
-                        LineRenderGraph::new(vec![Arc::<str>::from("1:hit")], page.work()).unwrap();
-                    let notes = GrepNoteUnits::new(&page);
-                    let content = match finish_grep_graph(
-                        &mut graph,
-                        1,
-                        &page,
-                        &notes,
-                        "(Complete: all 1 result shown.)",
-                    )
-                    .unwrap()
-                    {
-                        Some(text) => ToolResponse::text(text),
-                        None => budget_too_small(page.budget, page.budget_variable),
-                    };
-                    for response in [files, count, summary, content] {
-                        assert!(response.is_error, "budget={budget}, response={response:?}");
-                        let [ToolContent::Text(text)] = response.content.as_slice() else {
-                            panic!("expected one text error");
-                        };
-                        assert!(
-                            tiktoken_rs::o200k_base_singleton()
-                                .encode_ordinary(text)
-                                .len()
-                                <= budget,
-                            "independent oracle exceeded budget={budget}, text={text:?}"
-                        );
-                    }
-                }
-            }
-            return;
-        }
-
-        let mut child = Command::new(std::env::current_exe().unwrap());
-        child
-            .arg("--exact")
-            .arg("grep_tool::tests::tiny_skip_budgets_terminate_for_every_mode_under_a_hard_deadline")
-            .arg("--nocapture")
-            .env(CHILD_MARKER, "1");
-        let mut child = child.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success(), "tiny-budget child failed: {status}");
-                break;
-            }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                let status = child.wait().unwrap();
-                panic!("tiny-budget child exceeded its hard deadline: {status}");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    fn token_budget_returns_at_least_one_entry_and_an_exact_offset() {
-        let results = (1..=3)
-            .map(|index| FileResult::count(format!("{index}-{}", "x".repeat(100)), 1))
-            .collect::<Vec<_>>();
-        let skipped_files = SkippedFiles::default();
-        let transcoding_notes = BTreeSet::new();
-        let fallback_usage = FallbackUsage::default();
-        let page = PageFormat {
-            offset: 0,
-            head_limit: 0,
-            budget: 65,
-            budget_variable: "FASTCTX_TOKEN_BUDGET",
-            scan_complete: false,
-            total_entries_seen: 0,
-            skipped_files: &skipped_files,
-            transcoding_notes: &transcoding_notes,
-            fallback_usage: &fallback_usage,
-            single_file_target: false,
-            operation: None,
-        };
-        let response = format_files_mode(&results, &page);
-        assert!(!response.is_error, "{response:?}");
-        let ToolContent::Text(output) = &response.content[0] else {
-            panic!("expected text");
-        };
-        assert!(output.starts_with("1-"));
-        let shown = output.lines().take_while(|line| !line.is_empty()).count();
-        assert!((1..=3).contains(&shown), "{output}");
-        let range = if shown == 1 {
-            "file 1".to_string()
-        } else {
-            format!("files 1-{shown}")
-        };
-        assert!(
-            output.ends_with(&format!(
-                "(Partial: {range} shown; more exist. Continue with offset={shown}.)"
-            )),
-            "{output}"
-        );
-    }
-
-    #[test]
-    fn tiny_budget_fails_instead_of_returning_an_empty_success() {
-        let results = vec![FileResult::count("/a/very/long/path.txt".to_string(), 1)];
-        let skipped_files = SkippedFiles::default();
-        let transcoding_notes = BTreeSet::new();
-        let fallback_usage = FallbackUsage::default();
-        let page = PageFormat {
-            offset: 0,
-            head_limit: 1,
-            budget: 1,
-            budget_variable: "FASTCTX_TOKEN_BUDGET",
-            scan_complete: true,
-            total_entries_seen: 1,
-            skipped_files: &skipped_files,
-            transcoding_notes: &transcoding_notes,
-            fallback_usage: &fallback_usage,
-            single_file_target: false,
-            operation: None,
-        };
-        let response = format_files_mode(&results, &page);
-        assert!(response.is_error);
-        let [ToolContent::Text(text)] = response.content.as_slice() else {
-            panic!("expected one text error");
-        };
-        assert!(
-            tiktoken_rs::o200k_base_singleton()
-                .encode_ordinary(text)
-                .len()
-                <= 1
-        );
-    }
-
-    #[test]
-    fn tiny_budget_bounds_real_not_found_regex_encoding_and_cancel_errors() {
-        let temp = tempfile::tempdir().unwrap();
-        let file = temp.path().join("text.txt");
-        std::fs::write(&file, b"hit\n").unwrap();
-        let request = |path: String| GrepRequest {
-            pattern: "hit".to_string(),
-            path: Some(path),
-            glob: None,
-            file_type: None,
-            output_mode: Some(OutputMode::FilesWithMatches),
-            case_insensitive: None,
-            line_numbers: None,
-            only_matching: None,
-            before_context: None,
-            after_context: None,
-            context: None,
-            multiline: None,
-            head_limit: None,
-            offset: None,
-            encoding: None,
-            fallback_encoding: None,
-        };
-
-        let not_found = grep_files_with_budget(
-            request(crate::paths::display_path(&temp.path().join("missing.txt"))),
-            1,
-        );
-        let mut invalid_regex = request(crate::paths::display_path(&file));
-        invalid_regex.pattern = "[".to_string();
-        let invalid_regex = grep_files_with_budget(invalid_regex, 1);
-        let mut invalid_encoding = request(crate::paths::display_path(&file));
-        invalid_encoding.encoding = Some("not-a-real-encoding".to_string());
-        let invalid_encoding = grep_files_with_budget(invalid_encoding, 1);
-
-        let parent = CancellationToken::new();
-        let (mut guard, operation) =
-            RequestWorkGuard::new(RequestId::String(Arc::from("tiny-cancel")), parent.clone());
-        parent.cancel();
-        let cancelled = grep_files_with_budget_source_and_operation(
-            request(crate::paths::display_path(&file)),
-            1,
-            "FASTCTX_TOKEN_BUDGET",
-            Some(&operation),
-        );
-        guard.disarm();
-
-        for response in [not_found, invalid_regex, invalid_encoding, cancelled] {
-            assert!(response.is_error, "{response:?}");
-            let [ToolContent::Text(text)] = response.content.as_slice() else {
-                panic!("expected one text error");
-            };
-            assert!(
-                tiktoken_rs::o200k_base_singleton()
-                    .encode_ordinary(text)
-                    .len()
-                    <= 1,
-                "{text:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn encoding_skip_report_uses_remaining_budget_and_keeps_the_terminal_truthful() {
-        let paths = (0..3)
-            .map(|index| format!("/{}-{index}.txt", "a".repeat(80)))
-            .collect::<Vec<_>>();
-        let skipped = SkippedFiles {
-            entries: paths
-                .iter()
-                .map(|path| SkippedFile {
-                    path: path.clone(),
-                    reason: "ambiguous: windows-1252".to_string(),
-                })
-                .collect(),
-        };
-        let results = vec![FileResult::count("/match.txt".to_string(), 1)];
-        let transcoding_notes = BTreeSet::new();
-        let fallback_usage = FallbackUsage::default();
-        let page = PageFormat {
-            offset: 0,
-            head_limit: 1,
-            budget: 70,
-            budget_variable: "FASTCTX_TOKEN_BUDGET",
-            scan_complete: true,
-            total_entries_seen: 1,
-            skipped_files: &skipped,
-            transcoding_notes: &transcoding_notes,
-            fallback_usage: &fallback_usage,
-            single_file_target: false,
-            operation: None,
-        };
-        let response = format_files_mode(&results, &page);
-        assert!(!response.is_error, "{response:?}");
-        let [ToolContent::Text(output)] = response.content.as_slice() else {
-            panic!("expected one text success");
-        };
-        let expected = format!(
-            "/match.txt\n\n{} — ambiguous: windows-1252\n(Complete: all 1 file shown; 3 files skipped, showing 1 — narrow path/glob to inspect the rest.)",
-            paths[0]
-        );
-        assert_eq!(output.as_str(), expected);
-    }
-
-    #[test]
-    fn real_multi_file_skip_report_samples_in_deterministic_order_with_full_counts() {
-        let temp = tempfile::tempdir().unwrap();
-        let matches = temp.path().join("matches.txt");
-        std::fs::write(&matches, b"hit\n").unwrap();
-        set_file_mtime(&matches, FileTime::from_unix_time(1_700_000_001, 0)).unwrap();
-
-        let mut ambiguous = Vec::new();
-        for index in 0..3 {
-            let path = temp.path().join(format!("ambiguous-{index}.txt"));
-            std::fs::write(&path, b"valid\xFFtail").unwrap();
-            set_file_mtime(
-                &path,
-                FileTime::from_unix_time(1_700_000_100 - index as i64, 0),
-            )
-            .unwrap();
-            ambiguous.push(path);
-        }
-
-        let independent_display = |path: &std::path::Path| {
-            dunce::canonicalize(path)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/")
-        };
-        let match_path = independent_display(&matches);
-        let skipped_paths = ambiguous
-            .iter()
-            .map(|path| independent_display(path))
-            .collect::<Vec<_>>();
-        let full_expected = format!(
-            "{match_path}\n1:hit\n\n{} — ambiguous: windows-1252\n{} — ambiguous: windows-1252\n{} — ambiguous: windows-1252\n(Complete: all 1 result shown; 3 files skipped.)",
-            skipped_paths[0], skipped_paths[1], skipped_paths[2]
-        );
-        let expected = format!(
-            "{match_path}\n1:hit\n\n{} — ambiguous: windows-1252\n(Complete: all 1 result shown; 3 files skipped, showing 1 — narrow path/glob to inspect the rest.)",
-            skipped_paths[0]
-        );
-        let two_shown = format!(
-            "{match_path}\n1:hit\n\n{} — ambiguous: windows-1252\n{} — ambiguous: windows-1252\n(Complete: all 1 result shown; 3 files skipped, showing 2 — narrow path/glob to inspect the rest.)",
-            skipped_paths[0], skipped_paths[1]
-        );
-        let budget = bpe_openai::o200k_base().count(&expected);
-        assert!(bpe_openai::o200k_base().count(&two_shown) > budget);
-
-        let request = GrepRequest {
-            pattern: "hit".to_string(),
-            path: Some(temp.path().to_string_lossy().replace('\\', "/")),
-            glob: None,
-            file_type: None,
-            output_mode: Some(OutputMode::Content),
-            case_insensitive: None,
-            line_numbers: None,
-            only_matching: None,
-            before_context: None,
-            after_context: None,
-            context: None,
-            multiline: None,
-            head_limit: None,
-            offset: None,
-            encoding: None,
-            fallback_encoding: None,
-        };
-        let full_response = grep_files_with_budget(request.clone(), 100_000);
-        assert!(!full_response.is_error, "{full_response:?}");
-        assert_eq!(
-            full_response.content,
-            vec![ToolContent::Text(full_expected)]
-        );
-
-        let response = grep_files_with_budget(request, budget);
-        assert!(!response.is_error, "{response:?}");
-        assert_eq!(response.content, vec![ToolContent::Text(expected)]);
-    }
-
-    #[test]
-    fn unlimited_head_limit_still_stops_at_the_text_budget() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("many.txt");
-        std::fs::write(&path, "hit\n".repeat(100)).unwrap();
-        let response = grep_files_with_budget(
-            GrepRequest {
-                pattern: "hit".to_string(),
-                path: Some(crate::paths::display_path(&path)),
-                glob: None,
-                file_type: None,
-                output_mode: Some(OutputMode::Content),
-                case_insensitive: None,
-                line_numbers: None,
-                only_matching: None,
-                before_context: None,
-                after_context: None,
-                context: None,
-                multiline: None,
-                head_limit: Some(0),
-                offset: None,
-                encoding: None,
-                fallback_encoding: None,
-            },
-            30,
-        );
-        assert_eq!(
-            response.content,
-            vec![ToolContent::Text(
-                "1:hit\n2:hit\n\n(Partial: results 1-2 shown; more exist. Continue with offset=2.)"
-                    .to_string()
-            )]
-        );
-    }
-
-    #[test]
-    fn oversized_context_is_reduced_before_the_match_is_rejected() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("context.txt");
-        let mut lines = (1..=500)
-            .map(|index| format!("before-{index}"))
-            .collect::<Vec<_>>();
-        lines.push("NEEDLE".to_string());
-        lines.extend((1..=500).map(|index| format!("after-{index}")));
-        std::fs::write(&path, lines.join("\n")).unwrap();
-        let response = grep_files_with_budget(
-            GrepRequest {
-                pattern: "NEEDLE".to_string(),
-                path: Some(crate::paths::display_path(&path)),
-                glob: None,
-                file_type: None,
-                output_mode: Some(OutputMode::Content),
-                case_insensitive: None,
-                line_numbers: None,
-                only_matching: None,
-                before_context: None,
-                after_context: None,
-                context: Some(10_000),
-                multiline: None,
-                head_limit: None,
-                offset: None,
-                encoding: None,
-                fallback_encoding: None,
-            },
-            60,
-        );
-        assert!(!response.is_error, "{response:?}");
-        let ToolContent::Text(output) = &response.content[0] else {
-            panic!("expected text");
-        };
-        assert!(output.contains("501:NEEDLE"), "{output}");
-        assert!(!output.contains("1-before-1"), "{output}");
-        assert!(
-            output.ends_with("(Complete: all 1 result shown.)"),
-            "{output}"
-        );
-    }
-
-    #[test]
-    fn cancellation_before_regex_search_never_enters_a_sink_or_returns_success() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("cancel-before-regex.txt");
-        std::fs::write(&path, b"hit\nhit again\n").unwrap();
-        let cancellation = CancellationToken::new();
-        let cancellation_for_hook = cancellation.clone();
-        let before_regex_hits = Arc::new(AtomicUsize::new(0));
-        let before_regex_hits_for_hook = Arc::clone(&before_regex_hits);
-        let sink_hits = Arc::new(AtomicUsize::new(0));
-        let sink_hits_for_hook = Arc::clone(&sink_hits);
-        let hook = Arc::new(move |stage| match stage {
-            TestStage::BeforeRegexSearch
-                if before_regex_hits_for_hook.fetch_add(1, Ordering::AcqRel) == 0 =>
-            {
-                cancellation_for_hook.cancel();
-            }
-            TestStage::SinkMatch => {
-                sink_hits_for_hook.fetch_add(1, Ordering::AcqRel);
-            }
-            _ => {}
-        });
-        let (mut guard, operation) =
-            RequestWorkGuard::new_with_hook(RequestId::Number(40), cancellation, hook);
-
-        let response = grep_files_with_budget_source_and_operation(
-            grep_request(&path, OutputMode::Content),
-            100_000,
-            "FASTCTX_TOKEN_BUDGET",
-            Some(&operation),
-        );
-        guard.disarm();
-
-        assert!(response.is_error, "{response:?}");
-        assert_eq!(
-            response.content,
-            vec![ToolContent::Text("Request cancelled.".to_string())]
-        );
-        assert_eq!(before_regex_hits.load(Ordering::Acquire), 1);
-        assert_eq!(sink_hits.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn changing_single_file_returns_the_exact_retry_error() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("changing.txt");
-        std::fs::write(&path, b"hit\n").unwrap();
-        let path_for_hook = path.clone();
-        let changed = Arc::new(AtomicBool::new(false));
-        let changed_for_hook = Arc::clone(&changed);
-        let hook = Arc::new(move |stage| {
-            if stage == TestStage::BeforeIdentityPostCheck
-                && !changed_for_hook.swap(true, Ordering::AcqRel)
-            {
-                std::fs::write(&path_for_hook, b"hit from a different version\nhit again\n")
-                    .unwrap();
-            }
-        });
-        let (mut guard, operation) =
-            RequestWorkGuard::new_with_hook(RequestId::Number(41), CancellationToken::new(), hook);
-        let response = grep_files_with_budget_source_and_operation(
-            grep_request(&path, OutputMode::Content),
-            100_000,
-            "FASTCTX_TOKEN_BUDGET",
-            Some(&operation),
-        );
-        guard.disarm();
-        assert!(response.is_error, "{response:?}");
-        assert_eq!(
-            response.content,
-            vec![ToolContent::Text(format!(
-                "File changed while it was being searched: {}. Retry the grep request.",
-                crate::path_codec::display_path(&dunce::canonicalize(&path).unwrap())
-            ))]
-        );
-        assert!(changed.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn changing_directory_candidate_is_one_unified_skip_in_all_four_modes() {
-        for (request_id, mode) in [
-            (51, OutputMode::FilesWithMatches),
-            (52, OutputMode::Count),
-            (53, OutputMode::Content),
-            (54, OutputMode::Summary),
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let stable = temp.path().join("stable.txt");
-            let changing = temp.path().join("changing.txt");
-            std::fs::write(&stable, b"hit\n").unwrap();
-            std::fs::write(&changing, b"hit\n").unwrap();
-            set_file_mtime(&stable, FileTime::from_unix_time(1_700_000_200, 0)).unwrap();
-            set_file_mtime(&changing, FileTime::from_unix_time(1_700_000_100, 0)).unwrap();
-
-            let changing_for_hook = changing.clone();
-            let changed = Arc::new(AtomicBool::new(false));
-            let changed_for_hook = Arc::clone(&changed);
-            let hook = Arc::new(move |stage| {
-                if stage == TestStage::BeforeIdentityPostCheck
-                    && !changed_for_hook.swap(true, Ordering::AcqRel)
-                {
-                    std::fs::write(
-                        &changing_for_hook,
-                        b"hit from a different version\nhit that must not leak\n",
-                    )
-                    .unwrap();
-                }
-            });
-            let (mut guard, operation) = RequestWorkGuard::new_with_hook(
-                RequestId::Number(request_id),
-                CancellationToken::new(),
-                hook,
-            );
-            let response = grep_files_with_budget_source_and_operation(
-                grep_request(temp.path(), mode),
-                100_000,
-                "FASTCTX_TOKEN_BUDGET",
-                Some(&operation),
-            );
-            guard.disarm();
-            assert!(!response.is_error, "{mode:?}: {response:?}");
-            assert!(changed.load(Ordering::Acquire), "{mode:?}");
-
-            let stable_display =
-                crate::path_codec::display_path(&dunce::canonicalize(&stable).unwrap());
-            let changing_display =
-                crate::path_codec::display_path(&dunce::canonicalize(&changing).unwrap());
-            let body = match mode {
-                OutputMode::FilesWithMatches => stable_display.clone(),
-                OutputMode::Count => format!("{stable_display}:1"),
-                OutputMode::Content => format!("{stable_display}\n1:hit"),
-                OutputMode::Summary => String::new(),
-            };
-            let terminal = match mode {
-                OutputMode::FilesWithMatches => "(Complete: all 1 file shown; 1 file skipped.)",
-                OutputMode::Count | OutputMode::Summary => {
-                    "(Complete: 1 occurrence across 1 file; 1 file skipped.)"
-                }
-                OutputMode::Content => "(Complete: all 1 result shown; 1 file skipped.)",
-            };
-            let expected = if body.is_empty() {
-                format!("{changing_display} — changed while being searched\n{terminal}")
-            } else {
-                format!("{body}\n\n{changing_display} — changed while being searched\n{terminal}")
-            };
-            assert_eq!(
-                response.content,
-                vec![ToolContent::Text(expected)],
-                "{mode:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn terminal_encoding_rejection_keeps_the_exact_single_file_error() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("malformed.txt");
-        std::fs::write(&path, [b'a', b'b', b'c', 0xFF]).unwrap();
-        let mut request = grep_request(&path, OutputMode::Content);
-        request.encoding = Some("utf-8".to_string());
-        let response = grep_files_with_budget(request, 100_000);
-        assert!(response.is_error, "{response:?}");
-        assert_eq!(
-            response.content,
-            vec![ToolContent::Text(format!(
-                "Cannot decode {} as utf-8: the content is not valid utf-8. Try another encoding or view=\"hex\".",
-                crate::path_codec::display_path(&dunce::canonicalize(&path).unwrap())
-            ))]
-        );
-    }
-
-    #[test]
-    fn encoding_and_changed_candidates_share_one_ordered_skip_report_in_all_modes() {
-        for (request_id, mode) in [
-            (61, OutputMode::FilesWithMatches),
-            (62, OutputMode::Count),
-            (63, OutputMode::Content),
-            (64, OutputMode::Summary),
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let stable = temp.path().join("stable.txt");
-            let mixed = temp.path().join("mixed.txt");
-            let changing = temp.path().join("changing.txt");
-            std::fs::write(&stable, b"hit\n").unwrap();
-            let mut mixed_bytes = "界".repeat(11).into_bytes();
-            mixed_bytes.push(0xFF);
-            mixed_bytes.resize(8 * 1024, b'a');
-            std::fs::write(&mixed, mixed_bytes).unwrap();
-            std::fs::write(&changing, b"hit\n").unwrap();
-            set_file_mtime(&stable, FileTime::from_unix_time(1_700_000_300, 0)).unwrap();
-            set_file_mtime(&mixed, FileTime::from_unix_time(1_700_000_200, 0)).unwrap();
-            set_file_mtime(&changing, FileTime::from_unix_time(1_700_000_100, 0)).unwrap();
-
-            let changing_for_hook = changing.clone();
-            let changed = Arc::new(AtomicBool::new(false));
-            let changed_for_hook = Arc::clone(&changed);
-            let hook = Arc::new(move |stage| {
-                if stage == TestStage::BeforeIdentityPostCheck
-                    && !changed_for_hook.swap(true, Ordering::AcqRel)
-                {
-                    std::fs::write(
-                        &changing_for_hook,
-                        b"hit from a different version\nhit that must not leak\n",
-                    )
-                    .unwrap();
-                }
-            });
-            let (mut guard, operation) = RequestWorkGuard::new_with_hook(
-                RequestId::Number(request_id),
-                CancellationToken::new(),
-                hook,
-            );
-            let response = grep_files_with_budget_source_and_operation(
-                grep_request(temp.path(), mode),
-                100_000,
-                "FASTCTX_TOKEN_BUDGET",
-                Some(&operation),
-            );
-            guard.disarm();
-            assert!(!response.is_error, "{mode:?}: {response:?}");
-            assert!(changed.load(Ordering::Acquire), "{mode:?}");
-
-            let stable_display =
-                crate::path_codec::display_path(&dunce::canonicalize(&stable).unwrap());
-            let mixed_display =
-                crate::path_codec::display_path(&dunce::canonicalize(&mixed).unwrap());
-            let changing_display =
-                crate::path_codec::display_path(&dunce::canonicalize(&changing).unwrap());
-            let body = match mode {
-                OutputMode::FilesWithMatches => stable_display.clone(),
-                OutputMode::Count => format!("{stable_display}:1"),
-                OutputMode::Content => format!("{stable_display}\n1:hit"),
-                OutputMode::Summary => String::new(),
-            };
-            let terminal = match mode {
-                OutputMode::FilesWithMatches => "(Complete: all 1 file shown; 2 files skipped.)",
-                OutputMode::Count | OutputMode::Summary => {
-                    "(Complete: 1 occurrence across 1 file; 2 files skipped.)"
-                }
-                OutputMode::Content => "(Complete: all 1 result shown; 2 files skipped.)",
-            };
-            let skips = format!(
-                "{mixed_display} — mixed or inconsistent encodings\n{changing_display} — changed while being searched"
-            );
-            let expected = if body.is_empty() {
-                format!("{skips}\n{terminal}")
-            } else {
-                format!("{body}\n\n{skips}\n{terminal}")
-            };
-            assert_eq!(
-                response.content,
-                vec![ToolContent::Text(expected)],
-                "{mode:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn p1_and_p4_are_byte_identical_across_all_modes_and_paging() {
-        let temp = tempfile::tempdir().unwrap();
-        for index in 0..24 {
-            let path = temp.path().join(format!("candidate-{index:02}.txt"));
-            std::fs::write(
-                &path,
-                format!("before {index}\nhit {index}\nhit again {index}\nafter {index}\n"),
-            )
-            .unwrap();
-            set_file_mtime(
-                &path,
-                FileTime::from_unix_time(1_700_100_000 + index as i64, 0),
-            )
-            .unwrap();
-        }
-
-        let mut requests = [
-            OutputMode::FilesWithMatches,
-            OutputMode::Count,
-            OutputMode::Content,
-            OutputMode::Summary,
-        ]
-        .into_iter()
-        .map(|mode| grep_request(temp.path(), mode))
-        .collect::<Vec<_>>();
-        requests[0].offset = Some(3);
-        requests[0].head_limit = Some(7);
-        requests[1].offset = Some(4);
-        requests[1].head_limit = Some(9);
-        requests[2].offset = Some(5);
-        requests[2].head_limit = Some(11);
-        requests[2].context = Some(1);
-
-        let mut occurrences = grep_request(temp.path(), OutputMode::Content);
-        occurrences.only_matching = Some(true);
-        occurrences.offset = Some(7);
-        occurrences.head_limit = Some(13);
-        requests.push(occurrences);
-
-        for request in requests {
-            let serial = grep_files_with_budget_and_parallelism(request.clone(), 100_000, 1);
-            let parallel = grep_files_with_budget_and_parallelism(request, 100_000, 4);
-            assert_eq!(parallel, serial);
-        }
-    }
-
-    #[test]
-    fn overcapture_overflow_retries_the_live_window_inline_and_matches_p1() {
-        let temp = tempfile::tempdir().unwrap();
-        let frontier = temp.path().join("frontier.txt");
-        let mut frontier_text = String::new();
-        for line in 1..=120 {
-            frontier_text.push_str(&format!("hit {line:03} {}\n", "x".repeat(64)));
-        }
-        std::fs::write(&frontier, frontier_text).unwrap();
-        set_file_mtime(&frontier, FileTime::from_unix_time(1_700_200_100, 0)).unwrap();
-        for index in 0..3 {
-            let path = temp.path().join(format!("future-{index}.txt"));
-            std::fs::write(&path, format!("hit future {index}\n")).unwrap();
-            set_file_mtime(
-                &path,
-                FileTime::from_unix_time(1_700_200_000 + index as i64, 0),
-            )
-            .unwrap();
-        }
-
-        let mut request = grep_request(temp.path(), OutputMode::Content);
-        request.offset = Some(80);
-        request.head_limit = Some(1);
-        let (serial, serial_retries, serial_burst, serial_tickets) =
-            grep_files_with_parallelism_and_capture_limit(request.clone(), 100_000, 1, 1_024);
-        let (parallel, parallel_retries, parallel_burst, parallel_tickets) =
-            grep_files_with_parallelism_and_capture_limit(request, 100_000, 4, 1_024);
-
-        assert!(!serial.is_error, "{serial:?}");
-        assert_eq!(parallel, serial);
-        assert_eq!(serial_retries, 1);
-        assert_eq!(parallel_retries, 1);
-        for ledger in [
-            serial_burst,
-            serial_tickets,
-            parallel_burst,
-            parallel_tickets,
-        ] {
-            assert_eq!(ledger.released, ledger.allocated);
-            assert_eq!(ledger.live, 0);
-            assert_eq!(ledger.duplicate_releases, 0);
-        }
-        let ToolContent::Text(output) = &parallel.content[0] else {
-            panic!("expected text")
-        };
-        assert!(output.contains("81:hit 081"), "{output}");
-        assert!(output.ends_with("Continue with offset=81.)"), "{output}");
-
-        let mut exact_overflow = grep_request(temp.path(), OutputMode::Content);
-        exact_overflow.offset = Some(80);
-        exact_overflow.head_limit = Some(1);
-        let (skipped, retries, burst, tickets) =
-            grep_files_with_parallelism_and_capture_limit(exact_overflow, 100_000, 4, 8);
-        assert!(!skipped.is_error, "{skipped:?}");
-        let ToolContent::Text(output) = &skipped.content[0] else {
-            panic!("expected text")
-        };
-        assert!(
-            output.contains("matching content and context exceed the 64 MiB safety limit"),
-            "{output}"
-        );
-        assert!(output.contains("1 file skipped"), "{output}");
-        assert_eq!(
-            retries, 4,
-            "each of the four candidates gets at most one exact retry"
-        );
-        for ledger in [burst, tickets] {
-            assert_eq!(ledger.released, ledger.allocated);
-            assert_eq!(ledger.live, 0);
-            assert_eq!(ledger.duplicate_releases, 0);
-        }
-    }
-
-    fn grep_request(path: &Path, mode: OutputMode) -> GrepRequest {
-        GrepRequest {
-            pattern: "hit".to_string(),
-            path: Some(crate::paths::display_path(path)),
-            glob: None,
-            file_type: None,
-            output_mode: Some(mode),
-            case_insensitive: None,
-            line_numbers: None,
-            only_matching: None,
-            before_context: None,
-            after_context: None,
-            context: None,
-            multiline: None,
-            head_limit: None,
-            offset: None,
-            encoding: None,
-            fallback_encoding: None,
-        }
-    }
-
-    #[test]
-    fn search_memory_limits_have_exact_actionable_errors() {
-        let candidate = Candidate::without_metadata(Path::new("/large.txt"), Path::new("/"));
-        assert_eq!(
-            search_error_message(&candidate, &io::Error::other("heap limit reached")),
-            "Cannot search file /large.txt: a line or multiline buffer exceeds the 64 MiB safety limit. Narrow the path or search without multiline."
-        );
-        assert_eq!(
-            capture_limit_error(&candidate),
-            "Cannot search file /large.txt: matching content and context exceed the 64 MiB safety limit. Narrow the pattern or reduce context."
-        );
-        assert_eq!(
-            snapshot_error_message(&candidate, &io::Error::other("disk full")),
-            "Cannot create a stable search snapshot for /large.txt: disk full. Free temporary-disk space or retry after the file stops changing."
-        );
-    }
 }

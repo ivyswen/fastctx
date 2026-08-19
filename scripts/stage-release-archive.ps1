@@ -14,6 +14,11 @@ $mapping = @{
         Binary = "fastctx.exe"
         Format = "zip"
     }
+    "aarch64-pc-windows-msvc" = @{
+        Archive = "fastctx-aarch64-pc-windows-msvc.zip"
+        Binary = "fastctx.exe"
+        Format = "zip"
+    }
     "x86_64-unknown-linux-gnu" = @{
         Archive = "fastctx-x86_64-unknown-linux-gnu.tar.gz"
         Binary = "fastctx"
@@ -30,7 +35,12 @@ $mapping = @{
         Format = "tar.gz"
     }
 }
-$licenseFiles = @("LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")
+$licenseFiles = @(
+    "LICENSE-APACHE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.md",
+    "THIRD_PARTY_LICENSES_RUST.md"
+)
 $tarCommand = if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows
 )) {

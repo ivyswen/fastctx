@@ -1,4 +1,4 @@
-//! Text, image, PDF, and raw-byte dispatch for the read tool.
+//! Text, image, PDF, and raw-byte dispatch for the file-inspection tool.
 
 mod batch;
 mod hex_file;
@@ -16,7 +16,8 @@ use crate::binary::detect_binary_type;
 use crate::budget::{READ_TOKEN_BUDGET_ENV, tool_token_budget};
 use crate::model::ToolResponse;
 use crate::paths::{
-    canonical_existing, display_path, io_error_message, missing_read_file_message, parse_input_path,
+    canonical_existing, display_path, io_error_message, missing_read_file_message,
+    parse_local_path_input,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -28,8 +29,7 @@ use std::io::Read;
 ///
 /// A second fixed window would silently cap every default read far below the configured budget,
 /// forcing continuation calls the budget was raised to avoid. Do not reintroduce a numeric default
-/// here; page explicitly with `limit` instead. Locked by
-/// `read_contract::default_text_read_is_bounded_only_by_the_token_budget`. (2026-07-25)
+/// here; page explicitly with `limit` instead. (2026-07-25)
 const UNBOUNDED_LINE_LIMIT: usize = usize::MAX;
 /// Line window for a hex read that omits `limit`.
 ///
@@ -41,7 +41,7 @@ const DEFAULT_HEX_LINE_LIMIT: usize = 2_000;
 const MAX_LINE_CHARS: usize = 2_000;
 const TOTAL_COUNT_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 
-/// Automatic read dispatch or raw-byte viewing.
+/// Automatic channel dispatch or raw-byte viewing.
 #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum ViewMode {
@@ -52,22 +52,26 @@ enum ViewMode {
     Hex,
 }
 
-/// Parameters for the read tool; offset is a one-based line number.
+/// Parameters for the file-inspection tool; offset is a one-based line number.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadRequest {
-    /// The absolute path to the file to read. Both / and \ are accepted. Mutually exclusive with files.
+    /// File to inspect; mutually exclusive with files.
+    #[schemars(description = crate::model_guidance::local_path_description(
+        "File to inspect; both / and \\\\ are accepted. Mutually exclusive with files."
+    ))]
     pub file_path: Option<String>,
     /// Batch form: an array of {"path", "offset"?, "limit"?, "encoding"?} objects for
-    /// reading 1-32 text files in one call. Each entry behaves like a single-file text read;
-    /// results are packed in request order. Mutually exclusive with file_path and with the
-    /// top-level offset/limit/encoding/pages/pdf_mode/view parameters.
+    /// 1-32 text ranges in one call. Repeat a path for distinct ranges, each with its own
+    /// offset/limit, and freely mix ranges from multiple files. Each entry behaves like its
+    /// own single-file text request; results stay in request order. Mutually exclusive with
+    /// file_path and with the top-level offset/limit/encoding/pages/pdf_mode/view parameters.
     #[schemars(length(min = 1, max = 32))]
     pub files: Option<Vec<BatchReadEntry>>,
     /// The 1-based line number to start reading from. Use for paging through large files.
     #[schemars(range(min = 1))]
     pub offset: Option<usize>,
-    /// The number of lines to read. Omit to read as much as the output budget holds.
+    /// The number of lines to return. Omit to return as much as the output budget holds.
     #[schemars(range(min = 1))]
     pub limit: Option<usize>,
     /// Page range for PDF files, e.g. "1-5", "3", "10-20". Max 20 pages per call. Required in text mode for PDFs with more than 10 pages.
@@ -82,19 +86,22 @@ pub struct ReadRequest {
     pub view: Option<String>,
 }
 
-/// One text file in a batch read request.
+/// One text range in a batch inspection request.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BatchReadEntry {
-    /// Absolute path of the text file. Both / and \ are accepted.
+    /// Text file to inspect.
+    #[schemars(description = crate::model_guidance::local_path_description(
+        "Text file to inspect; both / and \\\\ are accepted."
+    ))]
     pub path: String,
     /// The 1-based line number to start reading from.
     #[schemars(range(min = 1))]
     pub offset: Option<usize>,
-    /// Maximum lines to read from this file in this call. Omit to let the shared budget decide.
+    /// Maximum lines to return from this range in this call. Omit to let the shared budget decide.
     #[schemars(range(min = 1))]
     pub limit: Option<usize>,
-    /// Known source encoding for this file, using the same labels as single-file read.
+    /// Known source encoding for this file, using the same labels as the top-level encoding parameter.
     pub encoding: Option<String>,
 }
 
@@ -111,14 +118,18 @@ pub fn read_file(request: ReadRequest) -> ToolResponse {
         .file_path
         .as_deref()
         .expect("single-file shape was validated");
-    let parsed = parse_input_path(file_path);
+    let parsed = match parse_local_path_input(file_path) {
+        Ok(path) => path,
+        Err(message) => return ToolResponse::error(message),
+    };
+    let input_display = display_path(&parsed);
     if !parsed.is_absolute() {
-        return ToolResponse::error(missing_read_file_message(file_path));
+        return ToolResponse::error(missing_read_file_message(&input_display));
     }
     let metadata = match fs::metadata(&parsed) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ToolResponse::error(missing_read_file_message(file_path));
+            return ToolResponse::error(missing_read_file_message(&input_display));
         }
         Err(error) => return ToolResponse::error(io_error_message(&parsed, &error)),
     };

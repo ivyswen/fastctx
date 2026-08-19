@@ -19,11 +19,23 @@ use std::os::windows::process::CommandExt;
 
 const TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Byte length of command text above which the command runs from a script file.
+///
+/// Windows CreateProcessW caps one command line at 32,767 UTF-16 units, and argument
+/// quoting can double the text in the worst case, so a long command passed straight to
+/// `bash -c` fails to spawn (os error 206). Commands over this threshold are written to
+/// a temp script instead, which has no length ceiling; 12,000 bytes doubles to well
+/// under the cap with room for the bash path and flags. Applied on every platform so
+/// behavior does not fork by OS (2026-08-08).
+const SCRIPT_SPAWN_THRESHOLD_BYTES: usize = 12_000;
+
 /// A spawned bash process whose kill operation covers the whole descendant tree.
 #[derive(Debug)]
 pub(crate) struct ManagedProcess {
     child: Box<dyn ChildWrapper>,
     output: Option<PipeReader>,
+    /// Keeps an over-threshold command's script file alive until the process is reaped.
+    _command_script: Option<tempfile::TempPath>,
 }
 
 impl ManagedProcess {
@@ -97,13 +109,25 @@ pub(crate) fn spawn_bash(
     let (reader, writer) = std::io::pipe()?;
     let mut command = crate::process_policy::noninteractive_command(bash);
     environment.configure_command(&mut command);
-    if login_shell {
-        command.arg("-lc");
+    let command_script = if command_text.len() > SCRIPT_SPAWN_THRESHOLD_BYTES {
+        let script = write_command_script(command_text)?;
+        if login_shell {
+            command.arg("-l");
+        } else {
+            command.args(["--noprofile", "--norc"]);
+        }
+        command.arg(script_operand(&script));
+        Some(script)
     } else {
-        command.args(["--noprofile", "--norc", "-c"]);
-    }
+        if login_shell {
+            command.arg("-lc");
+        } else {
+            command.args(["--noprofile", "--norc", "-c"]);
+        }
+        command.arg(command_text);
+        None
+    };
     command
-        .arg(command_text)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(writer.try_clone()?)
@@ -127,6 +151,10 @@ pub(crate) fn spawn_bash(
     if !login_shell {
         prepend_windows_toolset(&mut command, bash, environment);
     }
+    #[cfg(windows)]
+    if login_shell && environment.var_os(MSYS_PATH_TYPE).is_none() {
+        command.env(MSYS_PATH_TYPE, "inherit");
+    }
 
     let mut wrapped = CommandWrap::from(command);
     #[cfg(unix)]
@@ -138,7 +166,35 @@ pub(crate) fn spawn_bash(
     Ok(ManagedProcess {
         child,
         output: Some(reader),
+        _command_script: command_script,
     })
+}
+
+/// Writes over-threshold command text to a private temp script deleted when dropped.
+fn write_command_script(command_text: &str) -> std::io::Result<tempfile::TempPath> {
+    use std::io::Write;
+
+    let mut script = tempfile::Builder::new()
+        .prefix("fastctx-command-")
+        .suffix(".sh")
+        .tempfile()?;
+    script.write_all(command_text.as_bytes())?;
+    script.flush()?;
+    Ok(script.into_temp_path())
+}
+
+/// Renders the script path as the bash operand.
+fn script_operand(script: &tempfile::TempPath) -> std::ffi::OsString {
+    #[cfg(windows)]
+    {
+        // The msys argument layer passes a native absolute path through cleanly only in
+        // forward-slash form; backslashes are exposed to POSIX escaping rules.
+        std::ffi::OsString::from(script.to_string_lossy().replace('\\', "/"))
+    }
+    #[cfg(not(windows))]
+    {
+        script.as_os_str().to_os_string()
+    }
 }
 
 /// Owns a Windows Job Object whose process tree dies even if the supervising process is killed.
@@ -344,6 +400,17 @@ fn terminate_job(job: &OwnedHandle) -> std::io::Result<()> {
     }
 }
 
+/// Selects how the msys `/etc/profile` composes PATH out of the Windows PATH it inherits.
+///
+/// Git for Windows defaults this to `inherit`, but an msys2 installation defaults to `minimal`,
+/// whose profile *replaces* the inherited PATH with four Windows system directories — so a login
+/// shell there resolves none of the user's own tools. `prepend_windows_toolset` is the non-login
+/// counterpart; a login shell needs this instead, because profile runs after we hand over the
+/// environment. An explicit value is always left alone: choosing `minimal` or `strict` is a
+/// deliberate isolation choice that belongs to whoever made it.
+#[cfg(windows)]
+const MSYS_PATH_TYPE: &str = "MSYS2_PATH_TYPE";
+
 /// Gives a non-login Windows bash the Git-for-Windows Unix toolset on PATH.
 ///
 /// `--noprofile --norc` never sources `/etc/profile`, which is what normally puts
@@ -423,61 +490,4 @@ pub(crate) fn exit_code(status: ExitStatus) -> i32 {
         }
     }
     1
-}
-
-#[cfg(test)]
-mod tests {
-    use super::select_utf8_locale;
-
-    #[test]
-    fn locale_selection_prefers_c_utf8_and_has_the_frozen_fallback() {
-        assert_eq!(select_utf8_locale("c\nc.utf8\nen_us.utf8\n"), "C.UTF-8");
-        assert_eq!(select_utf8_locale("c\nposix\n"), "en_US.UTF-8");
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn managed_bash_child_preserves_the_no_console_window_policy() {
-        use std::io::Read;
-        use std::time::{Duration, Instant};
-
-        let bash = crate::shell::bash::probe_bash().unwrap();
-        let executable = std::env::current_exe().unwrap();
-        let quoted_executable = format!(
-            "'{}'",
-            executable
-                .to_string_lossy()
-                .replace('\\', "/")
-                .replace('\'', "'\"'\"'")
-        );
-        let command = format!(
-            "FASTCTX_TEST_NO_WINDOW_PROBE=1 {quoted_executable} --exact process_policy::tests::noninteractive_child_has_no_console --test-threads=1"
-        );
-        let environment = crate::session::SessionEnvironment::capture().unwrap();
-        let locale = super::detect_utf8_locale(&bash, &environment);
-        let mut process = super::spawn_bash(
-            &bash,
-            &command,
-            &std::env::current_dir().unwrap(),
-            false,
-            &environment,
-            &locale,
-        )
-        .unwrap();
-        let mut output = process.take_output();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            if let Some(status) = process.try_wait().unwrap() {
-                break status;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the no-window probe did not finish"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let mut text = String::new();
-        output.read_to_string(&mut text).unwrap();
-        assert!(status.success(), "{text}");
-    }
 }

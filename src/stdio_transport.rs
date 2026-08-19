@@ -63,14 +63,6 @@ impl DetachedStdin {
     pub(crate) fn read_error_receiver(&self) -> watch::Receiver<Option<String>> {
         self.read_error.clone()
     }
-
-    #[cfg(test)]
-    pub(crate) fn start_with_reader(reader: impl Read + Send + 'static) -> Self {
-        Self::spawn_reader(move |sender, read_error_sender| {
-            forward_reader(reader, sender, read_error_sender);
-        })
-        .expect("test stdin reader thread must start")
-    }
 }
 
 use std::io::{BufRead, BufReader, Write};

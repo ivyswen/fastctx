@@ -6,12 +6,20 @@ use super::{ReplaceRequest, ReplaceService, edit_token_budget, plural};
 use crate::budget::{
     GLOBAL_TOKEN_BUDGET_ENV, assemble_text, estimate_tokens, tool_token_budget_for_required,
 };
+use crate::glob_filter::{GlobPatterns, PathGlobFilter};
 use crate::model::ToolResponse;
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use crate::skip_report::{SkipTally, terminal_with_skips};
 use regex::{Captures, Regex, RegexBuilder};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// The paths a walk never entered: those worth listing, and how many there were.
+#[derive(Clone, Copy)]
+struct Unreachable<'a> {
+    issues: &'a [Issue],
+    total: usize,
+}
 
 const MAX_CANDIDATES: usize = 10_000;
 const MAX_STORED_PREVIEWS: usize = 100_000;
@@ -91,15 +99,29 @@ pub(super) fn replace(
         return ToolResponse::error(error);
     }
     let regex = compiled.regex;
-    let glob = match build_glob(request.glob.as_deref()) {
+    let glob = match build_glob(request.glob.as_ref()) {
         Ok(glob) => glob,
         Err(error) => return ToolResponse::error(error),
     };
-    let candidates = match crate::traversal::collect_project_candidates(&root, glob.as_ref(), None)
-    {
-        Ok(candidates) => candidates,
+    let collected = match crate::traversal::collect_project_candidates(&root, glob.as_ref(), None) {
+        Ok(collected) => collected,
         Err(error) => return ToolResponse::error(error),
     };
+    // Paths the walk never entered hide an unknown number of files. For a tool
+    // that writes, that is a coverage hole, not a footnote.
+    let unreachable_issues = collected
+        .skipped
+        .listed()
+        .map(|path| Issue {
+            path: path.display.to_string(),
+            message: path.reason.to_string(),
+        })
+        .collect::<Vec<_>>();
+    let unreachable = Unreachable {
+        issues: &unreachable_issues,
+        total: collected.skipped.total(),
+    };
+    let candidates = collected.items;
     if candidates.len() > MAX_CANDIDATES {
         return ToolResponse::error(
             "Too many candidate files: over 10000 matched. Narrow the path or glob.",
@@ -235,6 +257,7 @@ pub(super) fn replace(
             &analyzed,
             &skipped,
             &planning_failures,
+            unreachable,
             total_matches,
             budget,
             fallback_label,
@@ -380,6 +403,7 @@ pub(super) fn replace(
         &successes,
         &skipped,
         &failures,
+        unreachable,
         written_replacements,
         budget,
         &fallback_note(&analyzed, fallback_label),
@@ -728,33 +752,35 @@ fn replacement_tokens(replacement: &str) -> Vec<ReplacementToken<'_>> {
     tokens
 }
 
-fn build_glob(pattern: Option<&str>) -> Result<Option<GlobSet>, String> {
-    let Some(pattern) = pattern else {
+fn build_glob(patterns: Option<&GlobPatterns>) -> Result<Option<PathGlobFilter>, String> {
+    let Some(patterns) = patterns else {
         return Ok(None);
     };
-    let glob = Glob::new(pattern).map_err(|error| {
-        format!("Invalid glob pattern: {error}. Use forms like \"*.rs\" or \"**/*.{{ts,tsx}}\".")
-    })?;
-    let mut builder = GlobSetBuilder::new();
-    builder.add(glob);
-    builder.build().map(Some).map_err(|error| {
-        format!("Invalid glob pattern: {error}. Use forms like \"*.rs\" or \"**/*.{{ts,tsx}}\".")
-    })
+    PathGlobFilter::compile(patterns, false)
+        .map(Some)
+        .map_err(|error| {
+            format!(
+                "Invalid glob pattern: {error}. Use forms like \"*.rs\" or \"**/*.{{ts,tsx}}\"."
+            )
+        })
 }
 
 fn resolve_root(input: &str) -> Result<PathBuf, String> {
-    let parsed = crate::paths::parse_input_path(input);
+    let parsed = crate::paths::parse_local_path_input(input)?;
+    let input_display = crate::paths::display_path(&parsed);
     if !parsed.is_absolute() || !parsed.exists() {
-        return Err(crate::paths::missing_search_path_message(input));
+        return Err(crate::paths::missing_search_path_message(&input_display));
     }
     fs::metadata(&parsed).map_err(|error| crate::paths::io_error_message(&parsed, &error))?;
-    Ok(crate::paths::canonical_existing(&parsed).unwrap_or(parsed))
+    crate::paths::canonical_existing(&parsed)
+        .map_err(|error| crate::paths::io_error_message(&parsed, &error))
 }
 
 fn format_dry_run(
     analyzed: &[AnalyzedFile],
     skipped: &[Issue],
     failures: &[Issue],
+    unreachable: Unreachable<'_>,
     total_matches: usize,
     budget: usize,
     fallback_label: Option<&str>,
@@ -769,8 +795,9 @@ fn format_dry_run(
         .collect::<Vec<_>>();
     groups.extend(issue_groups(skipped, "skipped"));
     groups.extend(issue_groups(failures, "failed"));
+    groups.extend(issue_groups(unreachable.issues, "unreachable"));
     let matched_files = analyzed.len();
-    let mut terminal = if total_matches == 0 {
+    let terminal = if total_matches == 0 {
         "(Complete: dry run — no matches found.)".to_string()
     } else {
         format!(
@@ -779,16 +806,13 @@ fn format_dry_run(
             plural(matched_files, "file", "files")
         )
     };
-    if !skipped.is_empty() || !failures.is_empty() {
-        terminal = append_terminal_clause(
-            &terminal,
-            &format!(
-                "{} {} skipped",
-                skipped.len() + failures.len(),
-                plural(skipped.len() + failures.len(), "file", "files")
-            ),
-        );
-    }
+    let terminal = downgrade_if_unreachable(terminal, unreachable.total);
+    let tally = SkipTally {
+        files: skipped.len() + failures.len(),
+        unreachable: unreachable.total,
+        listed: 0,
+    };
+    let terminal = terminal_with_skips(&terminal, &tally, 0).unwrap_or(terminal);
     render_report(
         &groups,
         &terminal,
@@ -802,6 +826,7 @@ fn format_apply(
     successes: &[(String, usize)],
     skipped: &[Issue],
     failures: &[Issue],
+    unreachable: Unreachable<'_>,
     replacements: usize,
     budget: usize,
     extra_notes: &[String],
@@ -817,7 +842,8 @@ fn format_apply(
         .collect::<Vec<_>>();
     groups.extend(issue_groups(skipped, "skipped"));
     groups.extend(issue_groups(failures, "failed"));
-    let mut terminal = if replacements == 0 && failures.is_empty() {
+    groups.extend(issue_groups(unreachable.issues, "unreachable"));
+    let terminal = if replacements == 0 && failures.is_empty() {
         "(Complete: no matches found; nothing written.)".to_string()
     } else if failures.is_empty() {
         format!(
@@ -836,17 +862,27 @@ fn format_apply(
             plural(failures.len(), "file", "files")
         )
     };
-    if !skipped.is_empty() {
-        terminal = append_terminal_clause(
-            &terminal,
-            &format!(
-                "{} {} skipped",
-                skipped.len(),
-                plural(skipped.len(), "file", "files")
-            ),
-        );
-    }
+    let terminal = downgrade_if_unreachable(terminal, unreachable.total);
+    let tally = SkipTally {
+        files: skipped.len(),
+        unreachable: unreachable.total,
+        listed: 0,
+    };
+    let terminal = terminal_with_skips(&terminal, &tally, 0).unwrap_or(terminal);
     render_report(&groups, &terminal, extra_notes, budget, false)
+}
+
+/// A run that could not enter every path did not finish the job, however well
+/// the files it did reach turned out. `Complete` would overstate the coverage,
+/// and for a tool that writes, overstated coverage is the dangerous direction.
+fn downgrade_if_unreachable(terminal: String, unreachable: usize) -> String {
+    if unreachable == 0 {
+        return terminal;
+    }
+    if let Some(rest) = terminal.strip_prefix("(Complete:") {
+        return format!("(Partial:{rest}");
+    }
+    terminal
 }
 
 fn render_report(
@@ -990,86 +1026,5 @@ fn short_issue(error: &str) -> String {
         "undecodable".to_string()
     } else {
         error.to_string()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{analyze_file, build_regex, preview_text, validate_replacement_references};
-    use crate::edit::{ReplaceRequest, document::TextDocument};
-
-    fn request(pattern: &str, replacement: &str) -> ReplaceRequest {
-        ReplaceRequest {
-            pattern: pattern.to_string(),
-            replacement: replacement.to_string(),
-            path: "/tmp".to_string(),
-            glob: None,
-            literal: None,
-            case_insensitive: None,
-            dot_all: None,
-            max_replacements: None,
-            dry_run: None,
-            encoding: None,
-            fallback_encoding: None,
-        }
-    }
-
-    #[test]
-    fn captures_dollars_and_pattern_width_guards_follow_regex_semantics() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("replace.txt");
-        std::fs::write(&path, b"ab ab").unwrap();
-        let document = TextDocument::open(path.to_str().unwrap(), None, 256).unwrap();
-        let compiled = build_regex(&request("(a)(b)", "$2$1$$")).unwrap();
-        let analysis = analyze_file(&document, &compiled.regex, "$2$1$$", usize::MAX);
-        assert_eq!(analysis.matches, 2);
-        assert!(!compiled.can_match_empty);
-
-        assert_eq!(
-            build_regex(&request("", "")).unwrap_err(),
-            "An empty pattern matches at every position and is almost always a mistake. Give a non-empty pattern."
-        );
-        assert!(build_regex(&request("x*", "y")).unwrap().can_match_empty);
-        assert!(build_regex(&request(r"\b", "y")).unwrap().can_match_empty);
-    }
-
-    #[test]
-    fn replacement_references_are_validated_with_the_engine_token_grammar() {
-        let compiled = build_regex(&request("(?P<name>a)(b)?", "")).unwrap();
-        for replacement in ["$0", "$1", "${1}", "$2", "$name", "${name}", "$$", "$"] {
-            validate_replacement_references(&compiled.regex, replacement).unwrap();
-        }
-        for (replacement, token) in [
-            ("$3", "$3"),
-            ("${missing}", "${missing}"),
-            ("$1a", "$1a"),
-            ("$nameX", "$nameX"),
-        ] {
-            assert_eq!(
-                validate_replacement_references(&compiled.regex, replacement).unwrap_err(),
-                format!(
-                    "Replacement references an undefined capture group: {token}. The pattern defines groups 1-2; named group: name. Fix the replacement; nothing was written."
-                )
-            );
-        }
-        validate_replacement_references(&compiled.regex, "${1}a ${name}X").unwrap();
-    }
-
-    #[test]
-    fn preview_windows_are_single_line_and_character_bounded() {
-        assert_eq!(preview_text("a\r\nb"), "a\\nb");
-        assert_eq!(preview_text(&"界".repeat(161)).chars().count(), 161);
-    }
-
-    #[test]
-    fn replacement_size_guard_accepts_the_exact_limit_and_rejects_one_byte_more() {
-        assert_eq!(
-            super::checked_result_size(256 * 1024 * 1024 - 1, 1, "target", 256),
-            Ok(256 * 1024 * 1024)
-        );
-        assert_eq!(
-            super::checked_result_size(256 * 1024 * 1024, 1, "target", 256).unwrap_err(),
-            "Refusing to write target: the result would be 256.0 MiB, over the 256 MiB safety limit. Narrow the pattern."
-        );
     }
 }

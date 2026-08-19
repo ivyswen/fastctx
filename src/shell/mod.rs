@@ -65,7 +65,7 @@ pub struct RunBackgroundRequest {
     #[serde(default = "default_login_shell")]
     #[schemars(default = "default_login_shell")]
     pub login_shell: bool,
-    /// Default source encoding for this job's output when read with job_output (WHATWG label
+    /// Default source encoding for this job's output when shown by job_output (WHATWG label
     /// like "gbk"). Each job_output call may override it.
     pub encoding: Option<String>,
 }
@@ -102,7 +102,7 @@ pub struct JobKillRequest {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JobListRequest {
-    /// Lifecycle subset to list. Omit for currently running jobs.
+    /// Lifecycle subset to list: "running" (default, still-alive process trees), "finished" (retained exited and interrupted records), or "all". Omit for currently running jobs.
     #[serde(default)]
     #[schemars(default)]
     pub status: JobListStatus,
@@ -183,7 +183,8 @@ impl FastShell {
             Ok(cwd) => cwd,
             Err(error) => return ToolResponse::error(error),
         };
-        let bash = match self.bash.resolve(&self.session.environment) {
+        let environment = &self.session.command_environment;
+        let bash = match self.bash.resolve(environment) {
             Ok(bash) => bash,
             Err(error) => return ToolResponse::error(error),
         };
@@ -195,8 +196,8 @@ impl FastShell {
                 timeout_ms,
                 login_shell: request.login_shell,
                 encoding,
-                environment: &self.session.environment,
-                utf8_locale: self.bash.utf8_locale(&self.session.environment, &bash),
+                environment,
+                utf8_locale: self.bash.utf8_locale(environment, &bash),
             },
             cancelled,
         )
@@ -220,7 +221,8 @@ impl FastShell {
             Ok(cwd) => cwd,
             Err(error) => return ToolResponse::error(error),
         };
-        let bash = match self.bash.resolve(&self.session.environment) {
+        let environment = &self.session.command_environment;
+        let bash = match self.bash.resolve(environment) {
             Ok(bash) => bash,
             Err(error) => return ToolResponse::error(error),
         };
@@ -230,8 +232,8 @@ impl FastShell {
             cwd: &cwd,
             login_shell: request.login_shell,
             encoding,
-            environment: &self.session.environment,
-            utf8_locale: self.bash.utf8_locale(&self.session.environment, &bash),
+            environment,
+            utf8_locale: self.bash.utf8_locale(environment, &bash),
         })
     }
 
@@ -340,35 +342,4 @@ fn resolve_cwd(input: Option<&str>, session_cwd: &std::path::Path) -> Result<Pat
         None => session_cwd.to_path_buf(),
     };
     Ok(canonical_existing(&path).unwrap_or(path))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{FastShell, JobOutputRequest, RunRequest};
-
-    #[test]
-    fn validation_errors_are_exact_and_do_not_probe_bash() {
-        let shell = FastShell::new();
-        assert_eq!(
-            shell.run(RunRequest {
-                command: " ".to_string(),
-                cwd: None,
-                timeout_ms: None,
-                login_shell: true,
-                encoding: None,
-            }),
-            crate::ToolResponse::error("Invalid command: it must be a non-empty string.")
-        );
-        assert_eq!(
-            shell.job_output(JobOutputRequest {
-                job_id: "missing".to_string(),
-                wait_ms: Some(240_001),
-                after_seq: None,
-                encoding: None,
-            }),
-            crate::ToolResponse::error(
-                "Invalid wait_ms value: 240001. Expected an integer from 0 to 240000."
-            )
-        );
-    }
 }

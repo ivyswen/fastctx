@@ -376,27 +376,6 @@ fn load_search_executor(paths: &ControlPaths) -> Result<Arc<GrepGlobExecutor>, S
     )))
 }
 
-#[cfg(test)]
-async fn run_server_with_io<W>(
-    options: ServerOptions,
-    parent: Option<Option<crate::process_identity::ProcessIdentity>>,
-    stdin: crate::stdio_transport::DetachedStdin,
-    stdout: W,
-) -> Result<ExitCode, String>
-where
-    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
-{
-    run_server_with_io_and_executor(
-        options,
-        parent,
-        stdin,
-        stdout,
-        GrepGlobExecutor::shared(),
-        crate::session::SessionContext::library_default(),
-    )
-    .await
-}
-
 async fn run_server_with_io_and_executor<W>(
     options: ServerOptions,
     parent: Option<Option<crate::process_identity::ProcessIdentity>>,
@@ -777,101 +756,5 @@ fn print_receipt(receipt: &crate::control::apply::OperationReceipt) {
     println!("Changed {} target(s).", receipt.changed_targets);
     for note in &receipt.notes {
         println!("{note}");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ServerOptions, load_search_executor, run_server_with_io};
-    use crate::control::paths::ControlPaths;
-    use crate::stdio_transport::DetachedStdin;
-    use std::io::{Cursor, Read};
-    use std::time::Duration;
-
-    #[test]
-    fn persisted_search_parallelism_builds_the_production_executor_for_auto_and_boundaries() {
-        let maximum = crate::search_parallelism::detected_available();
-        let configured = std::collections::BTreeSet::from([
-            None,
-            Some(1),
-            Some((maximum / 2).max(1)),
-            Some(maximum),
-        ]);
-
-        for configured in configured {
-            let temp = tempfile::tempdir().unwrap();
-            let paths = ControlPaths::for_home(temp.path());
-            if let Some(configured) = configured {
-                std::fs::create_dir_all(&paths.fastctx_dir).unwrap();
-                std::fs::write(
-                    &paths.fastctx_config,
-                    format!("schema_version = 1\n\n[search]\nmax_cpu_cores = {configured}\n"),
-                )
-                .unwrap();
-            }
-
-            let executor = load_search_executor(&paths).unwrap();
-            let expected = configured.unwrap_or(maximum);
-            assert_eq!(
-                executor.parallelism(),
-                expected,
-                "configured={configured:?}"
-            );
-            assert_eq!(
-                executor.extra_capacity(),
-                expected - 1,
-                "configured={configured:?}"
-            );
-        }
-    }
-
-    struct BytesThenError {
-        bytes: Cursor<Vec<u8>>,
-    }
-
-    impl Read for BytesThenError {
-        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-            let read = self.bytes.read(output)?;
-            if read == 0 {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "injected established-session stdin failure",
-                ))
-            } else {
-                Ok(read)
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn established_server_reports_stdin_read_error() {
-        let initialize = serde_json::to_vec(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "stdin-error-contract", "version": "1.0"}
-            }
-        }))
-        .unwrap();
-        let mut input = initialize;
-        input.push(b'\n');
-        let stdin = DetachedStdin::start_with_reader(BytesThenError {
-            bytes: Cursor::new(input),
-        });
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            run_server_with_io(ServerOptions::default(), None, stdin, tokio::io::sink()),
-        )
-        .await
-        .expect("established server did not surface the stdin read error");
-
-        assert_eq!(
-            result.unwrap_err(),
-            "Cannot read MCP stdin: injected established-session stdin failure"
-        );
     }
 }

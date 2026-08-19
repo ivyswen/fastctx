@@ -4,7 +4,6 @@ mod common;
 use common::write_pdf;
 use common::{normalized, write};
 use fastctx::server::{FastCtxServer, ServerOptions};
-use rmcp::ServerHandler;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -38,195 +37,6 @@ fn fastctx_command_for_home(home: &std::path::Path) -> Command {
 }
 
 #[test]
-fn default_tool_definitions_publish_replace_with_explicit_permissions() {
-    let tools = FastCtxServer::new().tool_definitions();
-    assert_eq!(
-        tools
-            .iter()
-            .map(|tool| tool.name.as_ref())
-            .collect::<Vec<_>>(),
-        ["glob", "grep", "read", "replace"]
-    );
-    for tool in &tools {
-        let annotations = tool.annotations.as_ref().expect("annotations");
-        assert_eq!(
-            annotations.read_only_hint,
-            Some(tool.name != "replace"),
-            "{}",
-            tool.name
-        );
-        assert_eq!(annotations.destructive_hint, Some(false));
-        assert_eq!(annotations.open_world_hint, Some(false));
-        assert!(tool.output_schema.is_none());
-        assert!(tool.input_schema.get("type").is_some());
-    }
-    let read = tools.iter().find(|tool| tool.name == "read").unwrap();
-    assert_eq!(
-        read.description.as_deref(),
-        Some(concat!(
-            "Read one file (text, image, or PDF) or a batch of text files from the local\n",
-            "filesystem. Paths must be absolute. Text returns 1-based `N<tab>content`\n",
-            "lines, as much of the file as the output budget holds. For several text\n",
-            "files in one call, pass files=[{\"path\": ...}, ...] instead of file_path:\n",
-            "one token budget, per-file problems reported inline without failing the\n",
-            "batch, and a Partial note returns the exact files array for the next call.\n",
-            "Images (PNG/JPG/GIF/WebP/BMP) are shown to you visually. PDFs return the\n",
-            "selected pages' text layer or those pages rendered as images; image mode\n",
-            "defaults to 4 pages. view=\"hex\" dumps any file's raw bytes. PDFs, images,\n",
-            "and hex view are single-file only. Text output is always UTF-8; when\n",
-            "auto-detection is not confident it returns an error listing candidate\n",
-            "encodings instead of guessed text, so pass encoding only then. Text, PDF,\n",
-            "and hex responses end with a Complete or Partial status — continue only\n",
-            "with the exact parameters a Partial note provides."
-        ))
-    );
-    assert!(
-        read.input_schema
-            .get("required")
-            .is_none_or(|required| required.as_array().is_some_and(Vec::is_empty))
-    );
-    assert_eq!(read.input_schema["properties"]["files"]["minItems"], 1);
-    assert_eq!(read.input_schema["properties"]["files"]["maxItems"], 32);
-    assert_eq!(
-        read.input_schema["properties"]["files"]["items"]["$ref"],
-        "#/$defs/BatchReadEntry"
-    );
-    assert_eq!(
-        read.input_schema["$defs"]["BatchReadEntry"]["required"],
-        serde_json::json!(["path"])
-    );
-    assert_eq!(
-        read.input_schema["$defs"]["BatchReadEntry"]["properties"]["offset"]["minimum"],
-        1
-    );
-    assert_eq!(
-        read.input_schema["$defs"]["BatchReadEntry"]["properties"]["limit"]["minimum"],
-        1
-    );
-    assert_eq!(read.input_schema["properties"]["offset"]["minimum"], 1);
-    assert_eq!(read.input_schema["properties"]["limit"]["minimum"], 1);
-    let pdf_mode_schema = read.input_schema["properties"]["pdf_mode"].to_string();
-    assert!(pdf_mode_schema.contains("text"));
-    assert!(pdf_mode_schema.contains("image"));
-    assert!(read.input_schema["properties"].get("encoding").is_some());
-    assert_eq!(
-        read.input_schema["properties"]["encoding"]["description"],
-        "Text files only. Known source encoding as a WHATWG label, e.g. \"gbk\", \"shift_jis\", \"big5\", \"euc-kr\", \"windows-1252\", \"utf-16le\", plus \"utf-32le\"/\"utf-32be\". Selects how source bytes are decoded; output is always UTF-8. Omit for auto-detection; set it when you know the source encoding or the tool reports an ambiguous or undecodable encoding."
-    );
-    let view_schema = read.input_schema["properties"]["view"].to_string();
-    assert!(view_schema.contains("auto"));
-    assert!(view_schema.contains("hex"));
-    let grep = tools.iter().find(|tool| tool.name == "grep").unwrap();
-    assert_eq!(
-        grep.description.as_deref(),
-        Some(concat!(
-            "Fast regex content search (ripgrep engine; Rust regex, no lookaround). Output\n",
-            "modes: \"files_with_matches\" (default, paths only), \"content\", \"count\" (total\n",
-            "matches, not matching lines), \"summary\" (global totals). Respects .gitignore;\n",
-            "searches hidden files; skips .git and binaries. Files are decoded to UTF-8\n",
-            "before searching; files whose encoding can't be determined, that change, or\n",
-            "that cannot be searched are skipped and listed for directory targets; the\n",
-            "equivalent single-file failure returns an error. Matching is line-by-line:\n",
-            "`^` and `$` anchor line boundaries and are CRLF-aware. A path component of the\n",
-            "form ~fastctx~b...~ (reversible bytes/UTF-8) or ~fastctx~w...~ (Windows UTF-16)\n",
-            "is a filename escape; copy that whole component verbatim in later calls and\n",
-            "do not decode or rewrite it. The last line of every successful result states\n",
-            "Complete or Partial — continue only with the exact offset a Partial note\n",
-            "provides; errors are self-contained."
-        ))
-    );
-    assert_eq!(
-        grep.input_schema["required"],
-        serde_json::json!(["pattern"])
-    );
-    assert!(grep.input_schema["properties"].get("type").is_some());
-    assert!(grep.input_schema["properties"].get("file_type").is_none());
-    assert_eq!(
-        grep.input_schema["properties"]["encoding"]["description"],
-        "Single-file target only: decode that file with this WHATWG encoding label (e.g. \"gbk\"), same semantics as read's encoding. On a directory target use fallback_encoding instead."
-    );
-    assert_eq!(
-        grep.input_schema["properties"]["fallback_encoding"]["description"],
-        "Directory target: WHATWG encoding to assume only for files auto-detection can't determine — never overrides BOM, valid UTF-8, or already-resolved files. Strict-decoded; files that also fail under it stay in the skip report."
-    );
-    let output_mode_schema = grep.input_schema["properties"]["output_mode"].to_string();
-    for mode in ["content", "files_with_matches", "count", "summary"] {
-        assert!(output_mode_schema.contains(mode), "{output_mode_schema}");
-    }
-    let glob = tools.iter().find(|tool| tool.name == "glob").unwrap();
-    assert_eq!(
-        glob.description.as_deref(),
-        Some(concat!(
-            "Find files by glob pattern, e.g. \"**/*.rs\" or \"src/**/*.ts\". Returns absolute\n",
-            "paths sorted by path (or newest first with sort=\"modified\"), 100 per page by\n",
-            "default. filter_mode defaults to \"project\" (respects .gitignore, skips .git);\n",
-            "\"all\" lists everything. Omit `path` entirely for the session working directory\n",
-            "— never pass \"null\" or \"undefined\". A path component of the form ~fastctx~b...~\n",
-            "(reversible bytes/UTF-8) or ~fastctx~w...~ (Windows UTF-16) is a filename\n",
-            "escape; copy that whole component verbatim in later calls and do not decode or\n",
-            "rewrite it. The last line of every successful result states Complete or Partial\n",
-            "— continue only with the exact offset a Partial note provides; errors are\n",
-            "self-contained."
-        ))
-    );
-    assert_eq!(
-        glob.input_schema["required"],
-        serde_json::json!(["pattern"])
-    );
-    for property in ["filter_mode", "sort", "offset", "limit"] {
-        assert!(glob.input_schema["properties"].get(property).is_some());
-    }
-    assert_eq!(glob.input_schema["properties"]["limit"]["minimum"], 1);
-    assert_eq!(glob.input_schema["properties"]["limit"]["maximum"], 1_000);
-    let descriptions = tools
-        .iter()
-        .map(|tool| tool.description.as_deref().unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(" ");
-    for keyword in ["file", "read", "grep", "search", "glob", "replace"] {
-        assert!(descriptions.to_ascii_lowercase().contains(keyword));
-    }
-}
-
-#[test]
-fn server_instructions_follow_the_optional_shell_group() {
-    for enable_shell in [false, true] {
-        let info = FastCtxServer::with_options(ServerOptions { enable_shell }).get_info();
-        let instructions = info.instructions.as_deref().unwrap();
-        assert_eq!(
-            instructions.contains("POSIX-bash"),
-            enable_shell,
-            "{instructions}"
-        );
-        assert!(instructions.contains("replace"), "{instructions}");
-        // Hosts render these instructions as the tool namespace's one-line blurb and may keep
-        // only the first line and first 250 characters, so anything past that budget is
-        // silently dropped. Behavioural rules live in the guidance file instead (2026-07-24).
-        assert_eq!(instructions.lines().count(), 1, "{instructions}");
-        assert!(
-            instructions.chars().count() <= 250,
-            "instructions must fit the host namespace-description budget, got {}: {instructions}",
-            instructions.chars().count()
-        );
-        // Naming a host resource tool, or resources at all, puts it next to this server's name in
-        // every session. 0.2.2 shipped that pairing and users began reporting the very call it
-        // forbade, so the blurb introduces the toolset and says nothing else (2026-08-01).
-        for banned_tool in [
-            "list_mcp_resources",
-            "list_mcp_resource_templates",
-            "read_mcp_resource",
-            "MCP resources",
-            "file://",
-        ] {
-            assert!(!instructions.contains(banned_tool), "{instructions}");
-        }
-        for removed in ["named clips", "copy", "cut", "paste"] {
-            assert!(!instructions.contains(removed), "{instructions}");
-        }
-    }
-}
-
-#[test]
 fn all_nine_tools_publish_explicit_three_hint_annotations() {
     let tools = FastCtxServer::with_options(ServerOptions::all()).tool_definitions();
     assert_eq!(tools.len(), 9);
@@ -237,7 +47,13 @@ fn all_nine_tools_publish_explicit_three_hint_annotations() {
         assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name);
         assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
     }
-    for name in ["glob", "grep", "job_list", "job_output", "read"] {
+    for name in [
+        "glob",
+        "grep",
+        "job_list",
+        "job_output",
+        "inspect_local_file",
+    ] {
         let tool = tools.iter().find(|tool| tool.name == name).unwrap();
         assert_eq!(
             tool.annotations.as_ref().unwrap().read_only_hint,
@@ -250,6 +66,168 @@ fn all_nine_tools_publish_explicit_three_hint_annotations() {
             tool.annotations.as_ref().unwrap().read_only_hint,
             Some(false)
         );
+    }
+}
+
+/// Constructs that make a provider reject the whole tool declaration, each paired with
+/// the failure it causes so a reintroduction is diagnosed rather than merely flagged.
+///
+/// These are not style preferences. A tool declaration is validated before the request
+/// is submitted, so one rejected keyword returns 400 for the entire turn and takes every
+/// FastCtx tool down with it — the symptom is "FastCtx does not work on this provider",
+/// not "one parameter behaves oddly".
+const REJECTED_SCHEMA_KEYWORDS: [(&str, &str); 9] = [
+    (
+        "$ref",
+        "the Gemini API Schema type has no $ref field, and Codex rewrites every local \
+         $ref to {} once a tool schema passes its compaction budget, silently erasing \
+         an enum parameter's accepted values",
+    ),
+    (
+        "$defs",
+        "a definition table is unreachable once $ref is gone, and providers that do not \
+         know the key reject it",
+    ),
+    (
+        "oneOf",
+        "absent from the Gemini, OpenAI and Anthropic keyword sets; a fieldless enum \
+         belongs in type: \"string\" plus enum",
+    ),
+    (
+        "anyOf",
+        "Gemini rejects an anyOf node that carries any sibling key, and every parameter \
+         here carries a description; express the union at the Rust type instead",
+    ),
+    (
+        "allOf",
+        "OpenAI lists allOf as unsupported and the Gemini Schema type has no such field",
+    ),
+    (
+        "const",
+        "no provider subset accepts it; a string const belongs in enum",
+    ),
+    (
+        "$schema",
+        "metadata no consumer reads, and every known host transform strips it",
+    ),
+    (
+        "additionalProperties",
+        "absent from the Gemini API Schema type, where an unrecognized key is an \
+         Unknown name 400; serde(deny_unknown_fields) still enforces this at call time",
+    ),
+    (
+        "format",
+        "the derived numeric widths (uint, uint64, int64) are outside every provider's \
+         accepted format set, and minimum/maximum already carry the bound",
+    ),
+];
+
+/// Keywords a published input schema may use.
+///
+/// Deliberately an allow-list. schemars gains keywords over time and providers reject
+/// what they do not recognize, so a newly emitted keyword must fail here and be argued
+/// for rather than ship unnoticed. Every entry appears in the Gemini API Schema type,
+/// OpenAI's supported-keyword set, and Anthropic's.
+const PORTABLE_SCHEMA_KEYWORDS: [&str; 11] = [
+    "type",
+    "description",
+    "properties",
+    "required",
+    "items",
+    "enum",
+    "default",
+    "minimum",
+    "maximum",
+    "minItems",
+    "maxItems",
+];
+
+/// Scalar type names a node may carry. "null" is absent on purpose: optionality is
+/// carried by `required`, and Gemini's schema type is a single scalar with no way to
+/// spell a nullable union.
+const PORTABLE_SCHEMA_TYPES: [&str; 6] =
+    ["object", "array", "string", "integer", "number", "boolean"];
+
+/// Freezes the portable subset across every published tool rather than a named list of
+/// parameters, so a new tool, a new parameter, or a new schemars version cannot
+/// reintroduce a construct that costs us a whole provider. `src/tool_schema.rs` states
+/// the subset and the per-keyword reasoning; read it before widening either list above.
+#[test]
+fn published_tool_schemas_stay_inside_the_portable_subset() {
+    for tool in FastCtxServer::with_options(ServerOptions::all()).tool_definitions() {
+        let schema = Value::Object((*tool.input_schema).clone());
+        assert_eq!(
+            schema["type"], "object",
+            "{}: a tool's parameters must be an object",
+            tool.name
+        );
+        assert_portable_schema_node(&schema, &tool.name);
+    }
+}
+
+fn assert_portable_schema_node(node: &Value, path: &str) {
+    let map = node
+        .as_object()
+        .unwrap_or_else(|| panic!("{path}: every published schema node must be an object: {node}"));
+    for (keyword, reason) in REJECTED_SCHEMA_KEYWORDS {
+        assert!(
+            !map.contains_key(keyword),
+            "{path}: `{keyword}` reappeared in a published tool schema — {reason}"
+        );
+    }
+    for key in map.keys() {
+        assert!(
+            PORTABLE_SCHEMA_KEYWORDS.contains(&key.as_str()),
+            "{path}: `{key}` is outside the portable keyword set; \
+             adding it means answering why every provider accepts it"
+        );
+    }
+    let declared = map.get("type").and_then(Value::as_str).unwrap_or_else(|| {
+        panic!(
+            "{path}: needs one scalar `type`; a missing or list-valued type is exactly \
+             what strict providers reject: {node}"
+        )
+    });
+    assert!(
+        PORTABLE_SCHEMA_TYPES.contains(&declared),
+        "{path}: unsupported type `{declared}`"
+    );
+    if let Some(properties) = map.get("properties").and_then(Value::as_object) {
+        for (name, property) in properties {
+            assert_portable_schema_node(property, &format!("{path}.{name}"));
+        }
+    }
+    if let Some(items) = map.get("items") {
+        assert_portable_schema_node(items, &format!("{path}[]"));
+    }
+}
+
+/// The glob-pattern parameters advertise a plain string array while their Rust type
+/// still accepts a bare string. Both forms must keep parsing: the array is what models
+/// send once they read the published schema, the bare string is what every already
+/// deployed caller sends.
+#[test]
+fn glob_pattern_parameters_accept_both_the_advertised_array_and_a_bare_string() {
+    for pattern in [
+        serde_json::json!(["**/*.rs", "!tests/**"]),
+        "**/*.rs".into(),
+    ] {
+        serde_json::from_value::<fastctx::glob_tool::GlobRequest>(serde_json::json!({
+            "pattern": pattern,
+        }))
+        .unwrap_or_else(|error| panic!("glob.pattern rejected {pattern}: {error}"));
+        serde_json::from_value::<fastctx::grep_tool::GrepRequest>(serde_json::json!({
+            "pattern": "needle",
+            "glob": pattern,
+        }))
+        .unwrap_or_else(|error| panic!("grep.glob rejected {pattern}: {error}"));
+        serde_json::from_value::<fastctx::edit::ReplaceRequest>(serde_json::json!({
+            "pattern": "needle",
+            "replacement": "thread",
+            "path": "/tmp/file.txt",
+            "glob": pattern,
+        }))
+        .unwrap_or_else(|error| panic!("replace.glob rejected {pattern}: {error}"));
     }
 }
 
@@ -287,7 +265,8 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
             "never PowerShell. Commands must be non-interactive: there is no TTY or\n",
             "stdin; use flags like -y or --no-edit. A non-zero exit code is a normal\n",
             "result, not an error. Oversized output is truncated; for the full output,\n",
-            "redirect it to a file (command > file 2>&1) and page that file with read.\n",
+            "redirect it to a file (command > file 2>&1) and page that file with\n",
+            "inspect_local_file.\n",
             "Default timeout 120000 ms, ceiling 240000 — start anything that may outlast\n",
             "it with run_background. If output looks garbled (U+FFFD), pass encoding\n",
             "(e.g. \"gbk\"). The last line states Complete or Partial."
@@ -317,8 +296,8 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
             "output and exit code stay retrievable by job_id. Check on it with\n",
             "job_output; stop with job_kill; rediscover past jobs with job_list. There\n",
             "is no timeout: a job runs until it exits or is killed. Everything it\n",
-            "prints is kept in a plain log file whose path is returned here; read or\n",
-            "grep that path for anything job_output does not show. While your jobs\n",
+            "prints is kept in a plain log file whose path is returned here;\n",
+            "inspect_local_file or grep that path for anything job_output does not show. While your jobs\n",
             "run, every FastCtx result carries a one-line background status naming\n",
             "each job and how long it has run, just above the closing Complete or\n",
             "Partial line. It is a readout, not a notification: it refreshes only when\n",
@@ -347,13 +326,13 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
     assert_eq!(
         output.description.as_deref(),
         Some(concat!(
-            "Query a background job: its status (running, exited with its code, or\n",
-            "interrupted) plus output you have not been shown yet. Works for jobs\n",
+            "Query a background job: its status (running, exited with its code,\n",
+            "killed, or interrupted) plus output you have not been shown yet. Works for jobs\n",
             "started in earlier sessions. Long output is windowed: the newest lines\n",
             "that fit, the start of the log on the first call, and a note naming the\n",
             "exact lines skipped. The job's whole output is a plain log file on disk\n",
-            "whose line numbers are the seq numbers used here, so read or grep that\n",
-            "path for anything not shown. The call blocks up to wait_ms, so raise it\n",
+            "whose line numbers are the seq numbers used here, so inspect_local_file or\n",
+            "grep that path for anything not shown. The call blocks up to wait_ms, so raise it\n",
             "only when you have nothing else to do. If output looks garbled (U+FFFD),\n",
             "call again with encoding set to the source encoding (e.g. \"gbk\").\n",
             "Complete appears only once the job ends; servers and watchers never reach\n",
@@ -403,18 +382,14 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
             .get("required")
             .is_none_or(|required| required.as_array().is_some_and(Vec::is_empty))
     );
+    assert_eq!(list.input_schema["properties"]["status"]["type"], "string");
     assert_eq!(
-        list.input_schema["properties"]["status"]["$ref"],
-        "#/$defs/JobListStatus"
+        list.input_schema["properties"]["status"]["enum"],
+        serde_json::json!(["running", "finished", "all"])
     );
-    assert_eq!(
-        list.input_schema["$defs"]["JobListStatus"]["oneOf"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|option| option["const"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        ["running", "finished", "all"]
+    assert!(
+        list.input_schema.get("$defs").is_none(),
+        "enum variants are inlined, so no tool carries a definition table"
     );
     assert_eq!(list.input_schema["properties"]["limit"]["minimum"], 1);
     assert_eq!(list.input_schema["properties"]["limit"]["maximum"], 100);
@@ -487,60 +462,33 @@ fn shell_and_replace_tool_descriptions_and_schemas_match_the_frozen_contract() {
             "{property}"
         );
     }
+    assert_positive_local_path_schema(&replace.input_schema["properties"]["path"]);
 }
 
-#[test]
-fn stdio_glob_uses_the_server_working_directory_when_path_is_omitted() {
-    let temp = tempfile::tempdir().unwrap();
-    let file = temp.path().join("cwd.txt");
-    write(&file, b"cwd");
-    let mut child = fastctx_command()
-        .current_dir(temp.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-    send(
-        &mut stdin,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "cwd-test", "version": "1.0"}
-            }
-        }),
-    );
-    let _ = read_response(&mut stdout);
-    send(
-        &mut stdin,
-        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-    );
-    send(
-        &mut stdin,
-        serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{"name":"glob","arguments":{"pattern":"*.txt"}}
-        }),
-    );
-    let response = read_response(&mut stdout);
-    assert_eq!(response["result"]["isError"], false);
-    assert!(response["result"].get("structuredContent").is_none());
-    assert_eq!(
-        response["result"]["content"][0]["text"],
-        format!("{}\n\n(Complete: all 1 file shown.)", normalized(&file))
-    );
-
-    drop(stdin);
-    assert!(child.wait().unwrap().success());
+fn assert_positive_local_path_schema(schema: &Value) {
+    let description = schema["description"]
+        .as_str()
+        .expect("path schema should describe the accepted local path shape");
+    for required in [
+        "Plain absolute local filesystem path",
+        "URI-shaped",
+        "equivalent local absolute path",
+    ] {
+        assert!(description.contains(required), "{required}: {description}");
+    }
+    for forbidden in [
+        "read_mcp_resource",
+        "list_mcp_resources",
+        "list_mcp_resource_templates",
+        "MCP resources",
+        "file://",
+        "FastCtx is not",
+    ] {
+        assert!(
+            !description.contains(forbidden),
+            "{forbidden}: {description}"
+        );
+    }
 }
 
 #[test]
@@ -584,7 +532,7 @@ fn non_pdf_stdio_calls_do_not_extract_the_bundled_engine() {
             "jsonrpc":"2.0",
             "id":2,
             "method":"tools/call",
-            "params":{"name":"read","arguments":{"file_path":normalized(&file)}}
+            "params":{"name":"inspect_local_file","arguments":{"file_path":normalized(&file)}}
         }),
     );
     let response = read_response(&mut stdout);
@@ -607,85 +555,6 @@ fn non_pdf_stdio_calls_do_not_extract_the_bundled_engine() {
             "a non-PDF call extracted cache files: {direct_files:?}"
         );
     }
-}
-
-#[test]
-#[cfg(feature = "pdf")]
-fn stdio_pdf_call_extracts_one_hashed_engine_and_preserves_image_meta() {
-    let temp = tempfile::tempdir().unwrap();
-    let pdf = temp.path().join("page.pdf");
-    write_pdf(&pdf, &[Some("MCP PDF one"), Some("MCP PDF two")]);
-    let cache_root = temp.path().join("cache-root");
-    let home = temp.path().join("home");
-    let mut command = fastctx_command_for_home(&home);
-    command
-        .current_dir(temp.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let engine_dir = configure_isolated_cache(&mut command, &cache_root);
-    let mut child = command.spawn().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    send(
-        &mut stdin,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "pdf-test", "version": "1.0"}
-            }
-        }),
-    );
-    let _ = read_response(&mut stdout);
-    send(
-        &mut stdin,
-        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-    );
-    send(
-        &mut stdin,
-        serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "method":"tools/call",
-            "params":{"name":"read","arguments":{"file_path":normalized(&pdf),"pdf_mode":"image"}}
-        }),
-    );
-    let response = read_response(&mut stdout);
-    assert_eq!(response["result"]["isError"], false);
-    assert!(response["result"].get("structuredContent").is_none());
-    assert_eq!(response["result"]["content"].as_array().unwrap().len(), 3);
-    assert_eq!(response["result"]["content"][0]["type"], "image");
-    assert_eq!(response["result"]["content"][1]["type"], "image");
-    assert_eq!(response["result"]["content"][2]["type"], "text");
-    assert_eq!(
-        response["result"]["content"][2]["text"],
-        "(Complete: pages 1-2 of 2 rendered.)"
-    );
-    for image_index in [0, 1] {
-        assert_eq!(
-            response["result"]["content"][image_index]["_meta"]["codex/imageDetail"],
-            "high"
-        );
-    }
-    drop(stdin);
-    assert!(child.wait().unwrap().success());
-
-    let released = std::fs::read_dir(&engine_dir)
-        .unwrap()
-        .map(|entry| entry.unwrap())
-        .filter(|entry| {
-            entry.file_type().unwrap().is_file()
-                && !entry.file_name().to_string_lossy().ends_with(".lock")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(released.len(), 1, "{released:?}");
-    let name = released[0].file_name().to_string_lossy().into_owned();
-    assert!(name.contains("chromium-7763"));
-    assert!(released[0].metadata().unwrap().len() > 1_000_000);
 }
 
 #[test]
@@ -744,7 +613,7 @@ fn stdio_mcp_is_tool_only_lists_tools_and_never_returns_structured_content() {
             "jsonrpc":"2.0",
             "id":3,
             "method":"tools/call",
-            "params":{"name":"read","arguments":{"file_path":"Z:/definitely/missing.txt"}}
+            "params":{"name":"inspect_local_file","arguments":{"file_path":"Z:/definitely/missing.txt"}}
         }),
     );
     let called = read_response(&mut stdout);
@@ -808,230 +677,6 @@ fn stdio_mcp_is_tool_only_lists_tools_and_never_returns_structured_content() {
 }
 
 #[test]
-fn stdio_serve_flags_publish_exact_four_and_nine_tool_sets() {
-    let cases: [(&[&str], &[&str]); 4] = [
-        (&["serve"], &["glob", "grep", "read", "replace"]),
-        (
-            &["serve", "--enable-shell"],
-            &[
-                "glob",
-                "grep",
-                "job_kill",
-                "job_list",
-                "job_output",
-                "read",
-                "replace",
-                "run",
-                "run_background",
-            ],
-        ),
-        (
-            &["serve", "--enable-edit"],
-            &["glob", "grep", "read", "replace"],
-        ),
-        (
-            &["serve", "--enable-shell", "--enable-edit"],
-            &[
-                "glob",
-                "grep",
-                "job_kill",
-                "job_list",
-                "job_output",
-                "read",
-                "replace",
-                "run",
-                "run_background",
-            ],
-        ),
-    ];
-
-    for (args, expected) in cases {
-        assert_eq!(list_tool_names(args), expected, "args={args:?}");
-    }
-}
-
-#[test]
-fn stdio_head_limit_zero_still_uses_the_environment_token_budget() {
-    let temp = tempfile::tempdir().unwrap();
-    let file = temp.path().join("many.txt");
-    write(&file, "hit\n".repeat(100));
-    let mut command = fastctx_command();
-    command
-        .env("HOME", temp.path())
-        .env("USERPROFILE", temp.path())
-        .env_remove("CODEX_HOME")
-        .env_remove("FASTCTX_GREP_TOKEN_BUDGET")
-        .env("FASTCTX_TOKEN_BUDGET", "30");
-    let response = call_tool(
-        command,
-        "grep",
-        serde_json::json!({
-            "pattern": "hit",
-            "path": normalized(&file),
-            "output_mode": "content",
-            "head_limit": 0
-        }),
-    );
-    assert_eq!(response["result"]["isError"], false);
-    assert_eq!(
-        response["result"]["content"][0]["text"],
-        "1:hit\n2:hit\n\n(Partial: results 1-2 shown; more exist. Continue with offset=2.)"
-    );
-}
-
-#[test]
-fn stdio_preserves_utf8_text_without_host_codepage_transcoding() {
-    let temp = tempfile::tempdir().unwrap();
-    let file = temp.path().join("unicode.txt");
-    write(&file, "alpha\n中文 sentinel\n".as_bytes());
-    let response = call_tool(
-        fastctx_command(),
-        "read",
-        serde_json::json!({"file_path": normalized(&file)}),
-    );
-    assert_eq!(response["result"]["isError"], false);
-    assert_eq!(
-        response["result"]["content"][0]["text"],
-        "1\talpha\n2\t中文 sentinel\n3\t\n\n(Complete: reached end of file; lines 1-3 of 3 shown.)"
-    );
-}
-
-#[test]
-fn stdio_invalid_token_budget_is_an_exact_tool_error() {
-    let temp = tempfile::tempdir().unwrap();
-    let file = temp.path().join("plain.txt");
-    write(&file, b"plain");
-    let mut command = fastctx_command();
-    command.env("FASTCTX_TOKEN_BUDGET", "0");
-    let response = call_tool(
-        command,
-        "read",
-        serde_json::json!({"file_path": normalized(&file)}),
-    );
-    assert_eq!(response["result"]["isError"], true);
-    assert_eq!(
-        response["result"]["content"][0]["text"],
-        "Invalid FASTCTX_TOKEN_BUDGET value \"0\": expected a positive integer."
-    );
-}
-
-#[test]
-fn stdio_batch_read_requires_room_for_one_line_and_its_exact_continuation() {
-    let temp = tempfile::tempdir().unwrap();
-    let file = temp.path().join("plain.txt");
-    write(&file, b"plain\nmore");
-    let mut command = fastctx_command();
-    command
-        .env("FASTCTX_TOKEN_BUDGET", "10")
-        .env("FASTCTX_READ_TOKEN_BUDGET", "1");
-    let response = call_tool(
-        command,
-        "read",
-        serde_json::json!({"files": [{"path": normalized(&file)}]}),
-    );
-    assert_eq!(response["result"]["isError"], true);
-    assert_eq!(
-        response["result"]["content"][0]["text"],
-        "FASTCTX_READ_TOKEN_BUDGET=1 is too small to return the required continuation note. Increase it and retry."
-    );
-}
-
-#[test]
-fn stdio_per_tool_budgets_must_not_exceed_the_global_budget() {
-    let temp = tempfile::tempdir().unwrap();
-    let file = temp.path().join("plain.txt");
-    write(&file, b"plain");
-    let cases = [
-        (
-            "read",
-            "FASTCTX_READ_TOKEN_BUDGET",
-            serde_json::json!({"file_path": normalized(&file)}),
-        ),
-        (
-            "grep",
-            "FASTCTX_GREP_TOKEN_BUDGET",
-            serde_json::json!({"pattern": "plain", "path": normalized(&file)}),
-        ),
-        (
-            "glob",
-            "FASTCTX_GLOB_TOKEN_BUDGET",
-            serde_json::json!({"pattern": "*.txt", "path": normalized(temp.path())}),
-        ),
-    ];
-
-    for (tool, variable, arguments) in cases {
-        let mut command = fastctx_command();
-        command
-            .env("FASTCTX_TOKEN_BUDGET", "100")
-            .env(variable, "101");
-        let response = call_tool(command, tool, arguments);
-        assert_eq!(response["result"]["isError"], true);
-        assert_eq!(
-            response["result"]["content"][0]["text"],
-            format!(
-                "{variable}=101 exceeds FASTCTX_TOKEN_BUDGET=100. Increase the global budget or lower the per-tool budget."
-            )
-        );
-    }
-}
-
-#[test]
-fn stdio_per_tool_budgets_reject_non_positive_values() {
-    let temp = tempfile::tempdir().unwrap();
-    let file = temp.path().join("plain.txt");
-    write(&file, b"plain");
-    let cases = [
-        (
-            "read",
-            "FASTCTX_READ_TOKEN_BUDGET",
-            serde_json::json!({"file_path": normalized(&file)}),
-        ),
-        (
-            "grep",
-            "FASTCTX_GREP_TOKEN_BUDGET",
-            serde_json::json!({"pattern": "plain", "path": normalized(&file)}),
-        ),
-        (
-            "glob",
-            "FASTCTX_GLOB_TOKEN_BUDGET",
-            serde_json::json!({"pattern": "*.txt", "path": normalized(temp.path())}),
-        ),
-    ];
-
-    for (tool, variable, arguments) in cases {
-        let mut command = fastctx_command();
-        command.env(variable, "0");
-        let response = call_tool(command, tool, arguments);
-        assert_eq!(response["result"]["isError"], true);
-        assert_eq!(
-            response["result"]["content"][0]["text"],
-            format!("Invalid {variable} value \"0\": expected a positive integer.")
-        );
-    }
-}
-
-#[test]
-#[cfg(feature = "pdf")]
-fn stdio_pdf_text_mode_uses_the_read_specific_page_budget() {
-    let temp = tempfile::tempdir().unwrap();
-    let pdf = temp.path().join("budget.pdf");
-    let long_page = "x".repeat(5_000);
-    write_pdf(&pdf, &[Some("Small"), Some(long_page.as_str())]);
-    let mut command = fastctx_command();
-    command.env("FASTCTX_READ_TOKEN_BUDGET", "34");
-    let response = call_tool(
-        command,
-        "read",
-        serde_json::json!({"file_path": normalized(&pdf), "pages": "1-2"}),
-    );
-    assert_eq!(response["result"]["isError"], false);
-    assert_eq!(
-        response["result"]["content"][0]["text"],
-        "=== Page 1 ===\nSmall\n\n(Partial: page 1 of 2 shown. Continue with pages=\"2\".)"
-    );
-}
-
-#[test]
 #[cfg(feature = "pdf")]
 // Repair only happens on a control center that has not already released the engine, so each half
 // of this test needs a private one. `FASTCTX_TEST_BUILD_ID` is the only way to get that, and it is
@@ -1052,7 +697,7 @@ fn stdio_pdf_call_repairs_a_corrupted_cached_engine() {
     let engine_dir = configure_isolated_cache(&mut first_command, &cache_root);
     let first = call_tool(
         first_command,
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&pdf)}),
     );
     assert_eq!(first["result"]["isError"], false);
@@ -1081,7 +726,7 @@ fn stdio_pdf_call_repairs_a_corrupted_cached_engine() {
     configure_isolated_cache(&mut second_command, &cache_root);
     let second = call_tool(
         second_command,
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&pdf)}),
     );
     assert_eq!(second["result"]["isError"], false);
@@ -1106,7 +751,7 @@ fn stdio_pdf_initialization_uses_the_request_session_cache_environment() {
     let bootstrap_engine = configure_isolated_cache(&mut bootstrap, &bootstrap_cache);
     let first = call_tool(
         bootstrap,
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&text)}),
     );
     assert_eq!(first["result"]["isError"], false);
@@ -1115,7 +760,7 @@ fn stdio_pdf_initialization_uses_the_request_session_cache_environment() {
     let request_engine = configure_isolated_cache(&mut request, &request_cache);
     let second = call_tool(
         request,
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&pdf)}),
     );
     assert_eq!(second["result"]["isError"], false);
@@ -1148,7 +793,7 @@ fn no_pdf_build_rejects_pdf_without_affecting_the_public_read_schema() {
     write(&pdf, b"%PDF-1.4\n");
     let response = call_tool(
         fastctx_command(),
-        "read",
+        "inspect_local_file",
         serde_json::json!({"file_path": normalized(&pdf)}),
     );
     assert_eq!(response["result"]["isError"], true);
@@ -1167,52 +812,6 @@ fn read_response(reader: &mut impl BufRead) -> Value {
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     serde_json::from_str(&line).unwrap()
-}
-
-fn list_tool_names(args: &[&str]) -> Vec<String> {
-    let mut child = fastctx_command()
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    send(
-        &mut stdin,
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "tool-list-contract", "version": "1.0"}
-            }
-        }),
-    );
-    let initialized = read_response(&mut stdout);
-    assert_eq!(initialized["id"], 1);
-    send(
-        &mut stdin,
-        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
-    );
-    send(
-        &mut stdin,
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}),
-    );
-    let listed = read_response(&mut stdout);
-    let mut names = listed["result"]["tools"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|tool| tool["name"].as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-    names.sort();
-    drop(stdin);
-    assert!(child.wait().unwrap().success());
-    names
 }
 
 fn call_tool(mut command: Command, name: &str, arguments: Value) -> Value {

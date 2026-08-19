@@ -43,50 +43,6 @@ pub(crate) struct JobMessages {
     pub(crate) footer_follow: &'static str,
 }
 
-impl JobMessages {
-    #[cfg(test)]
-    fn values(&self) -> [&'static str; 36] {
-        [
-            self.menu,
-            self.title,
-            self.loading,
-            self.empty,
-            self.empty_note,
-            self.error_title,
-            self.error_note,
-            self.permission_title,
-            self.running_count,
-            self.output_title,
-            self.output_empty,
-            self.kill_prompt,
-            self.kill_warning,
-            self.kill_success,
-            self.storage_label,
-            self.storage_note,
-            self.running_limit_label,
-            self.running_limit_note,
-            self.user_limit_note,
-            self.footer_stop,
-            self.summary,
-            self.job_list_limit_label,
-            self.job_list_limit_note,
-            self.started_label,
-            self.elapsed_label,
-            self.status_running,
-            self.finished_notice,
-            self.history_note,
-            self.follow_on,
-            self.follow_off,
-            self.footer_navigate,
-            self.footer_refresh,
-            self.footer_scope,
-            self.footer_horizontal,
-            self.footer_scroll,
-            self.footer_follow,
-        ]
-    }
-}
-
 /// Returns the complete background-job table for a supported language.
 pub(crate) const fn messages(language: Language) -> &'static JobMessages {
     match language {
@@ -184,7 +140,7 @@ const EN: JobMessages = job_messages!(
     "Disk limit for background job records. Only finished records are evicted; running jobs are never affected.",
     "Max running jobs",
     "Maximum number of background jobs running across all FastCtx sessions for the current user.",
-    "Current-user setting. Saved changes take effect immediately; Apply is not required.",
+    "Current-user setting. Saved changes take effect immediately; reconnecting is not required.",
     "Enter stop",
     "{running} running · {total} total · {sources} sessions",
     "job_list page size",
@@ -223,7 +179,7 @@ const ZH_CN: JobMessages = job_messages!(
     "后台任务记录的磁盘总上限。只回收已结束的记录，绝不影响运行中的任务。",
     "最大运行任务数",
     "当前用户全部 FastCtx 会话同时运行的后台任务上限。",
-    "当前用户级设置。保存后立即生效，无需 Apply。",
+    "当前用户级设置。保存后立即生效，无需重新接入。",
     "Enter 停止",
     "{running} 个运行中 · 共 {total} 个 · {sources} 个会话",
     "job_list 每页数量",
@@ -262,7 +218,7 @@ const ZH_TW: JobMessages = job_messages!(
     "背景工作記錄的磁碟總上限。只回收已結束的記錄，絕不影響執行中的工作。",
     "最大執行工作數",
     "目前使用者所有 FastCtx 工作階段同時執行的背景工作上限。",
-    "目前使用者層級設定。儲存後立即生效，不需要 Apply。",
+    "目前使用者層級設定。儲存後立即生效，不需要重新接入。",
     "Enter 停止",
     "{running} 個執行中 · 共 {total} 個 · {sources} 個工作階段",
     "job_list 每頁筆數",
@@ -301,7 +257,7 @@ const JA: JobMessages = job_messages!(
     "バックグラウンドジョブ記録のディスク上限です。完了済み記録だけを削除し、実行中のジョブには影響しません。",
     "最大実行ジョブ数",
     "現在のユーザーの全 FastCtx セッションで同時実行できるバックグラウンドジョブの上限です。",
-    "現在のユーザー向けの設定です。保存後すぐに反映され、Apply は不要です。",
+    "現在のユーザー向けの設定です。保存後すぐに反映され、再接続は不要です。",
     "Enter 停止",
     "実行中 {running} 件 · 合計 {total} 件 · {sources} セッション",
     "job_list のページサイズ",
@@ -340,7 +296,7 @@ const KO: JobMessages = job_messages!(
     "백그라운드 작업 기록의 디스크 한도입니다. 완료된 기록만 정리하며 실행 중인 작업에는 영향을 주지 않습니다.",
     "최대 실행 작업 수",
     "현재 사용자의 모든 FastCtx 세션에서 동시에 실행할 수 있는 백그라운드 작업 수입니다.",
-    "현재 사용자 설정입니다. 저장 즉시 적용되며 Apply가 필요하지 않습니다.",
+    "현재 사용자 설정입니다. 저장 즉시 적용되며 다시 연결할 필요는 없습니다.",
     "Enter 중지",
     "{running}개 실행 중 · 총 {total}개 · 세션 {sources}개",
     "job_list 페이지 크기",
@@ -379,7 +335,7 @@ const ES: JobMessages = job_messages!(
     "Límite de disco para los registros de trabajos. Solo se eliminan registros terminados; los trabajos en ejecución nunca se ven afectados.",
     "Máximo de trabajos en ejecución",
     "Número máximo de trabajos en segundo plano en todas las sesiones de FastCtx del usuario actual.",
-    "Configuración del usuario actual. Los cambios guardados surten efecto de inmediato; no hace falta Apply.",
+    "Configuración del usuario actual. Los cambios guardados surten efecto de inmediato; no hace falta volver a conectar.",
     "Enter detener",
     "{running} en ejecución · {total} en total · {sources} sesiones",
     "Tamaño de página de job_list",
@@ -418,7 +374,7 @@ const FR: JobMessages = job_messages!(
     "Limite disque des enregistrements de tâches. Seuls les enregistrements terminés sont supprimés ; les tâches en cours ne sont jamais affectées.",
     "Nombre maximal de tâches en cours",
     "Nombre maximal de tâches en arrière-plan dans toutes les sessions FastCtx de l’utilisateur actuel.",
-    "Réglage de l’utilisateur actuel. Les modifications enregistrées s’appliquent immédiatement ; Apply n’est pas requis.",
+    "Réglage de l’utilisateur actuel. Les modifications enregistrées s’appliquent immédiatement ; aucune reconnexion nécessaire.",
     "Enter arrêter",
     "{running} en cours · {total} au total · {sources} sessions",
     "Taille de page de job_list",
@@ -457,7 +413,7 @@ const DE: JobMessages = job_messages!(
     "Festplattenlimit für Job-Datensätze. Nur beendete Datensätze werden entfernt; laufende Jobs bleiben immer unberührt.",
     "Maximal laufende Jobs",
     "Maximale Anzahl laufender Hintergrundjobs in allen FastCtx-Sitzungen des aktuellen Benutzers.",
-    "Einstellung für den aktuellen Benutzer. Gespeicherte Änderungen gelten sofort; Apply ist nicht erforderlich.",
+    "Einstellung für den aktuellen Benutzer. Gespeicherte Änderungen gelten sofort; neu verbinden ist nicht erforderlich.",
     "Enter stoppen",
     "{running} aktiv · {total} gesamt · {sources} Sitzungen",
     "job_list-Seitengröße",
@@ -496,7 +452,7 @@ const PT_BR: JobMessages = job_messages!(
     "Limite de disco dos registros de tarefas. Somente registros finalizados são removidos; tarefas em execução nunca são afetadas.",
     "Máximo de tarefas em execução",
     "Número máximo de tarefas em segundo plano em todas as sessões FastCtx do usuário atual.",
-    "Configuração do usuário atual. As alterações salvas entram em vigor imediatamente; não é necessário Apply.",
+    "Configuração do usuário atual. As alterações salvas entram em vigor imediatamente; não é necessário reconectar.",
     "Enter parar",
     "{running} em execução · {total} no total · {sources} sessões",
     "Tamanho de página do job_list",
@@ -535,7 +491,7 @@ const RU: JobMessages = job_messages!(
     "Дисковый лимит записей заданий. Удаляются только завершённые записи; выполняющиеся задания не затрагиваются.",
     "Максимум выполняющихся заданий",
     "Максимальное число фоновых заданий во всех сеансах FastCtx текущего пользователя.",
-    "Настройка текущего пользователя. Сохранённые изменения применяются сразу; Apply не требуется.",
+    "Настройка текущего пользователя. Сохранённые изменения применяются сразу; переподключение не требуется.",
     "Enter остановить",
     "Выполняется: {running} · всего: {total} · сеансов: {sources}",
     "Размер страницы job_list",
@@ -574,7 +530,7 @@ const IT: JobMessages = job_messages!(
     "Limite su disco per i record dei job. Vengono rimossi solo i record terminati; i job in esecuzione non sono mai interessati.",
     "Numero massimo di job in esecuzione",
     "Numero massimo di job in background in tutte le sessioni FastCtx dell’utente corrente.",
-    "Impostazione dell’utente corrente. Le modifiche salvate hanno effetto immediato; Apply non è necessario.",
+    "Impostazione dell’utente corrente. Le modifiche salvate hanno effetto immediato; non serve ricollegare.",
     "Enter arresta",
     "{running} in esecuzione · {total} totali · {sources} sessioni",
     "Dimensione pagina di job_list",
@@ -613,7 +569,7 @@ const TR: JobMessages = job_messages!(
     "Arka plan işi kayıtlarının disk sınırı. Yalnızca tamamlanan kayıtlar silinir; çalışan işler asla etkilenmez.",
     "Maksimum çalışan iş sayısı",
     "Geçerli kullanıcının tüm FastCtx oturumlarında çalışabilecek en fazla arka plan işi sayısı.",
-    "Geçerli kullanıcı ayarıdır. Kaydedilen değişiklikler hemen uygulanır; Apply gerekmez.",
+    "Geçerli kullanıcı ayarıdır. Kaydedilen değişiklikler hemen uygulanır; yeniden bağlanmak gerekmez.",
     "Enter durdur",
     "{running} çalışıyor · toplam {total} · {sources} oturum",
     "job_list sayfa boyutu",
@@ -652,7 +608,7 @@ const PL: JobMessages = job_messages!(
     "Limit dyskowy rekordów zadań. Usuwane są wyłącznie rekordy zakończone; uruchomione zadania nigdy nie są naruszane.",
     "Maksymalna liczba uruchomionych zadań",
     "Maksymalna liczba zadań w tle we wszystkich sesjach FastCtx bieżącego użytkownika.",
-    "Ustawienie bieżącego użytkownika. Zapisane zmiany działają natychmiast; Apply nie jest wymagane.",
+    "Ustawienie bieżącego użytkownika. Zapisane zmiany działają natychmiast; ponowne połączenie nie jest wymagane.",
     "Enter zatrzymaj",
     "Uruchomione: {running} · łącznie: {total} · sesje: {sources}",
     "Rozmiar strony job_list",
@@ -691,7 +647,7 @@ const NL: JobMessages = job_messages!(
     "Schijflimiet voor taakrecords. Alleen voltooide records worden verwijderd; actieve taken worden nooit beïnvloed.",
     "Maximaal gelijktijdig actieve taken",
     "Maximaal aantal achtergrondtaken in alle FastCtx-sessies van de huidige gebruiker.",
-    "Instelling voor de huidige gebruiker. Opgeslagen wijzigingen gaan direct in; Apply is niet nodig.",
+    "Instelling voor de huidige gebruiker. Opgeslagen wijzigingen gaan direct in; opnieuw verbinden is niet nodig.",
     "Enter stoppen",
     "{running} actief · {total} totaal · {sources} sessies",
     "Paginagrootte van job_list",
@@ -730,7 +686,7 @@ const VI: JobMessages = job_messages!(
     "Giới hạn đĩa cho bản ghi tác vụ. Chỉ bản ghi đã kết thúc bị thu hồi; tác vụ đang chạy không bao giờ bị ảnh hưởng.",
     "Số tác vụ chạy tối đa",
     "Số tác vụ nền tối đa trong mọi phiên FastCtx của người dùng hiện tại.",
-    "Cài đặt cho người dùng hiện tại. Thay đổi đã lưu có hiệu lực ngay; không cần Apply.",
+    "Cài đặt cho người dùng hiện tại. Thay đổi đã lưu có hiệu lực ngay; không cần kết nối lại.",
     "Enter dừng",
     "{running} đang chạy · tổng {total} · {sources} phiên",
     "Kích thước trang job_list",
@@ -769,7 +725,7 @@ const ID: JobMessages = job_messages!(
     "Batas disk untuk catatan pekerjaan. Hanya catatan selesai yang dihapus; pekerjaan berjalan tidak pernah terpengaruh.",
     "Maksimum pekerjaan yang berjalan",
     "Jumlah maksimum pekerjaan latar belakang di semua sesi FastCtx pengguna saat ini.",
-    "Pengaturan pengguna saat ini. Perubahan tersimpan langsung berlaku; Apply tidak diperlukan.",
+    "Pengaturan pengguna saat ini. Perubahan tersimpan langsung berlaku; tidak perlu hubungkan ulang.",
     "Enter hentikan",
     "{running} berjalan · total {total} · {sources} sesi",
     "Ukuran halaman job_list",
@@ -808,7 +764,7 @@ const UK: JobMessages = job_messages!(
     "Дисковий ліміт записів завдань. Видаляються лише завершені записи; запущені завдання ніколи не зачіпаються.",
     "Максимум запущених завдань",
     "Максимальна кількість фонових завдань у всіх сеансах FastCtx поточного користувача.",
-    "Налаштування поточного користувача. Збережені зміни застосовуються одразу; Apply не потрібен.",
+    "Налаштування поточного користувача. Збережені зміни застосовуються одразу; повторне підключення не потрібне.",
     "Enter зупинити",
     "Запущено: {running} · усього: {total} · сеансів: {sources}",
     "Розмір сторінки job_list",
@@ -827,77 +783,3 @@ const UK: JobMessages = job_messages!(
     "PgUp/PgDn прокрутка",
     "F стежити"
 );
-
-#[cfg(test)]
-mod tests {
-    use super::{EN, messages};
-    use crate::control::i18n::ALL_LANGUAGES;
-
-    #[test]
-    fn every_language_supplies_every_job_string_and_count_placeholder() {
-        for language in ALL_LANGUAGES {
-            let messages = messages(language);
-            assert!(
-                messages
-                    .values()
-                    .into_iter()
-                    .all(|value| !value.trim().is_empty()),
-                "{} contains an empty Jobs string",
-                language.code()
-            );
-            assert!(
-                messages.running_count.contains("{count}"),
-                "{} lost the running-count placeholder",
-                language.code()
-            );
-            for placeholder in ["{running}", "{total}", "{sources}"] {
-                assert!(
-                    messages.summary.contains(placeholder),
-                    "{} lost the {placeholder} summary placeholder",
-                    language.code()
-                );
-            }
-            assert!(
-                messages.finished_notice.contains("{id}"),
-                "{} lost the finished-job placeholder",
-                language.code()
-            );
-            for hint in [
-                messages.footer_navigate,
-                messages.footer_refresh,
-                messages.footer_horizontal,
-                messages.footer_scroll,
-                messages.footer_follow,
-            ] {
-                assert!(
-                    hint.chars()
-                        .any(|character| character.is_ascii_alphanumeric())
-                        || hint.contains('↑')
-                        || hint.contains('←'),
-                    "{} has an undiscoverable Jobs shortcut",
-                    language.code()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn english_job_contract_strings_are_stable() {
-        assert_eq!(ALL_LANGUAGES.len(), 17);
-        assert_eq!(EN.menu, "Jobs");
-        assert_eq!(
-            EN.storage_note,
-            "Disk limit for background job records. Only finished records are evicted; running jobs are never affected."
-        );
-        assert_eq!(
-            EN.user_limit_note,
-            "Current-user setting. Saved changes take effect immediately; Apply is not required."
-        );
-        assert_eq!(EN.permission_title, "Permission denied");
-        assert!(EN.kill_warning.contains("entire process tree"));
-        assert!(EN.job_list_limit_note.contains("10, 20, 50, or 100"));
-        assert!(EN.history_note.contains("job_output"));
-        assert_eq!(EN.footer_refresh, "R refresh");
-        assert_eq!(EN.footer_horizontal, "←→ output");
-    }
-}

@@ -6,6 +6,7 @@ pub(crate) mod private_storage;
 mod replace;
 
 use crate::budget::token_budget;
+use crate::glob_filter::GlobPatterns;
 use crate::model::ToolResponse;
 use locks::PathIdentity;
 use schemars::JsonSchema;
@@ -20,10 +21,15 @@ pub struct ReplaceRequest {
     pub pattern: String,
     /// Replacement text; $1/${name} reference groups, $$ is a literal $, empty deletes the match.
     pub replacement: String,
-    /// Absolute path of the file or directory to edit.
+    /// File or directory to edit.
+    #[schemars(description = crate::model_guidance::local_path_description(
+        "File or directory to edit."
+    ))]
     pub path: String,
-    /// Glob filter for directory targets, e.g. "*.rs", "**/*.{ts,tsx}".
-    pub glob: Option<String>,
+    /// Globs for directory targets, e.g. ["**/*.rs", "!tests/**"]. A leading `!` excludes and always wins; negative-only lists include every other file.
+    // Published as a plain string array; see the note on GlobRequest::pattern. (2026-08-17)
+    #[schemars(with = "Option<Vec<String>>")]
+    pub glob: Option<GlobPatterns>,
     /// Treat pattern as a literal string, not a regex.
     pub literal: Option<bool>,
     /// Case-insensitive matching.

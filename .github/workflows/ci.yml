@@ -18,6 +18,15 @@ concurrency:
 permissions:
   contents: read
 
+# The pinned Pdfium archive is a build input rather than a build output, so it belongs
+# in its own cache instead of the Cargo one. Cargo gives every feature-and-profile
+# combination its own build script run and the steps below visit several, so an
+# uncached job pulls the same bytes once per combination from a release CDN that has
+# taken this matrix red on its own. Absolute, because `cargo publish --dry-run` builds
+# from a staged copy under target/ and would resolve a relative path elsewhere.
+env:
+  FASTCTX_PDFIUM_CACHE_DIR: ${{ github.workspace }}/.pdfium-archive-cache
+
 jobs:
   test:
     name: ${{ matrix.target }}
@@ -28,6 +37,8 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: macos-15-intel
@@ -145,6 +156,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Cache the pinned Pdfium archive
+        uses: actions/cache@v4
+        with:
+          path: .pdfium-archive-cache
+          key: pdfium-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.rs') }}
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -202,6 +219,15 @@ jobs:
       - name: Lint without PDF support
         run: cargo clippy --locked --no-default-features --all-targets --target ${{ matrix.target }} -- -D warnings
 
+      # The lints above run in debug, so anything gated on `debug_assertions`
+      # compiles out of the release profile unseen: a parameter used only by a
+      # test hook reads as unused, and its `mut` as unnecessary. That blind spot
+      # has now produced warnings twice, in two different modules. One platform
+      # closes it, because `debug_assertions` has nothing to do with the target.
+      - name: Lint the release profile
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo clippy --locked --release --all-targets --all-features --target ${{ matrix.target }} -- -D warnings
+
       - name: Set up Node.js for npm packaging
         uses: actions/setup-node@v6
         with:
@@ -226,6 +252,7 @@ jobs:
           $version = (Select-String -LiteralPath Cargo.toml -Pattern '^version = "([^"]+)"$').Matches[0].Groups[1].Value
           $platform = switch ("${{ matrix.target }}") {
             "x86_64-pc-windows-msvc" { "fastctx-win32-x64-$version.tgz" }
+            "aarch64-pc-windows-msvc" { "fastctx-win32-arm64-$version.tgz" }
             "x86_64-unknown-linux-gnu" { "fastctx-linux-x64-$version.tgz" }
             "x86_64-apple-darwin" { "fastctx-darwin-x64-$version.tgz" }
             "aarch64-apple-darwin" { "fastctx-darwin-arm64-$version.tgz" }
@@ -247,6 +274,11 @@ jobs:
       - name: Verify frozen v0.1.1 compatibility evidence
         run: python3 tools/verify-v011-assets.py
       - uses: Swatinem/rust-cache@v2
+      - name: Cache the pinned Pdfium archive
+        uses: actions/cache@v4
+        with:
+          path: .pdfium-archive-cache
+          key: pdfium-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.rs') }}
       - run: cargo publish --locked --dry-run
       - uses: actions/setup-node@v6
         with:
@@ -267,7 +299,14 @@ jobs:
         with:
           tool: cargo-about@0.9.0
       - run: cargo deny check
-      - run: mkdir -p target && cargo about generate --locked --format json --fail --output-file target/licenses.json
+      - run: cargo about generate --locked --fail about.hbs --output-file THIRD_PARTY_LICENSES_RUST.md
+      - name: Third-party license inventory is current
+        run: |
+          if ! git diff --quiet -- THIRD_PARTY_LICENSES_RUST.md; then
+            echo "::error::THIRD_PARTY_LICENSES_RUST.md no longer matches Cargo.lock. Regenerate it with 'cargo about generate --locked --fail about.hbs --output-file THIRD_PARTY_LICENSES_RUST.md' and commit the result."
+            git diff -- THIRD_PARTY_LICENSES_RUST.md
+            exit 1
+          fi
 
   msrv:
     name: Rust 1.88 minimum version
@@ -278,4 +317,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv-1.88.0
+      - name: Cache the pinned Pdfium archive
+        uses: actions/cache@v4
+        with:
+          path: .pdfium-archive-cache
+          key: pdfium-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.rs') }}
       - run: cargo check --locked --all-targets

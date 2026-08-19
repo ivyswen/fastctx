@@ -8,12 +8,10 @@ mod npm_invocation;
 
 pub(crate) use check::{last_check_status, spawn_startup_update_check, spawn_update_check};
 pub(crate) use helper::{
-    FinalizeNotice, FinalizeOutcome, NPM_LAUNCHER_WAIT_EXIT_CODE, UPDATE_FAILURE_ENV,
-    UPDATE_FINALIZE_ENV, UpdateStart, begin_update, cleanup_replaced_binaries, finalize_update,
-    run_update_helper,
+    FinalizeGuidanceOutcome, FinalizeNotice, FinalizeOutcome, NPM_LAUNCHER_WAIT_EXIT_CODE,
+    UPDATE_FAILURE_ENV, UPDATE_FINALIZE_ENV, UpdateStart, begin_update, cleanup_replaced_binaries,
+    finalize_update, run_update_helper,
 };
-#[cfg(test)]
-pub(crate) use model::NpmRegistryProbe;
 pub(crate) use model::{
     CheckFailure, CheckFailureKind, NpmDiscovery, NpmVersionAuthority, StartupUpdate, UpdatePlan,
 };

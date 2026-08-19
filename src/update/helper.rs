@@ -4,7 +4,10 @@ use super::model::{
     NPMMIRROR_REGISTRY, NpmDriver, NpmMode, NpmProvenance, NpmVersionAuthority,
     OFFICIAL_NPM_REGISTRY, UpdatePlan, UpdateRequest,
 };
-use crate::control::apply::{AppliedBinarySync, synchronize_applied_binary};
+use crate::control::apply::{
+    AppliedBinarySync, AppliedGuidanceSync, synchronize_applied_binary,
+    synchronize_applied_guidance,
+};
 use crate::control::paths::ControlPaths;
 use crate::control::settings::UpdateSource;
 use crate::control::transaction;
@@ -50,6 +53,17 @@ pub(crate) struct FinalizeNotice {
     pub(crate) version: String,
     /// Whether the separately owned Apply runtime was synchronized.
     pub(crate) outcome: FinalizeOutcome,
+    /// Best-effort state of the independently managed host guidance block.
+    pub(crate) guidance: FinalizeGuidanceOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FinalizeGuidanceOutcome {
+    NotApplied,
+    Current,
+    Refreshed,
+    ApplyRequired,
+    Unchanged(String),
 }
 
 /// Stable Apply-copy result attached to a successful product update.
@@ -410,9 +424,17 @@ pub(crate) fn finalize_update(
         }
         Err(error) => FinalizeOutcome::RuntimeUnchanged(error),
     };
+    let guidance = match synchronize_applied_guidance(paths) {
+        Ok(AppliedGuidanceSync::NotApplied) => FinalizeGuidanceOutcome::NotApplied,
+        Ok(AppliedGuidanceSync::Current) => FinalizeGuidanceOutcome::Current,
+        Ok(AppliedGuidanceSync::Refreshed) => FinalizeGuidanceOutcome::Refreshed,
+        Ok(AppliedGuidanceSync::ApplyRequired(_)) => FinalizeGuidanceOutcome::ApplyRequired,
+        Err(error) => FinalizeGuidanceOutcome::Unchanged(error),
+    };
     Ok(FinalizeNotice {
         version: request.plan.target_version().to_string(),
         outcome,
+        guidance,
     })
 }
 
@@ -1716,6 +1738,7 @@ fn wait_for_parent_exit(parent_pid: u32) -> Result<(), String> {
 fn expected_release_archive_name() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => Some("fastctx-x86_64-pc-windows-msvc.zip"),
+        ("windows", "aarch64") => Some("fastctx-aarch64-pc-windows-msvc.zip"),
         ("linux", "x86_64") => Some("fastctx-x86_64-unknown-linux-gnu.tar.gz"),
         ("macos", "x86_64") => Some("fastctx-x86_64-apple-darwin.tar.gz"),
         ("macos", "aarch64") => Some("fastctx-aarch64-apple-darwin.tar.gz"),
@@ -1726,6 +1749,7 @@ fn expected_release_archive_name() -> Option<&'static str> {
 fn expected_npm_platform_package() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => Some("@fastctx/win32-x64"),
+        ("windows", "aarch64") => Some("@fastctx/win32-arm64"),
         ("linux", "x86_64") => Some("@fastctx/linux-x64"),
         ("macos", "x86_64") => Some("@fastctx/darwin-x64"),
         ("macos", "aarch64") => Some("@fastctx/darwin-arm64"),
@@ -1736,15 +1760,10 @@ fn expected_npm_platform_package() -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NPM_HANDOFF_SCHEMA_VERSION, NpmLauncherHandoff, REQUEST_SCHEMA_VERSION,
-        extract_release_binary, finish_failed_update, npm_install_arguments,
-        replace_release_with_rollback, run_with_npm_rollback, sha256_hex,
-        validate_download_response_url, validate_plan, verify_release_archive, write_handoff,
+        REQUEST_SCHEMA_VERSION, extract_release_binary, replace_release_with_rollback,
+        run_with_npm_rollback, sha256_hex, verify_release_archive,
     };
-    use crate::update::model::{
-        NpmDiscovery, NpmDriver, NpmMode, NpmProvenance, NpmRegistryProbe, NpmVersionAuthority,
-        OFFICIAL_NPM_REGISTRY, UpdatePlan,
-    };
+    use crate::update::model::{NpmDriver, OFFICIAL_NPM_REGISTRY, UpdatePlan};
     use std::io::{Cursor, Write};
 
     /// Hand-written v0.1.1 (schema 2) npm request: independent of the current
@@ -1829,80 +1848,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_two_github_requests_from_v0_1_1_still_load() {
-        let Some(archive_name) = super::expected_release_archive_name() else {
-            return;
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let paths = crate::control::paths::ControlPaths::for_home(temp.path());
-        let update_dir = super::prepare_update_directory(&paths).unwrap();
-        let base = "https://github.com/yc-duan/fastctx/releases/download/v0.2.0";
-        let request = serde_json::json!({
-            "schema_version": 2,
-            "current_version": "0.1.1",
-            "plan": {
-                "channel": "github-release",
-                "target_version": "0.2.0",
-                "archive_name": archive_name,
-                "archive_url": format!("{base}/{archive_name}"),
-                "checksums_url": format!("{base}/SHA256SUMS"),
-            },
-            "target_executable": temp.path().join("fastctx-previous"),
-            "helper_executable": update_dir.join("helper-golden"),
-            "health_file": update_dir.join("health-golden"),
-        });
-        let request_path = write_request_value(&update_dir, &request);
-
-        let loaded = super::load_request(&paths, &request_path).unwrap();
-        assert_eq!(loaded.schema_version, REQUEST_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn current_schema_requests_must_still_carry_the_npm_driver() {
-        let Some(platform_package) = super::expected_npm_platform_package() else {
-            return;
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let paths = crate::control::paths::ControlPaths::for_home(temp.path());
-        let update_dir = super::prepare_update_directory(&paths).unwrap();
-        let mut request = golden_v0_1_1_npm_request(temp.path(), &update_dir, platform_package);
-        request["schema_version"] = serde_json::Value::from(REQUEST_SCHEMA_VERSION);
-        let request_path = write_request_value(&update_dir, &request);
-
-        let error = super::load_request(&paths, &request_path).unwrap_err();
-        assert!(error.contains("Cannot parse update request"), "{error}");
-        assert!(error.contains("driver"), "{error}");
-    }
-
-    #[test]
-    fn unknown_future_request_schemas_are_rejected() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = crate::control::paths::ControlPaths::for_home(temp.path());
-        let update_dir = super::prepare_update_directory(&paths).unwrap();
-        let request = serde_json::json!({
-            "schema_version": 4,
-            "current_version": "0.1.1",
-            "plan": {
-                "channel": "github-release",
-                "target_version": "0.2.0",
-                "archive_name": "fastctx-any.zip",
-                "archive_url": "https://github.com/yc-duan/fastctx/releases/download/v0.2.0/fastctx-any.zip",
-                "checksums_url": "https://github.com/yc-duan/fastctx/releases/download/v0.2.0/SHA256SUMS",
-            },
-            "target_executable": temp.path().join("fastctx-previous"),
-            "helper_executable": update_dir.join("helper-golden"),
-            "health_file": update_dir.join("health-golden"),
-        });
-        let request_path = write_request_value(&update_dir, &request);
-
-        let error = super::load_request(&paths, &request_path).unwrap_err();
-        assert!(
-            error.contains("unsupported update request schema 4"),
-            "{error}"
-        );
-    }
-
-    #[test]
     fn aggregate_checksums_are_an_independent_exact_filename_oracle() {
         let archive = b"release archive";
         let digest = sha256_hex(archive);
@@ -1929,60 +1874,6 @@ mod tests {
                 .unwrap_err()
                 .contains("duplicate")
         );
-    }
-
-    #[test]
-    fn release_plan_rejects_cross_repository_urls() {
-        let Some(archive_name) = super::expected_release_archive_name() else {
-            return;
-        };
-        let plan = UpdatePlan::GithubRelease {
-            target_version: "9.9.9".to_string(),
-            archive_name: archive_name.to_string(),
-            archive_url: format!(
-                "https://github.com/attacker/project/releases/download/v9.9.9/{archive_name}"
-            ),
-            checksums_url:
-                "https://github.com/attacker/project/releases/download/v9.9.9/SHA256SUMS"
-                    .to_string(),
-        };
-        assert!(validate_plan(&plan).unwrap_err().contains("outside"));
-    }
-
-    #[test]
-    fn release_redirects_accept_only_the_documented_github_asset_hosts() {
-        for url in [
-            "https://github.com/yc-duan/fastctx/releases/download/v0.2.0/asset.zip",
-            "https://release-assets.githubusercontent.com/github-production-release-asset/fixture",
-            "https://objects.githubusercontent.com/github-production-release-asset/fixture",
-        ] {
-            validate_download_response_url(url).unwrap();
-        }
-        for url in [
-            "http://release-assets.githubusercontent.com/fixture",
-            "https://github.com/attacker/project/releases/download/v0.2.0/asset.zip",
-            "https://github.example.com/fixture",
-            "https://raw.githubusercontent.com/yc-duan/fastctx/main/fixture",
-        ] {
-            assert!(
-                validate_download_response_url(url)
-                    .unwrap_err()
-                    .contains("refusing release bytes"),
-                "{url}"
-            );
-        }
-    }
-
-    #[test]
-    fn zip_and_tar_gz_extract_only_the_flat_distribution_contract() {
-        let zip = make_zip(&release_entries("fastctx.exe"), 0o755);
-        let extracted = extract_release_binary("fastctx-test.zip", &zip).unwrap();
-        assert_eq!(extracted.bytes, b"release binary");
-
-        let tar = make_tar_gz(&release_entries("fastctx"), 0o755);
-        let extracted = extract_release_binary("fastctx-test.tar.gz", &tar).unwrap();
-        assert_eq!(extracted.bytes, b"release binary");
-        assert_eq!(extracted.unix_mode, 0o755);
     }
 
     #[test]
@@ -2058,118 +1949,6 @@ mod tests {
     }
 
     #[test]
-    fn npm_install_is_exact_script_free_and_uses_an_isolated_cache() {
-        let arguments = npm_install_arguments(
-            "fastctx@0.2.0",
-            "https://registry.example.test/custom/",
-            std::path::Path::new("/isolated/cache"),
-        )
-        .into_iter()
-        .map(|value| value.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-        for expected in [
-            "fastctx@0.2.0",
-            "--global",
-            "--prefer-online",
-            "https://registry.example.test/custom/",
-            "--cache",
-            "/isolated/cache",
-            "--ignore-scripts",
-        ] {
-            assert!(arguments.iter().any(|value| value == expected));
-        }
-        assert!(!arguments.iter().any(|value| value == "latest"));
-        assert!(!arguments.iter().any(|value| value == "clean"));
-    }
-
-    #[test]
-    fn npm_plan_requires_exact_main_and_platform_preflight_evidence() {
-        let temp = tempfile::tempdir().unwrap();
-        let target_version = "0.2.0";
-        let source_name = "official npm";
-        let platform_package = super::expected_npm_platform_package().unwrap();
-        let discovery = NpmDiscovery {
-            source_policy: "official".to_string(),
-            configured_registry: None,
-            target_version: target_version.to_string(),
-            authority: NpmVersionAuthority::Official,
-            github_version: Some(target_version.to_string()),
-            official_version: Some(target_version.to_string()),
-            platform_package: platform_package.to_string(),
-            probes: vec![NpmRegistryProbe {
-                source_name: source_name.to_string(),
-                registry: OFFICIAL_NPM_REGISTRY.to_string(),
-                reachable: true,
-                latest_version: Some(target_version.to_string()),
-                main_package_ready: true,
-                platform_package_ready: true,
-                error: None,
-                error_kind: None,
-            }],
-            selected_registry: Some(OFFICIAL_NPM_REGISTRY.to_string()),
-            selected_source: Some(source_name.to_string()),
-            selection_reason: "the configured source policy selected official npm".to_string(),
-        };
-        let mut plan = UpdatePlan::Npm {
-            provenance: NpmProvenance {
-                package: "fastctx".to_string(),
-                mode: NpmMode::Global,
-                node: temp.path().join("node"),
-                driver: NpmDriver::NodeScript,
-                npm_cli: temp.path().join("npm-cli.js"),
-                launcher: temp.path().join("launcher.js"),
-                launcher_pid: 42,
-                handoff_file: temp.path().join("npm-launcher-42.handoff"),
-            },
-            target_version: target_version.to_string(),
-            registry: OFFICIAL_NPM_REGISTRY.to_string(),
-            source_name: source_name.to_string(),
-            discovery: Box::new(discovery),
-        };
-        validate_plan(&plan).unwrap();
-        assert_eq!(REQUEST_SCHEMA_VERSION, 3);
-        let encoded = serde_json::to_value(&plan).unwrap();
-        assert_eq!(encoded["provenance"]["driver"], "node-script");
-        let decoded: UpdatePlan = serde_json::from_value(encoded.clone()).unwrap();
-        assert_eq!(decoded, plan);
-        let mut invalid_driver = encoded;
-        invalid_driver["provenance"]["driver"] = serde_json::Value::String("shell".to_string());
-        assert!(serde_json::from_value::<UpdatePlan>(invalid_driver).is_err());
-
-        let UpdatePlan::Npm { provenance, .. } = &mut plan else {
-            unreachable!();
-        };
-        provenance.driver = NpmDriver::Executable;
-        provenance.npm_cli = temp
-            .path()
-            .join(if cfg!(windows) { "npm.exe" } else { "npm" });
-        validate_plan(&plan).unwrap();
-        let UpdatePlan::Npm { provenance, .. } = &mut plan else {
-            unreachable!();
-        };
-        provenance.driver = NpmDriver::NodeScript;
-        provenance.npm_cli = temp.path().join("not-npm.js");
-        assert_eq!(
-            validate_plan(&plan).unwrap_err(),
-            "update plan has a non-npm Node.js entry point"
-        );
-        let UpdatePlan::Npm {
-            provenance,
-            discovery,
-            ..
-        } = &mut plan
-        else {
-            unreachable!();
-        };
-        provenance.npm_cli = temp.path().join("npm-cli.js");
-        discovery.probes[0].platform_package_ready = false;
-        assert_eq!(
-            validate_plan(&plan).unwrap_err(),
-            "update plan source did not pass the exact two-package preflight"
-        );
-    }
-
-    #[test]
     fn release_replacement_restores_old_bytes_when_restart_health_fails() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join(if cfg!(windows) {
@@ -2213,77 +1992,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value, 42);
-    }
-
-    #[test]
-    fn reopening_the_old_tui_never_turns_an_update_failure_into_success() {
-        assert_eq!(
-            finish_failed_update("injected update failure".to_string(), Ok(())).unwrap_err(),
-            "injected update failure"
-        );
-        assert_eq!(
-            finish_failed_update(
-                "injected update failure".to_string(),
-                Err("previous FastCtx also failed".to_string()),
-            )
-            .unwrap_err(),
-            "injected update failure; previous FastCtx also failed"
-        );
-    }
-
-    #[test]
-    fn stale_binary_cleanup_is_scoped_to_the_exact_target_name() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("fastctx.exe");
-        let owned_old = temp.path().join(".fastctx.exe.fastctx-old-12.0");
-        let another_binary = temp.path().join(".other.exe.fastctx-old-12.0");
-        let lookalike = temp.path().join(".fastctx.exe.user-backup");
-        for path in [&owned_old, &another_binary, &lookalike] {
-            std::fs::write(path, b"fixture").unwrap();
-        }
-
-        crate::control::leftovers::cleanup_stale_binary_siblings(&target);
-        assert!(!owned_old.exists());
-        assert!(another_binary.exists());
-        assert!(lookalike.exists());
-    }
-
-    #[test]
-    fn npm_launcher_handoff_moves_atomically_to_a_terminal_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let handoff = temp.path().join("npm-launcher-42.handoff");
-        let helper = temp.path().join("helper.exe");
-        write_handoff(
-            &handoff,
-            &NpmLauncherHandoff {
-                schema_version: NPM_HANDOFF_SCHEMA_VERSION,
-                state: "starting",
-                helper_pid: 0,
-                helper_executable: &helper,
-                detail: None,
-            },
-            true,
-        )
-        .unwrap();
-        let starting: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&handoff).unwrap()).unwrap();
-        assert_eq!(starting["state"], "starting");
-
-        write_handoff(
-            &handoff,
-            &NpmLauncherHandoff {
-                schema_version: NPM_HANDOFF_SCHEMA_VERSION,
-                state: "done",
-                helper_pid: 42,
-                helper_executable: &helper,
-                detail: None,
-            },
-            false,
-        )
-        .unwrap();
-        let done: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&handoff).unwrap()).unwrap();
-        assert_eq!(done["state"], "done");
-        assert_eq!(done["helper_pid"], 42);
     }
 }

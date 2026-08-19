@@ -201,16 +201,25 @@ impl fmt::Display for PathCodecError {
 
 impl std::error::Error for PathCodecError {}
 
-/// Parses a model-facing path and decodes each canonical normal component exactly once.
-pub(crate) fn parse_input_path(input: &str) -> Result<PathBuf, PathCodecError> {
+/// Parses a model-facing path, decoding canonical FastCtx components in plain paths exactly once.
+pub(crate) fn parse_input_path(input: &str) -> Result<PathBuf, String> {
+    let is_file_uri = crate::paths::is_local_file_uri_input(input);
+    let input = crate::paths::parse_local_path_input(input)?;
+    if is_file_uri {
+        // A URI names native path components, while FastCtx escapes are a model-facing display
+        // format. Decoding URI components again would reinterpret a literal token-shaped name.
+        return Ok(input);
+    }
     let mut decoded = PathBuf::new();
-    for component in Path::new(input).components() {
+    for component in input.components() {
         match component {
             Component::Prefix(prefix) => decoded.push(prefix.as_os_str()),
             Component::RootDir => decoded.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
             Component::CurDir => decoded.push("."),
             Component::ParentDir => decoded.push(".."),
-            Component::Normal(component) => decoded.push(decode_component_once(component)?),
+            Component::Normal(component) => {
+                decoded.push(decode_component_once(component).map_err(|error| error.to_string())?)
+            }
         }
     }
     Ok(decoded)

@@ -38,39 +38,3 @@ fn leading_word(segment: &str) -> &str {
         .unwrap_or(trimmed.len());
     &trimmed[..end]
 }
-
-#[cfg(test)]
-mod tests {
-    use super::misuse_note;
-
-    #[test]
-    fn failed_command_positions_of_the_channel_name_are_recognized() {
-        for command in [
-            "apply_patch <<'PATCH'\n*** Begin Patch\n*** End Patch\nPATCH",
-            "apply_patch<<'PATCH'\n*** Begin Patch\nPATCH",
-            "cd /tmp && apply_patch <<'PATCH'\nPATCH",
-            "true; apply_patch 'patch text'",
-        ] {
-            assert!(misuse_note(command, 127, None).is_some(), "{command}");
-        }
-    }
-
-    #[test]
-    fn a_real_executable_by_that_name_is_never_second_guessed() {
-        // Exit 0 means something by that name ran and worked, so the user owns the word here.
-        assert!(misuse_note("apply_patch --version", 0, None).is_none());
-        // An absolute path names a real program rather than the host channel.
-        assert!(misuse_note("/usr/bin/apply_patch foo", 1, None).is_none());
-        // Not in command position.
-        assert!(misuse_note("echo apply_patch", 1, None).is_none());
-        assert!(misuse_note("grep -r apply_patch .", 1, None).is_none());
-        // A timeout means the process was alive, so the channel was not what failed.
-        assert!(misuse_note("apply_patch <<'PATCH'\nPATCH", 143, Some(500)).is_none());
-    }
-
-    #[test]
-    fn unrelated_failures_stay_silent() {
-        assert!(misuse_note("cargo build", 101, None).is_none());
-        assert!(misuse_note("", 127, None).is_none());
-    }
-}

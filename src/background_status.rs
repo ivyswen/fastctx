@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 pub(crate) enum BackgroundState {
     Running,
     Exited(i32),
+    Killed,
     Interrupted,
 }
 
@@ -51,6 +52,7 @@ impl BackgroundStatus {
                     format_elapsed(now.duration_since(entry.started_at).unwrap_or_default())
                 ),
                 BackgroundState::Exited(code) => format!("{} exited {code}", entry.job_id),
+                BackgroundState::Killed => format!("{} killed", entry.job_id),
                 BackgroundState::Interrupted => format!("{} interrupted", entry.job_id),
             })
             .collect::<Vec<_>>()
@@ -60,11 +62,6 @@ impl BackgroundStatus {
             full_line: format!("(Background: {rendered}.)"),
             summary_line: format!("(Background: {running_count} {running_noun} running.)"),
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn full_line(&self) -> &str {
-        &self.full_line
     }
 }
 

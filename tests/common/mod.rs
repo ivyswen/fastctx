@@ -11,10 +11,12 @@ use lopdf::{
     Document, EncryptionState, EncryptionVersion, Object, Permissions, Stream, dictionary,
 };
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Idle timeout every test-spawned control center must use.
@@ -23,6 +25,75 @@ use std::time::{Duration, Instant};
 /// suite makes the next `cargo test` invocation fail to relink. Any test that spawns the binary
 /// outside [`McpSession::start`] has to set `FASTCTX_TEST_RUNTIME_IDLE_MS` to this value itself.
 pub const TEST_HOST_IDLE_MS: &str = "5000";
+const MCP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Gives every spawned fixture a private profile and OS cache/temp roots unless the caller
+/// explicitly selected a value for that variable.
+pub fn isolate_command(command: &mut Command, root: &Path) {
+    let default_home = root.join("home");
+    let home = command_environment_path(command, "HOME")
+        .or_else(|| command_environment_path(command, "USERPROFILE"))
+        .unwrap_or(default_home);
+    let temp = root.join("temp");
+    let local_app_data = root.join("local-app-data");
+    let app_data = root.join("app-data");
+    let xdg_runtime = root.join("xdg-runtime");
+    let xdg_config = root.join("xdg-config");
+    let xdg_cache = root.join("xdg-cache");
+    let xdg_data = root.join("xdg-data");
+    for path in [
+        &home,
+        &temp,
+        &local_app_data,
+        &app_data,
+        &xdg_runtime,
+        &xdg_config,
+        &xdg_cache,
+        &xdg_data,
+    ] {
+        fs::create_dir_all(path).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&xdg_runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for (name, value) in [
+        ("HOME", &home),
+        ("USERPROFILE", &home),
+        ("TMPDIR", &temp),
+        ("TMP", &temp),
+        ("TEMP", &temp),
+        ("LOCALAPPDATA", &local_app_data),
+        ("APPDATA", &app_data),
+        ("XDG_RUNTIME_DIR", &xdg_runtime),
+        ("XDG_CONFIG_HOME", &xdg_config),
+        ("XDG_CACHE_HOME", &xdg_cache),
+        ("XDG_DATA_HOME", &xdg_data),
+    ] {
+        if !command_has_environment_override(command, name) {
+            command.env(name, value);
+        }
+    }
+    if !command_has_environment_override(command, "CODEX_HOME") {
+        command.env_remove("CODEX_HOME");
+    }
+}
+
+fn command_has_environment_override(command: &Command, expected: &str) -> bool {
+    command
+        .get_envs()
+        .any(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case(expected))
+}
+
+fn command_environment_path(command: &Command, expected: &str) -> Option<PathBuf> {
+    command.get_envs().find_map(|(name, value)| {
+        name.to_string_lossy()
+            .eq_ignore_ascii_case(expected)
+            .then(|| value.map(PathBuf::from))
+            .flatten()
+    })
+}
 
 pub fn text(response: ToolResponse) -> String {
     assert!(!response.is_error, "unexpected tool error: {response:?}");
@@ -75,13 +146,20 @@ pub fn write(path: &Path, bytes: impl AsRef<[u8]>) {
 pub struct McpSession {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    responses: mpsc::Receiver<Result<String, String>>,
+    pending_responses: BTreeMap<i64, Value>,
     stderr: Option<ChildStderr>,
     next_id: i64,
+    _isolation: tempfile::TempDir,
 }
 
 impl McpSession {
     pub fn start(mut command: Command) -> Self {
+        let isolation = tempfile::Builder::new()
+            .prefix("fastctx-mcp-session-")
+            .tempdir()
+            .unwrap();
+        isolate_command(&mut command, isolation.path());
         if !command
             .get_envs()
             .any(|(name, _)| name == "FASTCTX_TEST_RUNTIME_IDLE_MS")
@@ -94,14 +172,18 @@ impl McpSession {
             .stderr(Stdio::piped());
         let mut child = command.spawn().unwrap();
         let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let stdout = child.stdout.take().unwrap();
+        let (response_sender, responses) = mpsc::channel();
+        std::thread::spawn(move || read_responses(stdout, response_sender));
         let stderr = child.stderr.take();
         let mut session = Self {
             child: Some(child),
             stdin: Some(stdin),
-            stdout,
+            responses,
+            pending_responses: BTreeMap::new(),
             stderr,
             next_id: 1,
+            _isolation: isolation,
         };
         let initialized = session.request(
             "initialize",
@@ -133,6 +215,11 @@ impl McpSession {
         )
     }
 
+    pub fn call_with_timeout(&mut self, name: &str, arguments: Value, timeout: Duration) -> Value {
+        let id = self.begin_call(name, arguments);
+        self.await_response_with_timeout(id, timeout)
+    }
+
     pub fn begin_call(&mut self, name: &str, arguments: Value) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -146,10 +233,20 @@ impl McpSession {
     }
 
     pub fn await_response(&mut self, id: i64) -> Value {
+        self.await_response_with_timeout(id, MCP_RESPONSE_TIMEOUT)
+    }
+
+    fn await_response_with_timeout(&mut self, id: i64, timeout: Duration) -> Value {
+        if let Some(response) = self.pending_responses.remove(&id) {
+            return response;
+        }
         loop {
-            let value = self.read();
+            let value = self.read_with_timeout(timeout);
             if value["id"].as_i64() == Some(id) {
                 return value;
+            }
+            if let Some(other_id) = value["id"].as_i64() {
+                self.pending_responses.insert(other_id, value);
             }
         }
     }
@@ -231,12 +328,7 @@ impl McpSession {
             "method": method,
             "params": params,
         }));
-        loop {
-            let value = self.read();
-            if value["id"].as_i64() == Some(id) {
-                return value;
-            }
-        }
+        self.await_response(id)
     }
 
     fn notify(&mut self, method: &str, params: Value) {
@@ -253,11 +345,35 @@ impl McpSession {
         stdin.flush().unwrap();
     }
 
-    fn read(&mut self) -> Value {
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).unwrap();
-        assert!(!line.is_empty(), "MCP server closed stdout before replying");
+    fn read_with_timeout(&mut self, timeout: Duration) -> Value {
+        let line = self
+            .responses
+            .recv_timeout(timeout)
+            .unwrap_or_else(|error| panic!("MCP server did not reply within {timeout:?}: {error}"))
+            .unwrap_or_else(|error| panic!("MCP server stdout failed: {error}"));
         serde_json::from_str(&line).unwrap()
+    }
+}
+
+fn read_responses(stdout: ChildStdout, sender: mpsc::Sender<Result<String, String>>) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                let _ = sender.send(Err("MCP server closed stdout before replying".to_string()));
+                return;
+            }
+            Ok(_) => {
+                if sender.send(Ok(line)).is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(Err(error.to_string()));
+                return;
+            }
+        }
     }
 }
 

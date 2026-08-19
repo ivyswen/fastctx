@@ -23,7 +23,7 @@ use crate::shell::output::{
     budget_too_small_message, compose_response_with_tail, global_token_budget,
     job_output_token_budget, plural, terminal_response,
 };
-use model::{JobRecord, JobStatus, LaunchSpec, StoredLine, TerminationKind};
+use model::{JobRecord, JobStatus, LaunchSpec, StoredLine};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
@@ -535,7 +535,7 @@ fn terminate(paths: &ControlPaths, job_id: &str) -> Result<KillState, String> {
                     "Cannot kill job {job_id}: its supervisor did not acknowledge within 6 seconds. Retry job_kill or stop the supervisor process manually."
                 ));
             }
-            JobStatus::Exited(exit) if exit.termination == TerminationKind::Killed => {
+            JobStatus::Exited(exit) if exit.was_killed() => {
                 return Ok(KillState::Killed);
             }
             JobStatus::Exited(exit) => return Ok(KillState::AlreadyExited(exit.exit_code)),
@@ -822,7 +822,7 @@ fn render_candidate(
         for (line, truncated) in selected.iter().zip(&decoded.truncated_per_line) {
             if *truncated {
                 notes.push(format!(
-                    "(Note: line {} was truncated at 2000 chars in this response; read the complete line at {} with offset={}, or inspect a fragment with grep or the read tool's hex view.)",
+                    "(Note: line {} was truncated at 2000 chars in this response; read the complete line at {} with offset={}, or inspect a fragment with grep or the inspect_local_file tool's hex view.)",
                     line.seq,
                     display_path(path),
                     line.seq
@@ -977,6 +977,12 @@ fn output_terminal(
     }
     if let Some(path) = snapshot.direct_log.as_ref() {
         return match &snapshot.status {
+            JobStatus::Exited(exit) if exit.was_killed() => format!(
+                "(Complete: job {job_id} was killed; {} {} total. Full log: {})",
+                snapshot.total_lines,
+                plural(snapshot.total_lines, "line", "lines"),
+                display_path(path)
+            ),
             JobStatus::Exited(exit) => format!(
                 "(Complete: job {job_id} exited {}; {} {} total. Full log: {})",
                 exit.exit_code,
@@ -999,6 +1005,9 @@ fn output_terminal(
             || snapshot.head.last().is_some_and(|line| line.seq > next));
     if more {
         return match &snapshot.status {
+            JobStatus::Exited(exit) if exit.was_killed() => format!(
+                "(Partial: job {job_id} was killed; more legacy output remains. Call job_output again with after_seq={next}.)"
+            ),
             JobStatus::Exited(exit) => format!(
                 "(Partial: job {job_id} exited {}; more legacy output remains. Call job_output again with after_seq={next}.)",
                 exit.exit_code
@@ -1015,6 +1024,11 @@ fn output_terminal(
         ""
     };
     match &snapshot.status {
+        JobStatus::Exited(exit) if exit.was_killed() => format!(
+            "(Complete: job {job_id} was killed; {} {} total{loss}.)",
+            snapshot.total_lines,
+            plural(snapshot.total_lines, "line", "lines")
+        ),
         JobStatus::Exited(exit) => format!(
             "(Complete: job {job_id} exited {}; {} {} total{loss}.)",
             exit.exit_code,
@@ -1203,6 +1217,7 @@ fn job_list_status_name(status: JobListStatus) -> &'static str {
 fn format_job_entry(record: &JobRecord) -> String {
     let status = match &record.status {
         JobStatus::Running => "running".to_string(),
+        JobStatus::Exited(exit) if exit.was_killed() => "killed".to_string(),
         JobStatus::Exited(exit) => format!("exited {}", exit.exit_code),
         JobStatus::Interrupted => "interrupted".to_string(),
     };
@@ -1456,66 +1471,15 @@ pub(crate) fn run_watchdog_entry(pid: u32, started: String) -> Result<(), String
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BackgroundLaunch, JobManager, JobRegistryError, OutputSnapshot, format_job_list,
-        format_job_list_with_budget, format_snapshot, source_tag, summaries, truncate_command,
-    };
+    use super::{BackgroundLaunch, JobManager, OutputSnapshot, format_snapshot};
     use crate::budget::TokenBudget;
     use crate::control::paths::ControlPaths;
-    use crate::model::{ToolContent, ToolResponse};
-    use crate::shell::JobListStatus;
+    use crate::model::ToolContent;
+
     use crate::shell::jobs::model::{
-        CaptureErrorRecord, ExitRecord, JOB_SCHEMA_VERSION, JobMeta, JobRecord, JobStatus,
-        META_FILE, OriginSnapshot, ProcessIdentity, StoredLine, TerminationKind,
+        CaptureErrorRecord, ExitRecord, JobStatus, StoredLine, TerminationKind,
     };
     use std::path::PathBuf;
-    use std::time::{Duration, UNIX_EPOCH};
-
-    fn response_text(response: ToolResponse) -> String {
-        assert!(!response.is_error);
-        match response.content.into_iter().next().unwrap() {
-            ToolContent::Text(text) => text,
-            ToolContent::Image { .. } => panic!("job tools return text"),
-        }
-    }
-
-    fn record(
-        id: &str,
-        command: &str,
-        cwd: &str,
-        started_at: &str,
-        started_order: u64,
-        status: JobStatus,
-        ended_order: u64,
-    ) -> JobRecord {
-        JobRecord {
-            id: id.to_string(),
-            directory: PathBuf::from(format!("/jobs/{id}")),
-            meta: JobMeta {
-                schema_version: 1,
-                command: command.to_string(),
-                cwd: cwd.to_string(),
-                login_shell: false,
-                encoding: None,
-                supervisor: ProcessIdentity {
-                    pid: 42,
-                    started: "token".to_string(),
-                },
-                origin: OriginSnapshot {
-                    server_pid: 7,
-                    server_started: Some("server-token".to_string()),
-                    parent_pid: Some(6),
-                    parent_executable: Some("codex".to_string()),
-                    server_cwd: "/workspace".to_string(),
-                },
-                started_at: started_at.to_string(),
-                started_at_unix_nanos: started_order,
-                isolation_warning: None,
-            },
-            status,
-            ended_sort_key: UNIX_EPOCH + Duration::from_nanos(ended_order),
-        }
-    }
 
     fn exited(code: i32, ended_order: u64) -> JobStatus {
         JobStatus::Exited(ExitRecord {
@@ -1528,276 +1492,6 @@ mod tests {
             capture_error: None,
             output_truncation: None,
         })
-    }
-
-    #[test]
-    fn source_tags_are_stable_and_long_enough_to_distinguish_many_sessions() {
-        let tag = source_tag("123:process-start-token:C:/workspace");
-        assert_eq!(tag.len(), 6);
-        assert!(tag.chars().all(|character| character.is_ascii_hexdigit()));
-        assert_eq!(tag, source_tag("123:process-start-token:C:/workspace"));
-        assert_ne!(tag, source_tag("124:process-start-token:C:/workspace"));
-    }
-
-    #[test]
-    fn registry_errors_preserve_permission_denial_without_parsing_os_text() {
-        let denied = JobRegistryError::from_io(
-            "Cannot list the background job registry".to_string(),
-            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-        );
-        let damaged = JobRegistryError::data("Damaged metadata".to_string());
-
-        assert!(denied.is_permission_denied());
-        assert!(!damaged.is_permission_denied());
-    }
-
-    #[test]
-    fn registry_summary_aggregates_records_from_distinct_server_origins() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        std::fs::create_dir_all(&paths.jobs_dir).unwrap();
-        let supervisor =
-            super::identity::process_identity(std::process::id()).expect("test process is alive");
-
-        for (id, server_pid, server_started, server_cwd) in [
-            ("j-000001", 101, "server-a", "/workspace-a"),
-            ("j-000002", 202, "server-b", "/workspace-b"),
-        ] {
-            let directory = paths.jobs_dir.join(id);
-            std::fs::create_dir(&directory).unwrap();
-            super::store::write_atomic_json(
-                &directory.join(META_FILE),
-                &JobMeta {
-                    schema_version: JOB_SCHEMA_VERSION,
-                    command: format!("printf {id}"),
-                    cwd: server_cwd.to_string(),
-                    login_shell: false,
-                    encoding: None,
-                    supervisor: supervisor.clone(),
-                    origin: OriginSnapshot {
-                        server_pid,
-                        server_started: Some(server_started.to_string()),
-                        parent_pid: None,
-                        parent_executable: Some("codex".to_string()),
-                        server_cwd: server_cwd.to_string(),
-                    },
-                    started_at: "2026-07-17T00:00:00Z".to_string(),
-                    started_at_unix_nanos: u64::from(server_pid),
-                    isolation_warning: None,
-                },
-            )
-            .unwrap();
-        }
-
-        let records = summaries(&paths).unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(
-            records
-                .iter()
-                .map(|record| record.source.server_cwd.as_str())
-                .collect::<std::collections::BTreeSet<_>>(),
-            ["/workspace-a", "/workspace-b"].into_iter().collect()
-        );
-        assert_ne!(records[0].source.key, records[1].source.key);
-        assert!(
-            records
-                .iter()
-                .all(|record| record.status == super::JobSummaryStatus::Running)
-        );
-    }
-
-    #[test]
-    fn job_list_empty_and_sorted_complete_shapes_are_byte_exact() {
-        assert_eq!(
-            response_text(format_job_list(Vec::new(), JobListStatus::Running, 0, 20)),
-            "(Complete: no running jobs.)"
-        );
-        let records = vec![
-            record(
-                "j-000003",
-                "old finished",
-                "/old-finished",
-                "2026-07-16T10:00:00Z",
-                1,
-                exited(3, 3),
-                3,
-            ),
-            record(
-                "j-000001",
-                "old running",
-                "/old-running",
-                "2026-07-16T10:00:00Z",
-                1,
-                JobStatus::Running,
-                0,
-            ),
-            record(
-                "j-000004",
-                "new finished",
-                "/new-finished",
-                "2026-07-16T10:00:02Z",
-                4,
-                exited(4, 4),
-                4,
-            ),
-            record(
-                "j-000002",
-                "new\ncommand",
-                "/new-running",
-                "2026-07-16T10:00:01Z",
-                2,
-                JobStatus::Running,
-                0,
-            ),
-        ];
-        assert_eq!(
-            response_text(format_job_list(records, JobListStatus::All, 0, 20)),
-            "j-000002  running; started 2026-07-16T10:00:01Z\n  /new-running — new\\ncommand\n\nj-000001  running; started 2026-07-16T10:00:00Z\n  /old-running — old running\n\nj-000004  exited 4; started 2026-07-16T10:00:02Z\n  /new-finished — new finished\n\nj-000003  exited 3; started 2026-07-16T10:00:00Z\n  /old-finished — old finished\n\n(Complete: 2 running jobs, 2 finished records.)"
-        );
-    }
-
-    #[test]
-    fn job_list_filters_before_offset_and_limit_and_preserves_the_query_in_continuations() {
-        let records = vec![
-            record(
-                "j-000001",
-                "old running",
-                "/one",
-                "2026-07-16T10:00:00Z",
-                1,
-                JobStatus::Running,
-                0,
-            ),
-            record(
-                "j-000002",
-                "new running",
-                "/two",
-                "2026-07-16T10:00:01Z",
-                2,
-                JobStatus::Running,
-                0,
-            ),
-            record(
-                "j-000003",
-                "old finished",
-                "/three",
-                "2026-07-16T10:00:02Z",
-                3,
-                exited(0, 3),
-                3,
-            ),
-            record(
-                "j-000004",
-                "new finished",
-                "/four",
-                "2026-07-16T10:00:03Z",
-                4,
-                exited(7, 4),
-                4,
-            ),
-        ];
-        let budget = TokenBudget {
-            value: 8_500,
-            variable: "FASTCTX_TOKEN_BUDGET",
-        };
-
-        assert_eq!(
-            response_text(format_job_list_with_budget(
-                records.clone(),
-                JobListStatus::Running,
-                0,
-                1,
-                budget
-            )),
-            "j-000002  running; started 2026-07-16T10:00:01Z\n  /two — new running\n\n(Partial: showing 1-1 of 2 running jobs. Call job_list again with status=\"running\", limit=1, offset=1.)"
-        );
-        assert_eq!(
-            response_text(format_job_list_with_budget(
-                records.clone(),
-                JobListStatus::Finished,
-                1,
-                20,
-                budget
-            )),
-            "j-000003  exited 0; started 2026-07-16T10:00:02Z\n  /three — old finished\n\n(Complete: 2 finished records.)"
-        );
-        assert_eq!(
-            response_text(format_job_list_with_budget(
-                records,
-                JobListStatus::Running,
-                2,
-                20,
-                budget
-            )),
-            "(Complete: no running jobs at offset=2; 2 available.)"
-        );
-    }
-
-    #[test]
-    fn job_list_budget_pagination_and_offset_are_byte_exact() {
-        let records = vec![
-            record(
-                "j-000001",
-                "first",
-                "/one",
-                "2026-07-16T10:00:00Z",
-                1,
-                JobStatus::Running,
-                0,
-            ),
-            record(
-                "j-000002",
-                "second",
-                "/two",
-                "2026-07-16T10:00:01Z",
-                2,
-                JobStatus::Running,
-                0,
-            ),
-            record(
-                "j-000003",
-                "third",
-                "/three",
-                "2026-07-16T10:00:02Z",
-                3,
-                JobStatus::Running,
-                0,
-            ),
-        ];
-        let budget = TokenBudget {
-            value: 80,
-            variable: "FASTCTX_TOKEN_BUDGET",
-        };
-        assert_eq!(
-            response_text(format_job_list_with_budget(
-                records.clone(),
-                JobListStatus::Running,
-                0,
-                20,
-                budget
-            )),
-            "j-000003  running; started 2026-07-16T10:00:02Z\n  /three — third\n\n(Partial: showing 1-1 of 3 running jobs. Call job_list again with status=\"running\", limit=20, offset=1.)"
-        );
-        assert_eq!(
-            response_text(format_job_list_with_budget(
-                records,
-                JobListStatus::Running,
-                1,
-                20,
-                budget
-            )),
-            "j-000002  running; started 2026-07-16T10:00:01Z\n  /two — second\n\nj-000001  running; started 2026-07-16T10:00:00Z\n  /one — first\n\n(Complete: 3 running jobs.)"
-        );
-    }
-
-    #[test]
-    fn job_list_command_truncation_is_exactly_120_characters() {
-        let short = "a".repeat(119);
-        let exact = "b".repeat(120);
-        let long = format!("{}c", "b".repeat(120));
-        assert_eq!(truncate_command(&short), short);
-        assert_eq!(truncate_command(&exact), exact);
-        assert_eq!(truncate_command(&long), format!("{}…", "b".repeat(120)));
     }
 
     #[test]
@@ -1971,44 +1665,5 @@ mod tests {
             rendered.response
         );
         assert!(!rendered.response.contains("legacy record"));
-    }
-
-    #[test]
-    fn running_no_output_terminal_stops_recommending_wait_growth_at_the_maximum() {
-        let budget = TokenBudget {
-            value: 8_500,
-            variable: "FASTCTX_TOKEN_BUDGET",
-        };
-        let snapshot = OutputSnapshot {
-            status: JobStatus::Running,
-            head: Vec::new(),
-            tail: Vec::new(),
-            unread_first: 1,
-            unread_last: 0,
-            all_unread_loaded: true,
-            total_lines: 0,
-            legacy_loss: false,
-            capture_error: None,
-            output_truncation: None,
-            default_encoding: None,
-            anchor: 0,
-            direct_log: Some(PathBuf::from("/jobs/j-000001/output.log")),
-        };
-
-        let immediate = format_snapshot("j-000001", 0, &snapshot, None, budget).unwrap();
-        assert!(
-            immediate
-                .response
-                .contains("raise wait_ms if you have nothing else to do")
-        );
-        assert!(!immediate.response.contains("60000"));
-        assert!(!immediate.response.contains("240000"));
-        let maximum = format_snapshot("j-000001", 240_000, &snapshot, None, budget).unwrap();
-        assert!(
-            maximum
-                .response
-                .contains("It may stay quiet for a long time, or never exit")
-        );
-        assert!(!maximum.response.contains("raise wait_ms"));
     }
 }

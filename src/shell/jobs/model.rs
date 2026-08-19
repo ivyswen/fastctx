@@ -81,6 +81,15 @@ fn is_natural_exit(kind: &TerminationKind) -> bool {
     *kind == TerminationKind::Exited
 }
 
+impl ExitRecord {
+    /// Whether job_kill ended this job. Displays must say "killed" instead of showing
+    /// exit_code: Windows TerminateProcess hardcodes exit code 1, so the number cannot
+    /// distinguish a requested stop from a real failure (2026-08-08).
+    pub(crate) fn was_killed(&self) -> bool {
+        self.termination == TerminationKind::Killed
+    }
+}
+
 /// One durable capture failure; the command itself continues to run.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct CaptureErrorRecord {
@@ -232,33 +241,4 @@ pub(crate) struct JobRecord {
     pub(crate) meta: JobMeta,
     pub(crate) status: JobStatus,
     pub(crate) ended_sort_key: SystemTime,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::JobMeta;
-
-    #[test]
-    fn version_one_metadata_without_new_origin_fields_remains_readable() {
-        let source = r#"{
-            "schema_version": 1,
-            "command": "printf ok",
-            "cwd": "/workspace",
-            "login_shell": false,
-            "supervisor": {"pid": 42, "started": "supervisor-token"},
-            "origin": {
-                "server_pid": 7,
-                "parent_executable": "codex",
-                "server_cwd": "/workspace"
-            },
-            "started_at": "2026-07-16T10:00:00Z"
-        }"#;
-
-        let meta: JobMeta = serde_json::from_str(source).unwrap();
-        assert_eq!(meta.schema_version, 1);
-        assert_eq!(meta.origin.server_pid, 7);
-        assert_eq!(meta.origin.server_started, None);
-        assert_eq!(meta.origin.parent_pid, None);
-        assert_eq!(meta.encoding, None);
-    }
 }

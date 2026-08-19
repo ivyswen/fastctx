@@ -4,6 +4,7 @@ use crate::budget::{
     GLOB_TOKEN_BUDGET_ENV, GLOBAL_TOKEN_BUDGET_ENV, GREP_TOKEN_BUDGET_ENV,
     JOB_OUTPUT_TOKEN_BUDGET_ENV, READ_TOKEN_BUDGET_ENV, RUN_TOKEN_BUDGET_ENV,
 };
+use crate::context_guard::{BURST_GAP, BurstTicket, GuardedBurstPool};
 use crate::control::paths::{CodexHomeSource, ControlPaths};
 use crate::control::provider::{EffectiveOutput, EffectiveOutputMode, ProviderDetection};
 use crate::control::settings::{FastCtxSettings, ToolBudgets};
@@ -241,9 +242,14 @@ impl SessionEnvironment {
 #[derive(Clone, Debug)]
 pub struct SessionContext {
     /// Exact native cwd/env captured by this connection's stdio proxy.
+    ///
+    /// This stays the sole basis for FastCtx's own identity — control paths, endpoint, budgets —
+    /// so restoring the machine's persisted environment can never relocate a user's state.
     pub environment: Arc<SessionEnvironment>,
     /// Session state used only by FastCtx's internal path and response-budget helpers.
     tool_environment: Arc<SessionEnvironment>,
+    /// Environment handed to commands the user runs, with the machine's persisted values restored.
+    pub command_environment: Arc<SessionEnvironment>,
     /// Per-user paths resolved exclusively from the connection environment.
     pub control_paths: ControlPaths,
     /// Saved FastCtx preferences visible to this connection.
@@ -252,6 +258,8 @@ pub struct SessionContext {
     pub provider: ProviderDetection,
     /// Provider-aware output policy made for this connection.
     pub effective_output: EffectiveOutput,
+    /// Aggregate response pool owned by this connection when Guarded is effective.
+    guarded_burst: Option<Arc<GuardedBurstPool>>,
 }
 
 impl SessionContext {
@@ -272,14 +280,19 @@ impl SessionContext {
             &provider,
         );
         let tool_environment = Arc::new(environment.with_guarded_output(effective_output));
+        let guarded_burst = guarded_burst_for(effective_output);
+        let command_environment =
+            Arc::new(crate::os_environment::command_environment(&environment));
         let environment = Arc::new(environment);
         Ok(Arc::new(Self {
             environment,
             tool_environment,
+            command_environment,
             control_paths,
             settings,
             provider,
             effective_output,
+            guarded_burst,
         }))
     }
 
@@ -309,13 +322,18 @@ impl SessionContext {
                 &provider,
             );
             let tool_environment = Arc::new(environment.with_guarded_output(effective_output));
+            let guarded_burst = guarded_burst_for(effective_output);
+            let command_environment =
+                Arc::new(crate::os_environment::command_environment(&environment));
             Arc::new(Self {
                 tool_environment,
+                command_environment,
                 environment: Arc::new(environment),
                 control_paths,
                 settings,
                 provider,
                 effective_output,
+                guarded_burst,
             })
         })
     }
@@ -329,6 +347,18 @@ impl SessionContext {
     pub fn tool_budgets(&self) -> ToolBudgets {
         self.effective_output.tool_budgets
     }
+
+    /// Registers one tool response with this connection's Guarded burst, when active.
+    pub(crate) fn begin_guarded_response(&self) -> Option<BurstTicket> {
+        self.guarded_burst.as_ref().map(GuardedBurstPool::begin)
+    }
+}
+
+fn guarded_burst_for(output: EffectiveOutput) -> Option<Arc<GuardedBurstPool>> {
+    if output.mode != EffectiveOutputMode::Guarded {
+        return None;
+    }
+    Some(GuardedBurstPool::new(output.fastctx_budget, BURST_GAP))
 }
 
 struct SessionEnvironmentScope {
@@ -474,15 +504,23 @@ fn is_budget_variable(name: &OsStr) -> bool {
 }
 
 #[cfg(windows)]
-fn environment_name_eq(candidate: &OsStr, expected: &str) -> bool {
+pub(crate) fn environment_name_eq(candidate: &OsStr, expected: &str) -> bool {
     candidate
         .to_str()
         .is_some_and(|candidate| candidate.eq_ignore_ascii_case(expected))
 }
 
 #[cfg(not(windows))]
-fn environment_name_eq(candidate: &OsStr, expected: &str) -> bool {
+pub(crate) fn environment_name_eq(candidate: &OsStr, expected: &str) -> bool {
     candidate == OsStr::new(expected)
+}
+
+/// Compares two native variable names under the same rules `environment_name_eq` applies.
+pub(crate) fn environment_name_eq_os(candidate: &OsStr, expected: &OsStr) -> bool {
+    match expected.to_str() {
+        Some(expected) => environment_name_eq(candidate, expected),
+        None => candidate == expected,
+    }
 }
 
 #[cfg(test)]

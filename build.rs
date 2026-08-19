@@ -8,10 +8,11 @@ use tar::Archive;
 
 const RELEASE_TAG: &str = "chromium/7763";
 const LOCAL_ARCHIVE_ENV: &str = "FASTCTX_PDFIUM_ARCHIVE";
+const CACHE_DIRECTORY_ENV: &str = "FASTCTX_PDFIUM_CACHE_DIR";
 const DISTRIBUTION_ENV: &str = "FASTCTX_DISTRIBUTION";
 const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LIBRARY_BYTES: u64 = 64 * 1024 * 1024;
-const DOWNLOAD_ATTEMPTS: u32 = 4;
+const DOWNLOAD_ATTEMPTS: u32 = 6;
 
 struct Artifact {
     asset: &'static str,
@@ -43,7 +44,7 @@ fn main() {
 
     let artifact = artifact_for_target(&target).unwrap_or_else(|| {
         panic!(
-            "bundled PDF support does not have a pinned Pdfium artifact for target {target}; supported targets are Windows x64, Linux x64, macOS x64, and macOS arm64"
+            "bundled PDF support does not have a pinned Pdfium artifact for target {target}; supported targets are Windows x64, Windows arm64, Linux x64, macOS x64, and macOS arm64"
         )
     });
     let archive_bytes = load_archive(&artifact, &target_env);
@@ -131,6 +132,13 @@ fn artifact_for_target(target: &str) -> Option<Artifact> {
             library_sha256: "a63949dc46a7314bba619ac6cc1b3849627e137f542ae31b2b36b302841f77ae",
             filename: "pdfium.dll",
         },
+        "aarch64-pc-windows-msvc" => Artifact {
+            asset: "pdfium-win-arm64.tgz",
+            archive_sha256: "e99570d74211a88d41589feb8861ef9b40d78c8d26825270ad4fb7a9a1d02f6d",
+            member: "bin/pdfium.dll",
+            library_sha256: "682ee648af5629c1194bb3649e67252d162bdab06e00cded3e2ebbe88be7bf49",
+            filename: "pdfium.dll",
+        },
         "x86_64-unknown-linux-gnu" => Artifact {
             asset: "pdfium-linux-x64.tgz",
             archive_sha256: "e3f0c66b2daad710cb6c8edd4a8c45c8902995e359dc0775917fc16e2e56349d",
@@ -157,6 +165,14 @@ fn artifact_for_target(target: &str) -> Option<Artifact> {
     Some(artifact)
 }
 
+/// Resolves the pinned archive from the cheapest source that can supply it: an
+/// explicit local path, then the on-disk cache, then the release CDN.
+///
+/// Cargo gives every feature-and-profile combination its own build script run, and CI
+/// visits several of them per job, so without a cache one job fetches the same pinned
+/// bytes once per combination - measured at four over a subset of this repository's own
+/// sequence. Every one of those is an independent chance to land in a release CDN
+/// outage, which is how a green build turns red for no local reason.
 fn load_archive(artifact: &Artifact, target_env: &str) -> Vec<u8> {
     if let Some(path) = env::var_os(target_env).or_else(|| env::var_os(LOCAL_ARCHIVE_ENV)) {
         println!("cargo:rerun-if-changed={}", Path::new(&path).display());
@@ -169,20 +185,111 @@ fn load_archive(artifact: &Artifact, target_env: &str) -> Vec<u8> {
         return read_limited(file, MAX_ARCHIVE_BYTES, "local Pdfium archive");
     }
 
+    let cached = cache_path(artifact);
+    if let Some(bytes) = cached
+        .as_deref()
+        .and_then(|path| read_cached_archive(path, artifact))
+    {
+        return bytes;
+    }
+
     let url = format!(
         "https://github.com/bblanchon/pdfium-binaries/releases/download/{RELEASE_TAG}/{}",
         artifact.asset
     );
-    read_limited(
+    let bytes = read_limited(
         download(&url).into_reader(),
         MAX_ARCHIVE_BYTES,
         "downloaded Pdfium archive",
-    )
+    );
+    if let Some(path) = cached.as_deref() {
+        store_cached_archive(path, &bytes);
+    }
+    bytes
+}
+
+/// Names the cache entry after the digest the build already pins, so an entry can
+/// only ever be the exact bytes this build wants. A damaged or half-written file is
+/// a miss rather than a silent substitution, and `main` verifies the result whatever
+/// source produced it.
+fn cache_path(artifact: &Artifact) -> Option<PathBuf> {
+    let directory = cache_directory()?;
+    Some(directory.join(format!("{}-{}", artifact.archive_sha256, artifact.asset)))
+}
+
+fn cache_directory() -> Option<PathBuf> {
+    // Deliberately not declared with `cargo:rerun-if-env-changed`: the pinned digest
+    // makes the produced bytes independent of where they were found, so tracking this
+    // variable would buy nothing but extra build script runs - the very cost the cache
+    // exists to remove. An empty value opts a hermetic build out entirely.
+    if let Some(explicit) = env::var_os(CACHE_DIRECTORY_ENV) {
+        if explicit.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(explicit));
+    }
+    default_cache_root().map(|root| root.join("fastctx").join("pdfium"))
+}
+
+/// `cfg!` rather than `#[cfg]` keeps every branch compiled on every host. This
+/// repository has a single local build gate, so platform-gated code that exists only
+/// on the other targets is precisely what it cannot check before CI.
+fn default_cache_root() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    }
+    if cfg!(target_os = "macos") {
+        return env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Caches"));
+    }
+    if let Some(directory) = env::var_os("XDG_CACHE_HOME") {
+        return Some(PathBuf::from(directory));
+    }
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache"))
+}
+
+fn read_cached_archive(path: &Path, artifact: &Artifact) -> Option<Vec<u8>> {
+    let file = fs::File::open(path).ok()?;
+    let bytes = try_read_limited(file, MAX_ARCHIVE_BYTES).ok()?;
+    if hex::encode(Sha256::digest(&bytes)) == artifact.archive_sha256 {
+        return Some(bytes);
+    }
+    // An entry that no longer matches the digest it is named after was damaged after
+    // it was written. Say so - a cache quietly missing forever is how a workaround
+    // becomes permanent - then fall back to the network instead of failing a build
+    // over storage this crate owns and can rebuild.
+    println!(
+        "cargo:warning=cached Pdfium archive {} no longer matches its pinned digest; refetching",
+        path.display()
+    );
+    let _ = fs::remove_file(path);
+    None
+}
+
+/// Best effort by design: a build that cannot populate the cache is slower, never
+/// wrong, so an unwritable directory leaves the download path carrying the build.
+fn store_cached_archive(path: &Path, bytes: &[u8]) {
+    let (Some(directory), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    if fs::create_dir_all(directory).is_err() {
+        return;
+    }
+    // Publish through a rename so a cargo invocation reading the same entry in
+    // parallel never observes a partial archive under the final name.
+    let staging = directory.join(format!("{name}.{}.partial", std::process::id()));
+    if fs::write(&staging, bytes).is_ok() && fs::rename(&staging, path).is_ok() {
+        return;
+    }
+    let _ = fs::remove_file(&staging);
 }
 
 /// Fetches the pinned release asset, retrying only the failures a later attempt can
 /// clear. Retrying cannot widen what the build accepts: the bytes are still checked
-/// against the pinned digest afterwards.
+/// against the pinned digest afterwards. The attempt count spans roughly a minute of
+/// backoff because the release CDN goes down for stretches longer than a handful of
+/// seconds; widening a wait like this one only delays the report of a real outage,
+/// while keeping it tight reports a healthy build as broken.
 fn download(url: &str) -> ureq::Response {
     let mut attempt = 1;
     loop {
@@ -214,19 +321,26 @@ fn is_retryable(error: &ureq::Error) -> bool {
     }
 }
 
-fn read_limited(mut reader: impl Read, limit: u64, label: &str) -> Vec<u8> {
+fn read_limited(reader: impl Read, limit: u64, label: &str) -> Vec<u8> {
+    try_read_limited(reader, limit).unwrap_or_else(|error| panic!("{label}: {error}"))
+}
+
+/// The fallible half exists for the cache, where an unreadable or oversized entry has
+/// a recovery - refetch - that a missing download does not.
+fn try_read_limited(mut reader: impl Read, limit: u64) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     reader
         .by_ref()
         .take(limit + 1)
         .read_to_end(&mut bytes)
-        .unwrap_or_else(|error| panic!("failed to read {label}: {error}"));
-    assert!(
-        bytes.len() as u64 <= limit,
-        "{label} exceeds the {} MiB build safety limit",
-        limit / (1024 * 1024)
-    );
-    bytes
+        .map_err(|error| format!("read failed: {error}"))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!(
+            "exceeds the {} MiB build safety limit",
+            limit / (1024 * 1024)
+        ));
+    }
+    Ok(bytes)
 }
 
 fn verify_sha256(bytes: &[u8], expected: &str, label: &str) {

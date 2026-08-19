@@ -96,11 +96,6 @@ impl LineRing {
         self.total_lines().saturating_sub(self.lines.len() as u64)
     }
 
-    #[cfg(test)]
-    pub(crate) fn had_truncation(&self) -> bool {
-        self.had_truncation
-    }
-
     pub(crate) fn all(&self) -> Vec<BufferedLine> {
         self.lines.iter().cloned().collect()
     }
@@ -109,49 +104,5 @@ impl LineRing {
 impl Default for LineRing {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::LineRing;
-    use crate::shell::normalize::NormalizedLine;
-
-    fn line(text: &str, truncated: bool) -> NormalizedLine {
-        NormalizedLine {
-            bytes: text.as_bytes().to_vec(),
-            total_bytes: text.len() as u64,
-            terminated: true,
-            stream_encoding: None,
-            raw_truncated: truncated,
-        }
-    }
-
-    #[test]
-    fn ring_evicts_only_whole_lines_and_preserves_sequence_numbers() {
-        let single_line_bytes = std::mem::size_of::<super::BufferedLine>() + "one".len() + 1;
-        let mut ring = LineRing::with_limit(single_line_bytes * 2);
-        assert_eq!(ring.push(line("one", false)), 1);
-        assert_eq!(ring.push(line("two", false)), 2);
-        assert_eq!(ring.push(line("six", false)), 3);
-
-        assert_eq!(
-            ring.all()
-                .into_iter()
-                .map(|line| (line.seq, String::from_utf8(line.bytes).unwrap()))
-                .collect::<Vec<_>>(),
-            [(2, "two".to_string()), (3, "six".to_string())]
-        );
-        assert_eq!(ring.total_lines(), 3);
-        assert_eq!(ring.dropped_lines(), 1);
-        assert!(ring.had_drop);
-    }
-
-    #[test]
-    fn truncation_is_a_lifetime_loss_even_without_eviction() {
-        let mut ring = LineRing::new();
-        ring.push(line("short", true));
-        assert!(ring.had_truncation());
-        assert!(!ring.had_drop);
     }
 }

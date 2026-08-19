@@ -13,6 +13,7 @@ $cargoVersion = (Select-String -LiteralPath (Join-Path $root "Cargo.toml") -Patt
 
 $mapping = @{
     "x86_64-pc-windows-msvc" = @{ Directory = "fastctx-win32-x64"; Package = "@fastctx/win32-x64"; Name = "fastctx.exe" }
+    "aarch64-pc-windows-msvc" = @{ Directory = "fastctx-win32-arm64"; Package = "@fastctx/win32-arm64"; Name = "fastctx.exe" }
     "x86_64-unknown-linux-gnu" = @{ Directory = "fastctx-linux-x64"; Package = "@fastctx/linux-x64"; Name = "fastctx" }
     "x86_64-apple-darwin" = @{ Directory = "fastctx-darwin-x64"; Package = "@fastctx/darwin-x64"; Name = "fastctx" }
     "aarch64-apple-darwin" = @{ Directory = "fastctx-darwin-arm64"; Package = "@fastctx/darwin-arm64"; Name = "fastctx" }
@@ -57,7 +58,12 @@ if ($sourceHash -ne $stagedHash) {
 function Stage-Licenses([string]$Directory) {
     $licenseDirectory = Join-Path $Directory "licenses"
     New-Item -ItemType Directory -Force -Path $licenseDirectory | Out-Null
-    foreach ($name in @("LICENSE-APACHE", "NOTICE", "THIRD_PARTY_LICENSES.md")) {
+    foreach ($name in @(
+        "LICENSE-APACHE",
+        "NOTICE",
+        "THIRD_PARTY_LICENSES.md",
+        "THIRD_PARTY_LICENSES_RUST.md"
+    )) {
         Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $licenseDirectory $name) -Force
     }
 }
@@ -104,7 +110,12 @@ function Pack-CheckedPackage([string]$Directory, [string[]]$AllowedFiles) {
     }
 }
 
-$licenseFiles = @("licenses/LICENSE-APACHE", "licenses/NOTICE", "licenses/THIRD_PARTY_LICENSES.md")
+$licenseFiles = @(
+    "licenses/LICENSE-APACHE",
+    "licenses/NOTICE",
+    "licenses/THIRD_PARTY_LICENSES.md",
+    "licenses/THIRD_PARTY_LICENSES_RUST.md"
+)
 Pack-CheckedPackage $packageDirectory (@("package.json", "bin/$($entry.Name)") + $licenseFiles)
 
 if ($IncludeRootPackages) {

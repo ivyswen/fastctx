@@ -19,7 +19,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+// A wait-for-it bound, not a promise of promptness: exceeding it only delays a
+// failure report, while cutting it close reports a slow machine as broken. Ten
+// seconds was not enough to launch a supervisor on a real Snapdragon device.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_POLL: Duration = Duration::from_millis(20);
 const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const WATCHDOG_IDENTITY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -92,7 +95,10 @@ pub(crate) fn launch_supervisor(
         }
         Err(_) => {
             abort_failed_launch(&mut child, spec);
-            Err("Cannot start the background job supervisor: it did not become ready within 10 seconds.".to_string())
+            Err(format!(
+                "Cannot start the background job supervisor: it did not become ready within {} seconds.",
+                STARTUP_TIMEOUT.as_secs()
+            ))
         }
     }
 }

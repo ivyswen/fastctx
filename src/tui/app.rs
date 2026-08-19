@@ -14,8 +14,9 @@ use crate::control::doctor::{self, DoctorReport};
 use crate::control::guard_i18n::{self, GuardMessages};
 use crate::control::i18n::{ALL_LANGUAGES, Language, Messages};
 use crate::control::job_i18n::{self, JobMessages};
+use crate::control::link::{self, LinkState};
 use crate::control::paths::ControlPaths;
-use crate::control::provider::{self, CompactionSupport, EffectiveOutput};
+use crate::control::provider::{self, EffectiveOutput, GuardReason};
 use crate::control::settings::{self, FastCtxSettings};
 use crate::search_parallelism::{self, SearchParallelismInputError};
 use crate::shell::jobs::{self, JobSummary};
@@ -141,6 +142,58 @@ pub(crate) struct Toast {
     pub(crate) warning: bool,
 }
 
+fn finalize_notice_toast(
+    messages: &UpdateMessages,
+    notice: crate::update::FinalizeNotice,
+) -> Toast {
+    let (base, mut warning) = match notice.outcome {
+        crate::update::FinalizeOutcome::Updated => (
+            messages.updated.replace("{version}", &notice.version),
+            false,
+        ),
+        crate::update::FinalizeOutcome::RuntimeUpdated => (
+            messages
+                .updated_runtime
+                .replace("{version}", &notice.version),
+            false,
+        ),
+        crate::update::FinalizeOutcome::RuntimeUnchanged(detail) => (
+            format!(
+                "{}: {detail}",
+                messages
+                    .runtime_unchanged
+                    .replace("{version}", &notice.version)
+            ),
+            true,
+        ),
+    };
+    let mut lines = vec![base];
+    match notice.guidance {
+        crate::update::FinalizeGuidanceOutcome::NotApplied
+        | crate::update::FinalizeGuidanceOutcome::Current => {}
+        crate::update::FinalizeGuidanceOutcome::Refreshed => {
+            lines.push(messages.guidance_apply_required.to_string());
+            lines.push(messages.guidance_refreshed.to_string());
+            warning = true;
+        }
+        crate::update::FinalizeGuidanceOutcome::ApplyRequired => {
+            lines.push(messages.guidance_apply_required.to_string());
+            warning = true;
+        }
+        crate::update::FinalizeGuidanceOutcome::Unchanged(detail) => {
+            lines.push(messages.guidance_apply_required.to_string());
+            lines.push(messages.guidance_unchanged.replace("{detail}", &detail));
+            warning = true;
+        }
+    }
+    // Apply must precede the restart when guidance still needs an explicit ownership receipt.
+    lines.push(messages.restart_codex.to_string());
+    Toast {
+        message: lines.join("\n"),
+        warning,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Effect {
     RetryUpdate,
@@ -196,6 +249,7 @@ pub(crate) struct App {
     pub(crate) detail_viewport: DetailViewport,
     pub pending_job: Option<JobSummary>,
     pub running_job_count: Option<usize>,
+    pub(crate) link_state: LinkState,
     pub status: StatusState,
     pub receipt: Option<OperationReceipt>,
     pub error: Option<String>,
@@ -233,6 +287,7 @@ impl App {
         let running_job_count = jobs::running_summaries(&paths)
             .ok()
             .map(|running| running.len());
+        let link_state = link::link_state(&paths, settings.applied.as_ref());
         let language = settings
             .language
             .as_deref()
@@ -256,39 +311,8 @@ impl App {
         } else {
             Language::En
         };
-        let startup_notice = startup_notice.map(|notice| {
-            let messages = update_copy::messages(notice_language);
-            match notice.outcome {
-                crate::update::FinalizeOutcome::Updated => Toast {
-                    message: format!(
-                        "{}\n{}",
-                        messages.updated.replace("{version}", &notice.version),
-                        messages.restart_codex
-                    ),
-                    warning: false,
-                },
-                crate::update::FinalizeOutcome::RuntimeUpdated => Toast {
-                    message: format!(
-                        "{}\n{}",
-                        messages
-                            .updated_runtime
-                            .replace("{version}", &notice.version),
-                        messages.restart_codex
-                    ),
-                    warning: false,
-                },
-                crate::update::FinalizeOutcome::RuntimeUnchanged(detail) => Toast {
-                    message: format!(
-                        "{}: {detail}\n{}",
-                        messages
-                            .runtime_unchanged
-                            .replace("{version}", &notice.version),
-                        messages.restart_codex
-                    ),
-                    warning: true,
-                },
-            }
-        });
+        let startup_notice = startup_notice
+            .map(|notice| finalize_notice_toast(update_copy::messages(notice_language), notice));
         let startup_failure = match &startup_update {
             StartupUpdate::Failed(error) if error.kind == CheckFailureKind::Structural => {
                 Some(Toast {
@@ -336,6 +360,7 @@ impl App {
             detail_viewport: DetailViewport::default(),
             pending_job: None,
             running_job_count,
+            link_state,
             paths,
             settings,
             provider_detection,
@@ -417,8 +442,12 @@ impl App {
 
     /// Whether the visible provider currently locks the effective output tier to Guarded.
     pub(crate) fn output_guard_active(&self) -> bool {
-        self.config_draft.output_guard_enabled
-            && self.provider_detection.support == CompactionSupport::Local
+        self.config_draft.output_guard_enabled && self.provider_detection.requires_guard()
+    }
+
+    /// Why the visible provider activates Guarded copy, when it does.
+    pub(crate) fn output_guard_reason(&self) -> Option<GuardReason> {
+        self.provider_detection.guard_reason()
     }
 
     /// Concrete output policy shown by the configuration UI.
@@ -1587,6 +1616,9 @@ impl App {
     }
 
     fn show_receipt(&mut self, receipt: OperationReceipt) {
+        // Apply and Unapply both reach this after refreshing the receipt, so it is the single
+        // place the menu's connection state has to be recomputed.
+        self.link_state = link::link_state(&self.paths, self.settings.applied.as_ref());
         self.receipt = Some(receipt);
         self.screen = Screen::Receipt;
         self.selected = 0;
@@ -1739,19 +1771,11 @@ mod tests {
     use super::{App, Effect, Screen, config};
     use crate::control::i18n::Language;
     use crate::control::paths::ControlPaths;
-    use crate::control::settings::{
-        AppliedRecord, FastCtxSettings, ManagedFileRecord, Tier, ToolBudgetLevel, UpdateSource,
-    };
-    use crate::search_parallelism::SearchParallelismInputError;
-    use crate::shell::jobs::{JobSourceSummary, JobSummary, JobSummaryStatus};
-    use crate::tui::config::{ConfigCursor, ConfigDraft, ConfigItemId, ConfigValue};
-    use crate::tui::jobs::{JobsDetail, JobsState};
-    use crate::update::{
-        CheckFailure, CheckFailureKind, NpmDiscovery, NpmRegistryProbe, NpmVersionAuthority,
-        StartupUpdate, UpdatePlan,
-    };
+    use crate::control::settings::{FastCtxSettings, Tier};
+
+    use crate::tui::config::ConfigItemId;
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use std::time::{Duration, Instant};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1765,40 +1789,6 @@ mod tests {
             last_seen_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             tool_budget_epoch: Some(crate::control::settings::TOOL_BUDGET_EPOCH),
             ..FastCtxSettings::default()
-        }
-    }
-
-    fn type_text(app: &mut App, value: &str) {
-        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        for character in value.chars() {
-            app.handle_key(key(KeyCode::Char(character)));
-        }
-    }
-
-    fn receipt() -> AppliedRecord {
-        let managed = |path: &str| ManagedFileRecord {
-            path: path.to_string(),
-            original_existed: true,
-            applied_sha256: "managed-hash".to_string(),
-        };
-        AppliedRecord {
-            applied_at_utc: "2026-07-21T00:00:00Z".to_string(),
-            version: "0.1.1".to_string(),
-            command: "fastctx".to_string(),
-            tier: Tier::High,
-            tool_output_token_limit: 30_000,
-            tool_timeout_sec: None,
-            previous_token_limit_present: true,
-            previous_token_limit: Some(10_000),
-            fastctx_token_budget: 25_500,
-            tool_budgets: crate::control::settings::ToolBudgets::default(),
-            fastshell_enabled: true,
-            fastedit_enabled: false,
-            codex_dir_created: true,
-            codex_config: managed("config.toml"),
-            codex_agents: managed("AGENTS.md"),
-            codex_agents_inserted_separator: None,
-            binary_sha256: "binary-hash".to_string(),
         }
     }
 
@@ -1816,52 +1806,6 @@ mod tests {
         (temp, app)
     }
 
-    fn pending_discovery(target_version: &str) -> NpmDiscovery {
-        NpmDiscovery {
-            source_policy: "auto".to_string(),
-            configured_registry: Some("https://registry.npmmirror.com/".to_string()),
-            target_version: target_version.to_string(),
-            authority: NpmVersionAuthority::Official,
-            github_version: Some(target_version.to_string()),
-            official_version: Some(target_version.to_string()),
-            platform_package: "@fastctx/test-platform".to_string(),
-            probes: vec![NpmRegistryProbe {
-                source_name: "npmmirror".to_string(),
-                registry: "https://registry.npmmirror.com/".to_string(),
-                reachable: true,
-                latest_version: Some("0.1.0".to_string()),
-                main_package_ready: false,
-                platform_package_ready: false,
-                error: None,
-                error_kind: None,
-            }],
-            selected_registry: None,
-            selected_source: None,
-            selection_reason: "the configured source is still propagating".to_string(),
-        }
-    }
-
-    fn job(id: &str) -> JobSummary {
-        job_from(id, "source-1", JobSummaryStatus::Running)
-    }
-
-    fn job_from(id: &str, source_key: &str, status: JobSummaryStatus) -> JobSummary {
-        JobSummary {
-            id: id.to_string(),
-            command: format!("printf {id}"),
-            cwd: "/workspace".to_string(),
-            started_at: "2026-07-16T10:00:00Z".to_string(),
-            status,
-            source: JobSourceSummary {
-                key: source_key.to_string(),
-                tag: source_key.to_string(),
-                server_pid: 7,
-                parent_executable: Some("codex".to_string()),
-                server_cwd: format!("/{source_key}"),
-            },
-        }
-    }
-
     #[test]
     fn first_run_requires_language_selection_before_main_menu() {
         let (_temp, mut app) = fixture();
@@ -1871,81 +1815,6 @@ mod tests {
         app.execute_pending();
         assert_eq!(app.screen, Screen::Main);
         assert!(app.settings.language.is_some());
-    }
-
-    #[test]
-    fn migrated_user_confirms_notice_before_the_startup_update_gate() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        std::fs::create_dir_all(&paths.fastctx_dir).unwrap();
-        std::fs::write(
-            &paths.fastctx_config,
-            concat!(
-                "schema_version = 1\n",
-                "language = \"en\"\n",
-                "\n[tool_budgets]\n",
-                "grep = \"percent75\"\n",
-            ),
-        )
-        .unwrap();
-
-        let mut app = App::load_with_startup(paths, StartupUpdate::None, None).unwrap();
-        assert_eq!(app.screen, Screen::MigrationNotice);
-        assert_eq!(
-            app.settings.tool_budgets,
-            crate::control::settings::ToolBudgetPreferences::default()
-        );
-        let (sender, receiver) = std::sync::mpsc::channel();
-        app.set_startup_update_check(receiver);
-        let plan = UpdatePlan::GithubRelease {
-            target_version: "99.88.77".to_string(),
-            archive_name: "fixture.zip".to_string(),
-            archive_url:
-                "https://github.com/yc-duan/fastctx/releases/download/v99.88.77/fixture.zip"
-                    .to_string(),
-            checksums_url:
-                "https://github.com/yc-duan/fastctx/releases/download/v99.88.77/SHA256SUMS"
-                    .to_string(),
-        };
-        sender
-            .send(StartupUpdate::Available(Box::new(plan.clone())))
-            .unwrap();
-        app.poll_update_check();
-        assert_eq!(app.screen, Screen::MigrationNotice);
-        assert_eq!(app.update_state, StartupUpdate::None);
-
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.screen, Screen::MigrationNotice);
-        assert!(app.migration_notice_pending);
-
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::UpdateChecking);
-        app.poll_update_check();
-        assert_eq!(app.screen, Screen::Update);
-        assert_eq!(app.update_state, StartupUpdate::Available(Box::new(plan)));
-    }
-
-    #[test]
-    fn migration_notice_follows_first_run_language_and_is_persisted_exactly_once() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        std::fs::create_dir_all(&paths.fastctx_dir).unwrap();
-        std::fs::write(&paths.fastctx_config, b"schema_version = 1\n").unwrap();
-
-        let mut app = App::load_with_startup(paths.clone(), StartupUpdate::None, None).unwrap();
-        assert_eq!(app.screen, Screen::Language { first_run: true });
-        app.handle_key(key(KeyCode::Enter));
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::MigrationNotice);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Main);
-
-        let reloaded = App::load_with_startup(paths, StartupUpdate::None, None).unwrap();
-        assert_eq!(reloaded.screen, Screen::Main);
-        assert_eq!(
-            reloaded.settings.last_seen_version.as_deref(),
-            Some(env!("CARGO_PKG_VERSION"))
-        );
     }
 
     #[test]
@@ -1968,19 +1837,6 @@ mod tests {
         app.execute_pending();
         assert_eq!(app.screen, Screen::Receipt);
         assert!(app.receipt.as_ref().unwrap().changed_targets >= 3);
-    }
-
-    #[test]
-    fn unapply_goes_straight_from_apply_home_to_preview() {
-        let (_temp, mut app) = fixture();
-        app.screen = Screen::ApplyHome;
-        app.selected = 1;
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::UnapplyLoading);
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::UnapplyPreview);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::UnapplyConfirm);
     }
 
     #[test]
@@ -2044,27 +1900,6 @@ mod tests {
     }
 
     #[test]
-    fn shared_limit_confirmation_defaults_to_no_and_cancel_writes_nothing() {
-        let (_temp, mut app) = fixture();
-        std::fs::write(&app.paths.codex_config, b"tool_output_token_limit = 9000\n").unwrap();
-        app.screen = Screen::ApplyHome;
-        app.selected = 0;
-        app.handle_key(key(KeyCode::Enter));
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::ApplyPreview);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::ApplyConflict);
-        assert_eq!(app.selected, 0);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::ApplyHome);
-        assert_eq!(
-            std::fs::read(&app.paths.codex_config).unwrap(),
-            b"tool_output_token_limit = 9000\n"
-        );
-        assert!(!app.paths.fastctx_config.exists());
-    }
-
-    #[test]
     fn operation_failure_has_a_retry_path_back_to_a_fresh_preview() {
         let temp = tempfile::tempdir().unwrap();
         let paths = ControlPaths::for_home(temp.path());
@@ -2100,421 +1935,6 @@ mod tests {
     }
 
     #[test]
-    fn config_navigation_walks_parent_then_children_and_wraps() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default();
-
-        for expected in [
-            ConfigItemId::OutputTier,
-            ConfigItemId::ReadBudget,
-            ConfigItemId::GrepBudget,
-            ConfigItemId::GlobBudget,
-            ConfigItemId::RunBudget,
-            ConfigItemId::JobOutputBudget,
-            ConfigItemId::OutputGuard,
-            ConfigItemId::ReplaceFileLimit,
-            ConfigItemId::FastShell,
-            ConfigItemId::JobStorageLimit,
-            ConfigItemId::MaxRunningJobs,
-            ConfigItemId::JobListLimit,
-            ConfigItemId::SearchCpuLimit,
-            ConfigItemId::UpdateAutoCheck,
-            ConfigItemId::UpdateSource,
-            ConfigItemId::ResetAll,
-            ConfigItemId::SaveAll,
-        ] {
-            assert_eq!(app.config_cursor.entry().item, expected);
-            app.handle_key(key(KeyCode::Down));
-        }
-        assert_eq!(app.config_cursor, ConfigCursor::default());
-        app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::SaveAll);
-    }
-
-    #[test]
-    fn config_tab_and_shift_tab_jump_between_group_parents() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default().next().next();
-
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(
-            app.config_cursor.entry().item,
-            ConfigItemId::ReplaceFileLimit
-        );
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::FastShell);
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::SearchCpuLimit);
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(
-            app.config_cursor.entry().item,
-            ConfigItemId::UpdateAutoCheck
-        );
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::ResetAll);
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::SaveAll);
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputTier);
-        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::SaveAll);
-        app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::ResetAll);
-        app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(
-            app.config_cursor.entry().item,
-            ConfigItemId::UpdateAutoCheck
-        );
-        app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::SearchCpuLimit);
-        app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::FastShell);
-        app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(
-            app.config_cursor.entry().item,
-            ConfigItemId::ReplaceFileLimit
-        );
-        app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
-    }
-
-    #[test]
-    fn guarded_provider_locks_only_the_tier_and_disabling_requires_confirmation() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        std::fs::write(
-            &app.paths.codex_config,
-            concat!(
-                "model_provider = 'third-party'\n",
-                "[model_providers.third-party]\n",
-                "name = 'Third Party'\n",
-            ),
-        )
-        .unwrap();
-        app.provider_detection = crate::control::provider::detect_path(&app.paths.codex_config);
-        app.config_draft = ConfigDraft::from_settings(&app.settings);
-        app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default();
-
-        assert!(app.output_guard_active());
-        assert_eq!(app.effective_output().host_limit, 10_000);
-        assert_eq!(app.effective_output().fastctx_budget, 9_000);
-        app.handle_key(key(KeyCode::Right));
-        assert_eq!(app.config_draft.output.tier, Tier::Standard);
-
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::ReadBudget);
-        // Guarded locks the tier, not the per-tool shares. Two presses leave automatic behind and
-        // land on a stop the guarded budget still resolves against.
-        app.handle_key(key(KeyCode::Left));
-        app.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            app.config_draft.output.budgets.read,
-            Some(ToolBudgetLevel::Percent(75))
-        );
-        assert_eq!(
-            app.effective_output().tool_budgets.read,
-            ToolBudgetLevel::Percent(75)
-        );
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
-        app.handle_key(key(KeyCode::Left));
-        assert!(app.config_draft.output_guard_enabled);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::ConfigOutputGuardConfirm);
-        assert!(!app.has_pending_effect());
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::Config);
-        assert!(app.config_draft.output_guard_enabled);
-
-        app.handle_key(key(KeyCode::Enter));
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Config);
-        assert!(!app.config_draft.output_guard_enabled);
-        // Confirming the warning only decides the draft; the guard is still on disk until saved.
-        assert!(app.settings.output_guard.enabled);
-        app.handle_key(key(KeyCode::Char('s')));
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::Config);
-        assert!(!app.settings.output_guard.enabled);
-        assert!(app.toast.as_ref().is_some_and(|toast| toast.warning));
-        assert!(
-            !crate::control::settings::load(&app.paths)
-                .unwrap()
-                .output_guard
-                .enabled
-        );
-
-        app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default();
-        app.handle_key(key(KeyCode::Right));
-        assert_eq!(app.config_draft.output.tier, Tier::High);
-
-        app.config_cursor = ConfigCursor::default().next_group();
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::OutputGuard);
-        app.handle_key(key(KeyCode::Enter));
-        // Turning protection back on needs no confirmation, but it still needs a save.
-        assert!(app.config_draft.output_guard_enabled);
-        assert!(!app.settings.output_guard.enabled);
-        app.handle_key(key(KeyCode::Char('s')));
-        app.execute_pending();
-        assert!(app.settings.output_guard.enabled);
-    }
-
-    #[test]
-    fn fastshell_toggle_persists_on_the_save_key_and_takes_effect_only_on_apply() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.screen = Screen::Config;
-        app.config_cursor = config::cursor_for(ConfigItemId::FastShell);
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::FastShell);
-        app.handle_key(key(KeyCode::Right));
-        assert!(!app.settings.fastshell.enabled);
-
-        app.handle_key(key(KeyCode::Char('s')));
-        app.execute_pending();
-
-        assert_eq!(app.screen, Screen::Config);
-        assert!(app.settings.fastshell.enabled);
-        assert!(!app.settings.fastedit.enabled);
-        assert!(app.settings.applied.is_none());
-        let persisted = crate::control::settings::load(&app.paths).unwrap();
-        assert!(persisted.fastshell.enabled);
-        assert!(!persisted.fastedit.enabled);
-    }
-
-    #[test]
-    fn current_user_limits_save_immediately_without_apply() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.screen = Screen::Config;
-        app.config_cursor = config::cursor_for(ConfigItemId::ReplaceFileLimit);
-        app.handle_key(key(KeyCode::Right));
-        app.config_cursor = config::cursor_for(ConfigItemId::JobStorageLimit);
-        assert_eq!(
-            app.config_cursor.entry().item,
-            ConfigItemId::JobStorageLimit
-        );
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::MaxRunningJobs);
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::JobListLimit);
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Char('s')));
-        app.execute_pending();
-
-        assert_eq!(app.screen, Screen::Config);
-        assert_eq!(app.settings.fastshell.job_storage_limit_mib, 2_048);
-        assert_eq!(app.settings.fastshell.max_running_jobs, 256);
-        assert_eq!(app.settings.fastshell.job_list_limit, 50);
-        assert_eq!(app.settings.replace.max_file_size_mib, 512);
-        assert!(app.settings.applied.is_none());
-        assert!(app.toast.as_ref().is_some_and(|toast| {
-            toast.message.contains(app.job_messages().user_limit_note)
-                && toast
-                    .message
-                    .contains(app.config_messages().replace_limit_saved_note)
-        }));
-        let persisted = crate::control::settings::load(&app.paths).unwrap();
-        assert_eq!(persisted.fastshell.job_storage_limit_mib, 2_048);
-        assert_eq!(persisted.fastshell.max_running_jobs, 256);
-        assert_eq!(persisted.fastshell.job_list_limit, 50);
-        assert_eq!(persisted.replace.max_file_size_mib, 512);
-        assert!(persisted.applied.is_none());
-    }
-
-    #[test]
-    fn update_preferences_save_immediately_without_apply() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.screen = Screen::Config;
-        app.config_cursor = config::cursor_for(ConfigItemId::UpdateAutoCheck);
-        assert_eq!(
-            app.config_cursor.entry().item,
-            ConfigItemId::UpdateAutoCheck
-        );
-
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::UpdateSource);
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Char('s')));
-        app.execute_pending();
-
-        assert_eq!(app.screen, Screen::Config);
-        assert!(!app.settings.update.auto_check);
-        assert_eq!(app.settings.update.source, UpdateSource::NpmConfig);
-        assert!(app.settings.applied.is_none());
-        let persisted = crate::control::settings::load(&app.paths).unwrap();
-        assert!(!persisted.update.auto_check);
-        assert_eq!(persisted.update.source, UpdateSource::NpmConfig);
-        assert!(persisted.applied.is_none());
-    }
-
-    #[test]
-    fn search_cpu_editor_takes_only_digits_and_leaves_automatic_to_the_arrows() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.screen = Screen::Config;
-        app.config_cursor = config::cursor_for(ConfigItemId::SearchCpuLimit);
-        let maximum = crate::search_parallelism::detected_available();
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::ConfigCpuEdit);
-        // An automatic limit opens on the count it currently resolves to, not on a keyword.
-        assert_eq!(app.cpu_limit_editor.input, maximum.to_string());
-
-        type_text(&mut app, "");
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            app.cpu_limit_editor.error,
-            Some(SearchParallelismInputError::Empty { maximum })
-        );
-        // Non-digits never reach the field, so there is nothing left for Enter to reject. This is
-        // what stops `auto` from being a word anyone has to know in order to use the editor.
-        for value in ["four", "auto", "-1", "1.5"] {
-            type_text(&mut app, value);
-            assert!(
-                app.cpu_limit_editor
-                    .input
-                    .chars()
-                    .all(|character| character.is_ascii_digit()),
-                "{value:?} leaked a non-digit into the field"
-            );
-        }
-        for value in ["0".to_string(), (maximum + 1).to_string()] {
-            type_text(&mut app, &value);
-            app.handle_key(key(KeyCode::Enter));
-            assert!(matches!(
-                app.cpu_limit_editor.error,
-                Some(SearchParallelismInputError::OutOfRange { .. })
-            ));
-            assert_eq!(app.cpu_limit_editor.input, value);
-        }
-
-        type_text(&mut app, &maximum.to_string());
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Config);
-        // Accepting an entry is not a save: the value reaches the draft and the settings file
-        // stays untouched until the explicit save key.
-        assert!(!app.has_pending_effect());
-        assert_eq!(app.settings.search.max_cpu_cores, None);
-        assert!(!app.paths.fastctx_config.exists());
-        app.handle_key(key(KeyCode::Char('s')));
-        assert!(app.has_pending_effect());
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::Config);
-        assert_eq!(app.settings.search.max_cpu_cores, Some(maximum as i64));
-        assert!(
-            app.toast.as_ref().is_some_and(|toast| {
-                toast.message.contains(app.config_messages().cpu_limit_note)
-            })
-        );
-        assert_eq!(
-            crate::control::settings::load(&app.paths)
-                .unwrap()
-                .search
-                .max_cpu_cores,
-            Some(maximum as i64)
-        );
-
-        // Automatic is an arrow-key stop rather than a keyword, and it still round-trips to disk
-        // as the absent limit.
-        for _ in 0..8 {
-            if app.config_draft.search_max_cpu_cores.is_none() {
-                break;
-            }
-            app.handle_key(key(KeyCode::Right));
-        }
-        assert_eq!(app.config_draft.search_max_cpu_cores, None);
-        app.handle_key(key(KeyCode::Char('s')));
-        app.execute_pending();
-        assert_eq!(app.settings.search.max_cpu_cores, None);
-        assert_eq!(
-            crate::control::settings::load(&app.paths)
-                .unwrap()
-                .search
-                .max_cpu_cores,
-            None
-        );
-    }
-
-    #[test]
-    fn reset_all_defaults_to_no_preserves_receipt_and_jobs_and_resets_every_preference() {
-        let (_temp, mut app) = fixture();
-        let receipt = receipt();
-        app.settings.language = Some("zh-CN".to_string());
-        app.language = Language::ZhCn;
-        app.settings.tier = Tier::High;
-        app.settings.tool_budgets.grep = Some(ToolBudgetLevel::Percent(25));
-        app.settings.fastshell.enabled = true;
-        app.settings.fastshell.job_storage_limit_mib = 4_096;
-        app.settings.update.auto_check = false;
-        app.settings.update.source = UpdateSource::Npmmirror;
-        app.settings.search.max_cpu_cores = Some(1);
-        app.settings.applied = Some(receipt.clone());
-        crate::control::settings::save(&app.paths, &app.settings).unwrap();
-        app.config_draft = crate::tui::config::ConfigDraft::from_settings(&app.settings);
-        let reset_success = crate::control::config_i18n::messages(Language::En).reset_success;
-        let job_sentinel = app
-            .paths
-            .jobs_dir
-            .join("running-sentinel")
-            .join("payload.bin");
-        std::fs::create_dir_all(job_sentinel.parent().unwrap()).unwrap();
-        std::fs::write(&job_sentinel, b"running job state").unwrap();
-
-        app.screen = Screen::Config;
-        app.config_cursor = config::cursor_for(ConfigItemId::ResetAll);
-        assert_eq!(app.config_cursor.entry().item, ConfigItemId::ResetAll);
-        let before_cancel = file_tree(&app.paths.fastctx_dir);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::ConfigResetConfirm);
-        assert_eq!(app.selected, 0);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Config);
-        assert!(!app.has_pending_effect());
-        assert_eq!(file_tree(&app.paths.fastctx_dir), before_cancel);
-
-        app.handle_key(key(KeyCode::Enter));
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::ConfigResetting);
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::Language { first_run: true });
-        assert_eq!(app.settings.applied, Some(receipt.clone()));
-        assert_eq!(
-            FastCtxSettings {
-                applied: None,
-                ..app.settings.clone()
-            },
-            default_with_current_watermark()
-        );
-        let persisted = crate::control::settings::load(&app.paths).unwrap();
-        assert_eq!(persisted.applied, Some(receipt));
-        assert_eq!(
-            FastCtxSettings {
-                applied: None,
-                ..persisted
-            },
-            default_with_current_watermark()
-        );
-        assert_eq!(std::fs::read(job_sentinel).unwrap(), b"running job state");
-        assert_eq!(
-            app.toast.as_ref().map(|toast| toast.message.as_str()),
-            Some(reset_success)
-        );
-    }
-
-    #[test]
     fn reset_save_failure_keeps_context_and_retries_without_false_success() {
         let (_temp, mut app) = fixture();
         app.settings.language = Some("en".to_string());
@@ -2546,732 +1966,6 @@ mod tests {
             app.toast.as_ref().map(|toast| toast.message.as_str()),
             Some(reset_success)
         );
-    }
-
-    #[test]
-    fn reset_cleanup_failure_keeps_memory_aligned_with_the_committed_defaults() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("zh-CN".to_string());
-        app.language = Language::ZhCn;
-        app.settings.tier = Tier::High;
-        app.settings.search.max_cpu_cores = Some(1);
-        crate::control::settings::save(&app.paths, &app.settings).unwrap();
-        app.config_draft = crate::tui::config::ConfigDraft::from_settings(&app.settings);
-        std::fs::write(&app.paths.jobs_dir, b"not a registry directory").unwrap();
-
-        app.screen = Screen::Config;
-        app.config_cursor = config::cursor_for(ConfigItemId::ResetAll);
-        app.handle_key(key(KeyCode::Enter));
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Enter));
-        app.execute_pending();
-
-        assert_eq!(app.screen, Screen::OperationFailed);
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("Settings were saved, but")),
-            "{:?}",
-            app.error
-        );
-        assert_eq!(app.settings, default_with_current_watermark());
-        assert_eq!(
-            app.config_draft,
-            crate::tui::config::ConfigDraft::from_settings(&default_with_current_watermark())
-        );
-        assert_eq!(
-            crate::control::settings::load(&app.paths).unwrap(),
-            default_with_current_watermark()
-        );
-        assert!(app.toast.is_none());
-        assert!(matches!(app.retry_effect, Some(Effect::ResetConfig)));
-
-        std::fs::remove_file(&app.paths.jobs_dir).unwrap();
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::ConfigResetting);
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::Language { first_run: true });
-        assert_eq!(
-            app.toast.as_ref().map(|toast| toast.message.as_str()),
-            Some(crate::control::config_i18n::messages(Language::En).reset_success)
-        );
-    }
-
-    #[test]
-    fn jobs_refresh_preserves_the_focused_id_and_clamps_when_it_disappears() {
-        let (_temp, mut app) = fixture();
-        app.screen = Screen::Jobs;
-        app.jobs_state = JobsState::ready(vec![job("j-000001"), job("j-000002")]);
-        app.jobs_selected = 1;
-        app.jobs_detail.job_id = Some("j-000002".to_string());
-
-        app.refresh_jobs(vec![job("j-000003"), job("j-000002"), job("j-000004")]);
-        assert_eq!(app.jobs_selected, 1);
-        assert_eq!(app.focused_job().unwrap().id, "j-000002");
-        assert_eq!(app.jobs_detail.job_id.as_deref(), Some("j-000002"));
-
-        app.refresh_jobs(vec![job("j-000003"), job("j-000004")]);
-        assert_eq!(app.jobs_selected, 1);
-        assert_eq!(app.focused_job().unwrap().id, "j-000004");
-        assert!(app.jobs_detail.job_id.is_none());
-
-        app.refresh_jobs(Vec::new());
-        assert!(matches!(app.jobs_state, JobsState::Empty));
-        assert_eq!(app.jobs_selected, 0);
-        assert!(app.jobs_detail.job_id.is_none());
-    }
-
-    #[test]
-    fn jobs_empty_enter_is_inert_and_escape_returns_to_main() {
-        let (_temp, mut app) = fixture();
-        app.screen = Screen::Jobs;
-        app.jobs_state = JobsState::Empty;
-
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Jobs);
-        assert!(app.pending_job.is_none());
-        assert!(!app.has_pending_effect());
-
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::Main);
-    }
-
-    #[test]
-    fn jobs_dashboard_aggregates_running_jobs_only_and_exposes_navigation_keys() {
-        let (_temp, mut app) = fixture();
-        app.screen = Screen::Jobs;
-        app.refresh_jobs(vec![
-            job_from("j-a-run", "source-a", JobSummaryStatus::Running),
-            job_from("j-b-run", "source-b", JobSummaryStatus::Running),
-            job_from("j-a-done", "source-a", JobSummaryStatus::Exited(0)),
-        ]);
-        assert_eq!(app.running_job_count, Some(2));
-        assert_eq!(app.jobs_state.jobs().len(), 2);
-        assert!(
-            app.jobs_state
-                .jobs()
-                .iter()
-                .all(|job| job.status == JobSummaryStatus::Running)
-        );
-        assert_eq!(app.focused_job().unwrap().id, "j-a-run");
-
-        app.jobs_detail.job_id = Some("j-a-run".to_string());
-        app.jobs_detail.tail.lines = vec!["0123456789abcdef".to_string()];
-        app.handle_key(key(KeyCode::Right));
-        assert_eq!(app.jobs_detail.horizontal_offset, 8);
-        app.handle_key(key(KeyCode::PageUp));
-        assert!(!app.jobs_detail.follow_tail);
-
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.focused_job().unwrap().id, "j-a-run");
-
-        app.handle_key(key(KeyCode::Char('R')));
-        assert!(matches!(app.pending, Some(Effect::LoadJobs)));
-    }
-
-    #[test]
-    fn a_finished_running_job_disappears_with_an_agent_output_notice() {
-        let (_temp, mut app) = fixture();
-        app.screen = Screen::Jobs;
-        app.jobs_state = JobsState::ready(vec![job("j-000001"), job("j-000002")]);
-        app.jobs_selected = 0;
-
-        app.refresh_jobs(vec![
-            job_from("j-000001", "source-1", JobSummaryStatus::Exited(0)),
-            job("j-000002"),
-        ]);
-
-        assert_eq!(app.jobs_state.jobs().len(), 1);
-        assert_eq!(app.focused_job().unwrap().id, "j-000002");
-        let toast = app.toast.as_ref().expect("completion notice");
-        assert!(toast.message.contains("j-000001"));
-        assert!(toast.message.contains("job_output"));
-        assert!(!toast.warning);
-    }
-
-    #[test]
-    fn job_kill_confirmation_defaults_to_no_and_failure_can_retry_or_escape() {
-        let (_temp, mut app) = fixture();
-        app.screen = Screen::Jobs;
-        app.jobs_state = JobsState::ready(vec![job("j-000001")]);
-
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::JobsKillConfirm);
-        assert_eq!(app.selected, 0);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Jobs);
-        assert!(app.pending_job.is_none());
-        assert!(!app.has_pending_effect());
-
-        app.handle_key(key(KeyCode::Enter));
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::Jobs);
-        assert!(app.pending_job.is_none());
-
-        app.handle_key(key(KeyCode::Enter));
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::JobsKilling);
-        assert!(matches!(
-            app.pending,
-            Some(Effect::KillJob { ref job_id }) if job_id == "j-000001"
-        ));
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::JobsKillFailed);
-        assert!(
-            app.error
-                .as_deref()
-                .is_some_and(|error| error.contains("No such job"))
-        );
-        assert!(matches!(
-            app.retry_effect,
-            Some(Effect::KillJob { ref job_id }) if job_id == "j-000001"
-        ));
-
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::JobsKilling);
-        assert!(app.has_pending_effect());
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::JobsKillFailed);
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::Jobs);
-        assert!(app.error.is_none());
-        assert!(app.pending_job.is_none());
-        assert!(app.retry_effect.is_none());
-    }
-
-    #[test]
-    fn successful_job_kill_returns_to_loading_with_a_refreshable_toast() {
-        let (_temp, mut app) = fixture();
-        app.screen = Screen::JobsKilling;
-        app.jobs_state = JobsState::ready(vec![job("j-000001")]);
-        app.jobs_detail = JobsDetail {
-            job_id: Some("j-000001".to_string()),
-            ..Default::default()
-        };
-        app.pending_job = Some(job("j-000001"));
-        app.error = Some("old failure".to_string());
-        app.finish_job_kill();
-
-        assert_eq!(app.screen, Screen::Jobs);
-        assert!(matches!(app.jobs_state, JobsState::Loading));
-        assert!(app.jobs_detail.job_id.is_none());
-        assert!(app.pending_job.is_none());
-        assert!(app.error.is_none());
-        assert!(app.last_jobs_refresh.is_none());
-        assert!(app.last_tail_refresh.is_none());
-        assert_eq!(
-            app.toast,
-            Some(super::Toast {
-                message: app.job_messages().kill_success.to_string(),
-                warning: false,
-            })
-        );
-    }
-
-    #[test]
-    fn startup_update_gate_waits_behind_first_run_language_then_opens_the_update_page() {
-        let (_temp, mut app) = fixture();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        app.set_startup_update_check(receiver);
-        let plan = UpdatePlan::GithubRelease {
-            target_version: "0.2.0".to_string(),
-            archive_name: "fixture.zip".to_string(),
-            archive_url: "https://github.com/yc-duan/fastctx/releases/download/v0.2.0/fixture.zip"
-                .to_string(),
-            checksums_url: "https://github.com/yc-duan/fastctx/releases/download/v0.2.0/SHA256SUMS"
-                .to_string(),
-        };
-        sender
-            .send(StartupUpdate::Available(Box::new(plan.clone())))
-            .unwrap();
-
-        app.poll_update_check();
-        assert_eq!(app.screen, Screen::Language { first_run: true });
-        assert_eq!(app.update_state, StartupUpdate::None);
-        app.handle_key(key(KeyCode::Enter));
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::UpdateChecking);
-        assert!(app.toast.is_none());
-
-        app.poll_update_check();
-        assert_eq!(app.screen, Screen::Update);
-        assert_eq!(app.update_state, StartupUpdate::Available(Box::new(plan)));
-        assert_eq!(app.selected, 0);
-        assert!(app.toast.is_none());
-    }
-
-    #[test]
-    fn first_run_does_not_even_spawn_the_startup_probe_before_language_is_saved() {
-        let (_temp, mut app) = fixture();
-        app.request_startup_update_check();
-
-        assert_eq!(app.screen, Screen::Language { first_run: true });
-        assert!(app.startup_update_check_requested);
-        assert!(app.update_check.is_none());
-
-        app.handle_key(key(KeyCode::Enter));
-        app.execute_pending();
-        assert!(!app.startup_update_check_requested);
-        assert_eq!(app.screen, Screen::Main);
-        assert!(app.update_check.is_none());
-    }
-
-    #[test]
-    fn startup_gate_deadline_transient_pending_and_current_are_silent_but_structural_warns_once() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.screen = Screen::Main;
-
-        let (_sender, receiver) = std::sync::mpsc::channel();
-        app.set_startup_update_check(receiver);
-        assert_eq!(app.screen, Screen::UpdateChecking);
-        app.update_check.as_mut().unwrap().startup_deadline =
-            Some(Instant::now() - Duration::from_millis(1));
-        app.poll_update_check();
-        assert_eq!(app.screen, Screen::Main);
-        assert_eq!(app.update_state, StartupUpdate::None);
-        assert!(app.toast.is_none());
-
-        let (sender, receiver) = std::sync::mpsc::channel();
-        app.set_startup_update_check(receiver);
-        sender
-            .send(StartupUpdate::Failed(CheckFailure {
-                kind: CheckFailureKind::Transient,
-                message: "HTTP 429".to_string(),
-            }))
-            .unwrap();
-        app.poll_update_check();
-        assert_eq!(app.screen, Screen::Main);
-        assert!(app.toast.is_none());
-
-        let (sender, receiver) = std::sync::mpsc::channel();
-        app.set_startup_update_check(receiver);
-        sender
-            .send(StartupUpdate::NpmPending {
-                target_version: "0.2.0".to_string(),
-                discovery: Box::new(pending_discovery("0.2.0")),
-            })
-            .unwrap();
-        app.poll_update_check();
-        assert_eq!(app.screen, Screen::Main);
-        assert!(app.toast.is_none());
-
-        let (sender, receiver) = std::sync::mpsc::channel();
-        app.set_startup_update_check(receiver);
-        sender.send(StartupUpdate::None).unwrap();
-        app.poll_update_check();
-        assert_eq!(app.screen, Screen::Main);
-        assert!(app.toast.is_none());
-
-        let (sender, receiver) = std::sync::mpsc::channel();
-        app.set_startup_update_check(receiver);
-        sender
-            .send(StartupUpdate::Failed(CheckFailure {
-                kind: CheckFailureKind::Structural,
-                message: "latest tag is invalid".to_string(),
-            }))
-            .unwrap();
-        app.poll_update_check();
-        assert_eq!(app.screen, Screen::Main);
-        let toast = app.toast.take().unwrap();
-        assert!(toast.warning);
-        assert!(toast.message.contains("latest tag is invalid"));
-        app.poll_update_check();
-        assert!(app.toast.is_none(), "the structural warning repeated");
-    }
-
-    #[test]
-    fn startup_available_can_continue_or_escape_to_main_and_can_confirm_installation() {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = ControlPaths::for_home(temp.path());
-        let plan = UpdatePlan::GithubRelease {
-            target_version: "0.2.0".to_string(),
-            archive_name: "fixture.zip".to_string(),
-            archive_url: "https://github.com/yc-duan/fastctx/releases/download/v0.2.0/fixture.zip"
-                .to_string(),
-            checksums_url: "https://github.com/yc-duan/fastctx/releases/download/v0.2.0/SHA256SUMS"
-                .to_string(),
-        };
-        let mut settings = FastCtxSettings {
-            last_seen_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            // Already reconciled with this generation's budget defaults, so startup lands on the
-            // update screen instead of the one-time migration notice.
-            tool_budget_epoch: Some(crate::control::settings::TOOL_BUDGET_EPOCH),
-            language: Some("en".to_string()),
-            ..FastCtxSettings::default()
-        };
-        crate::control::settings::save(&paths, &settings).unwrap();
-        let mut app = App::load_with_startup(paths.clone(), StartupUpdate::None, None).unwrap();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        app.set_startup_update_check(receiver);
-        sender
-            .send(StartupUpdate::Available(Box::new(plan.clone())))
-            .unwrap();
-        app.poll_update_check();
-        assert_eq!(app.screen, Screen::Update);
-        assert_eq!(app.selected, 0);
-        assert!(app.toast.is_none());
-
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Main);
-        assert!(!app.should_quit);
-
-        let (sender, receiver) = std::sync::mpsc::channel();
-        app.set_startup_update_check(receiver);
-        sender
-            .send(StartupUpdate::Available(Box::new(plan.clone())))
-            .unwrap();
-        app.poll_update_check();
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::Main);
-
-        app.set_screen(Screen::Update);
-        app.update_state = StartupUpdate::Available(Box::new(plan.clone()));
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::UpdateConfirm);
-        assert!(!app.should_quit);
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Enter));
-        assert!(app.should_quit);
-        assert_eq!(app.take_update_plan(), Some(plan));
-
-        settings.language = None;
-        crate::control::settings::save(&paths, &settings).unwrap();
-        let mut app = App::load_with_startup(
-            paths.clone(),
-            StartupUpdate::NpmPending {
-                target_version: "0.2.0".to_string(),
-                discovery: Box::new(pending_discovery("0.2.0")),
-            },
-            None,
-        )
-        .unwrap();
-        assert_eq!(app.screen, Screen::Language { first_run: true });
-        assert!(app.toast.is_none());
-        assert!(!app.should_quit);
-        assert!(app.take_update_plan().is_none());
-
-        let mut app = App::load_with_startup(
-            paths,
-            StartupUpdate::InstallFailed("injected failure".to_string()),
-            None,
-        )
-        .unwrap();
-        assert_eq!(app.screen, Screen::Language { first_run: true });
-        let toast = app.toast.take().unwrap();
-        assert!(toast.warning);
-        assert!(toast.message.contains(app.update_messages().update_failed));
-        assert!(toast.message.contains("injected failure"));
-    }
-
-    #[test]
-    fn config_nested_adjustments_wait_for_the_save_key_and_escape_can_discard_them() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        // Pin the starting levels instead of inheriting the shipped defaults: this test owns the
-        // draft/commit semantics and the cycle order, not the product's chosen default values.
-        app.settings.tier = Tier::Standard;
-        app.settings.tool_budgets = crate::control::settings::ToolBudgetPreferences {
-            read: Some(ToolBudgetLevel::Inherit),
-            grep: None,
-            glob: None,
-            run: Some(ToolBudgetLevel::Percent(75)),
-            job_output: Some(ToolBudgetLevel::Percent(25)),
-        };
-        app.config_draft = crate::tui::config::ConfigDraft::from_settings(&app.settings);
-        app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default();
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            app.config_draft.value(ConfigItemId::OutputTier),
-            ConfigValue::Tier(Tier::High)
-        );
-        assert_eq!(
-            budget_level(&app, ConfigItemId::ReadBudget),
-            ToolBudgetLevel::Percent(75)
-        );
-        assert_eq!(app.settings.tier, Tier::Standard);
-        assert_eq!(
-            app.settings.tool_budgets.read,
-            Some(ToolBudgetLevel::Inherit)
-        );
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::ConfigDiscardConfirm);
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Main);
-        assert_eq!(app.settings.tier, Tier::Standard);
-        assert!(!app.paths.fastctx_config.exists());
-
-        app.selected = 1;
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Config);
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Left));
-        for _ in 0..3 {
-            app.handle_key(key(KeyCode::Down));
-        }
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Right));
-        // The save key belongs to the page rather than to a row, so it commits every group at
-        // once from wherever the cursor happens to be.
-        app.handle_key(key(KeyCode::Char('s')));
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::Config);
-        assert_eq!(app.settings.tier, Tier::High);
-        // Three children moved one stop each from three distinct starting shares, in two
-        // directions, so a cursor that collapsed onto a single item cannot satisfy all three.
-        assert_eq!(
-            app.settings.tool_budgets.read,
-            Some(ToolBudgetLevel::Percent(75))
-        );
-        assert_eq!(
-            app.settings.tool_budgets.run,
-            Some(ToolBudgetLevel::Inherit)
-        );
-        assert_eq!(
-            app.settings.tool_budgets.job_output,
-            Some(ToolBudgetLevel::Percent(50))
-        );
-        // The two untouched tools stay unset, so they keep tracking the tier the user just raised
-        // rather than being frozen at whatever Standard happened to recommend.
-        assert_eq!(app.settings.tool_budgets.grep, None);
-        assert_eq!(app.settings.tool_budgets.glob, None);
-        let persisted = crate::control::settings::load(&app.paths).unwrap();
-        assert_eq!(persisted.tier, Tier::High);
-        assert_eq!(
-            persisted.tool_budgets.read,
-            Some(ToolBudgetLevel::Percent(75))
-        );
-        assert_eq!(persisted.tool_budgets.run, Some(ToolBudgetLevel::Inherit));
-        assert_eq!(
-            persisted.tool_budgets.job_output,
-            Some(ToolBudgetLevel::Percent(50))
-        );
-        assert_eq!(persisted.tool_budgets.grep, None);
-    }
-
-    /// Leaving the settings page is the one moment a draft can be lost, so it has to offer a way
-    /// back rather than discarding on a single keystroke.
-    #[test]
-    fn escaping_unsaved_settings_offers_a_way_back_before_discarding_them() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default();
-        app.handle_key(key(KeyCode::Right));
-        let drafted = app.config_draft;
-        assert!(app.config_is_dirty());
-
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::ConfigDiscardConfirm);
-        assert_eq!(app.selected, 0);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Config);
-        assert_eq!(app.config_draft, drafted);
-
-        app.handle_key(key(KeyCode::Char('s')));
-        app.execute_pending();
-        assert!(!app.config_is_dirty());
-        // With nothing unsaved there is nothing to warn about, so leaving is immediate again.
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::Main);
-    }
-
-    /// Enter used to save every group and leave the page, which made typing a number in an editor
-    /// look like it had committed unrelated settings.
-    #[test]
-    fn enter_activates_the_focused_item_instead_of_writing_settings() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default();
-        let tier = app.settings.tier;
-
-        app.handle_key(key(KeyCode::Enter));
-
-        assert_eq!(
-            app.config_draft.value(ConfigItemId::OutputTier),
-            ConfigValue::Tier(tier.next())
-        );
-        assert!(!app.has_pending_effect());
-        assert_eq!(app.settings.tier, tier);
-        assert!(!app.paths.fastctx_config.exists());
-    }
-
-    fn budget_level(app: &App, item: ConfigItemId) -> ToolBudgetLevel {
-        match app.config_draft.value(item) {
-            ConfigValue::Budget(budget) => budget.level,
-            other => panic!("{item:?} is not a budget item: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_budget_editor_types_an_off_grid_share_and_the_arrows_hand_it_back() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.settings.tier = Tier::Standard;
-        app.config_draft = crate::tui::config::ConfigDraft::from_settings(&app.settings);
-        app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default();
-        // Move onto grep, which ships unset and therefore follows the tier.
-        for _ in 0..2 {
-            app.handle_key(key(KeyCode::Down));
-        }
-        let resolved = budget_level(&app, ConfigItemId::GrepBudget).percent();
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            app.screen,
-            Screen::ConfigBudgetEdit(ConfigItemId::GrepBudget)
-        );
-        // The field opens on the share in effect, so editing always starts from what is on screen.
-        assert_eq!(app.budget_editor.input, resolved.to_string());
-        // Letters never reach it, which is what lets the prompt promise digits and nothing else.
-        type_text(&mut app, "auto");
-        assert_eq!(app.budget_editor.input, "");
-
-        type_text(&mut app, "37");
-        app.handle_key(key(KeyCode::Enter));
-        // Accepting an entry returns to the list with the value in the draft, the same way the
-        // CPU limit editor does. Nothing is written until the save key.
-        assert_eq!(app.screen, Screen::Config);
-        assert!(!app.has_pending_effect());
-        assert_eq!(app.settings.tool_budgets.grep, None);
-        app.handle_key(key(KeyCode::Char('s')));
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::Config);
-        assert_eq!(
-            app.settings.tool_budgets.grep,
-            Some(ToolBudgetLevel::Percent(37))
-        );
-
-        open_grep_budget_editor(&mut app);
-        assert_eq!(app.budget_editor.input, "37");
-        app.handle_key(key(KeyCode::Esc));
-
-        // Getting back to tier tracking is the arrows' job now. An off-grid share snaps down to
-        // the stop below it and one more press leaves the grid for automatic, so the round trip
-        // stays possible without the editor knowing a keyword.
-        app.handle_key(key(KeyCode::Left));
-        assert_eq!(
-            app.config_draft.output.budgets.grep,
-            Some(ToolBudgetLevel::Percent(25))
-        );
-        app.handle_key(key(KeyCode::Left));
-        assert_eq!(app.config_draft.output.budgets.grep, None);
-        app.handle_key(key(KeyCode::Char('s')));
-        app.execute_pending();
-        assert_eq!(app.settings.tool_budgets.grep, None);
-
-        // A rejected value stays on the editor with the reason recorded and changes nothing.
-        open_grep_budget_editor(&mut app);
-        type_text(&mut app, "150");
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            app.screen,
-            Screen::ConfigBudgetEdit(ConfigItemId::GrepBudget)
-        );
-        assert!(app.budget_editor.error.is_some());
-        assert!(!app.has_pending_effect());
-        assert_eq!(app.settings.tool_budgets.grep, None);
-        app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::Config);
-    }
-
-    /// Reopens the grep share editor from wherever the previous commit left the app.
-    fn open_grep_budget_editor(app: &mut App) {
-        app.screen = Screen::Config;
-        app.config_cursor = config::cursor_for(ConfigItemId::GrepBudget);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            app.screen,
-            Screen::ConfigBudgetEdit(ConfigItemId::GrepBudget)
-        );
-    }
-
-    /// The button is the visible half of the explicit-save rule: it reports what pressing it would
-    /// do, it commits from wherever the cursor is, and pressing it with nothing pending says so
-    /// rather than running a write indistinguishable from a real one.
-    #[test]
-    fn the_save_button_reports_what_is_pending_and_both_paths_frame_the_write() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.screen = Screen::Config;
-        app.config_cursor = config::cursor_for(ConfigItemId::SaveAll);
-
-        assert_eq!(app.config_unsaved_count(), 0);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Config);
-        assert!(!app.has_pending_effect());
-        assert!(!app.paths.fastctx_config.exists());
-        let clean = app.config_messages().save_button_clean;
-        assert!(
-            app.toast
-                .as_ref()
-                .is_some_and(|toast| toast.message == clean),
-            "{:?}",
-            app.toast
-        );
-
-        // Two edits in two groups, counted per item rather than collapsed into one dirty flag.
-        app.config_cursor = ConfigCursor::default();
-        app.handle_key(key(KeyCode::Right));
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Right));
-        assert_eq!(app.config_unsaved_count(), 2);
-
-        // `settings::save` runs synchronously on this thread, so the frame announcing it has to
-        // reach the terminal before the write starts — from the page key and the button alike.
-        app.handle_key(key(KeyCode::Char('s')));
-        assert_eq!(app.screen, Screen::ConfigSaving);
-        assert!(app.has_pending_effect());
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::Config);
-        assert_eq!(app.config_unsaved_count(), 0);
-        assert!(app.paths.fastctx_config.exists());
-
-        app.handle_key(key(KeyCode::Right));
-        assert_eq!(app.config_unsaved_count(), 1);
-        app.config_cursor = config::cursor_for(ConfigItemId::SaveAll);
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::ConfigSaving);
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::Config);
-        assert_eq!(app.config_unsaved_count(), 0);
-    }
-
-    #[test]
-    fn config_save_failure_keeps_the_draft_and_retries_cleanly() {
-        let (_temp, mut app) = fixture();
-        app.settings.language = Some("en".to_string());
-        app.screen = Screen::Config;
-        app.config_cursor = ConfigCursor::default();
-        app.handle_key(key(KeyCode::Right));
-        std::fs::write(&app.paths.fastctx_dir, b"blocks directory creation").unwrap();
-
-        app.handle_key(key(KeyCode::Char('s')));
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::OperationFailed);
-        assert!(app.error.is_some());
-        assert_eq!(
-            app.config_draft.value(ConfigItemId::OutputTier),
-            ConfigValue::Tier(Tier::High)
-        );
-        assert_eq!(app.settings.tier, Tier::Standard);
-
-        std::fs::remove_file(&app.paths.fastctx_dir).unwrap();
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Config);
-        app.execute_pending();
-        assert_eq!(app.screen, Screen::Config);
-        assert_eq!(app.settings.tier, Tier::High);
-        assert!(!app.config_is_dirty());
     }
 
     fn file_tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {

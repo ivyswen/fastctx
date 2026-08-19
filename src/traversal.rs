@@ -1,7 +1,9 @@
-//! Shared project traversal with lossless search paths and deterministic failures.
+//! Shared project traversal with lossless search paths, partial results, and a
+//! deterministic report of whatever the walk could not reach.
 
 use crate::bounded_sort::sort_cancelable;
 use crate::file_executor::{BurstUse, GrepGlobExecutor};
+use crate::glob_filter::PathGlobFilter;
 use crate::operation::OperationCtx;
 #[cfg(test)]
 use crate::operation::TestStage;
@@ -9,10 +11,10 @@ use crate::path_codec::{
     PathRecord, ResolvedRoot, RootKind, display_path as search_display_path,
     io_error_message as search_io_error_message,
 };
-use globset::GlobSet;
 use ignore::types::TypesBuilder;
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use parking_lot::Mutex;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -21,6 +23,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) const TRAVERSAL_BATCH_ITEMS: usize = 256;
+
+/// Upper bound on skipped paths kept with full detail. A damaged tree can raise
+/// far more failures than any response could carry, so detail is bounded while
+/// the tally stays exact.
+const SKIPPED_DETAIL_CAP: usize = 256;
 
 /// Legacy replace candidate retained while search uses `PathRecord` directly.
 #[derive(Debug)]
@@ -31,7 +38,9 @@ pub(crate) struct ProjectCandidate {
 /// The schedule-independent ordering key for one traversal failure.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct TraversalErrorKey {
-    pub(crate) display_path_bytes: Vec<u8>,
+    /// Doubles as the reported path: `String` orders by the same bytes the key
+    /// needs, so the failure never carries a second copy of it.
+    pub(crate) display: String,
     pub(crate) kind_rank: u8,
     pub(crate) raw_os_error: Option<i32>,
     pub(crate) normalized_message: String,
@@ -40,7 +49,10 @@ pub(crate) struct TraversalErrorKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TraversalFailure {
     pub(crate) key: TraversalErrorKey,
+    /// Standalone sentence used when the failure ends the whole request.
     pub(crate) message: String,
+    /// Short cause phrase for skip reporting, where the path is already shown.
+    reason: String,
 }
 
 /// Existing collection limit enforced at the first item beyond `maximum`.
@@ -50,62 +62,165 @@ pub(crate) struct TraversalLimit {
     pub(crate) message: &'static str,
 }
 
-/// Batched traversal output plus test-only evidence about lock and lane usage.
-pub(crate) struct TraversalCollection<T> {
-    pub(crate) items: Vec<T>,
-    #[cfg(test)]
-    pub(crate) metrics: TraversalMetrics,
+/// One path a walk could not enter or evaluate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SkippedPath<'a> {
+    pub(crate) display: &'a str,
+    pub(crate) reason: &'a str,
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct TraversalMetrics {
-    pub(crate) serial_walks: usize,
-    pub(crate) parallel_walks: usize,
-    pub(crate) parallel_threads: usize,
-    pub(crate) batch_lock_acquisitions: usize,
-    pub(crate) largest_batch: usize,
+/// Paths a walk had to skip, deduplicated by failure identity and ordered by the
+/// same schedule-independent key the walk uses everywhere else, so the report is
+/// identical across serial and parallel runs.
+#[derive(Debug, Default)]
+pub(crate) struct SkippedPaths {
+    /// Keyed by failure identity; the value is that failure's cause phrase.
+    entries: BTreeMap<TraversalErrorKey, String>,
+    beyond_cap: usize,
+    /// Lowest-ranked failure, kept verbatim for the paths that still fail whole.
+    minimum: Option<(TraversalErrorKey, String)>,
+}
+
+/// Batched traversal output: what the walk collected, plus what it could not reach.
+pub(crate) struct TraversalCollection<T> {
+    pub(crate) items: Vec<T>,
+    pub(crate) skipped: SkippedPaths,
+}
+
+impl SkippedPaths {
+    fn record(&mut self, failure: TraversalFailure) {
+        let TraversalFailure {
+            key,
+            message,
+            reason,
+        } = failure;
+        if self
+            .minimum
+            .as_ref()
+            .is_none_or(|(existing, _)| key < *existing)
+        {
+            self.minimum = Some((key.clone(), message));
+        }
+        self.insert(key, reason);
+    }
+
+    /// Past the cap the key is dropped, so repeats of an already-overflowed
+    /// failure add to the tally again. Holding every key just to keep the count
+    /// exact would defeat the bound the cap exists to provide, and a walk that
+    /// raised more than `SKIPPED_DETAIL_CAP` distinct failures is already being
+    /// told "large parts of this tree were not searched".
+    fn insert(&mut self, key: TraversalErrorKey, reason: String) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        if self.entries.len() < SKIPPED_DETAIL_CAP {
+            self.entries.insert(key, reason);
+        } else {
+            self.beyond_cap = self.beyond_cap.saturating_add(1);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        if let Some((key, message)) = other.minimum
+            && self
+                .minimum
+                .as_ref()
+                .is_none_or(|(existing, _)| key < *existing)
+        {
+            self.minimum = Some((key, message));
+        }
+        for (key, reason) in other.entries {
+            self.insert(key, reason);
+        }
+        self.beyond_cap = self.beyond_cap.saturating_add(other.beyond_cap);
+    }
+
+    /// The message a walk reports when the skip cannot be survived.
+    fn root_failure_message(&self) -> Option<String> {
+        self.minimum.as_ref().map(|(_, message)| message.clone())
+    }
+
+    /// Also answers "has anything been recorded at all": `record` always both
+    /// sets `minimum` and lands in one of the two counters, so an empty report
+    /// can never be hiding a failure the parallel merge would drop.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.beyond_cap == 0
+    }
+
+    /// Every skipped path, listed and unlisted alike; exact up to the cap.
+    pub(crate) fn total(&self) -> usize {
+        self.entries.len().saturating_add(self.beyond_cap)
+    }
+
+    /// Paths kept with full detail, in deterministic order.
+    pub(crate) fn listed(&self) -> impl ExactSizeIterator<Item = SkippedPath<'_>> {
+        self.entries.iter().map(|(key, reason)| SkippedPath {
+            display: &key.display,
+            reason,
+        })
+    }
+
+    /// Paths counted but dropped from the detail list at the cap.
+    pub(crate) fn unlisted(&self) -> usize {
+        self.beyond_cap
+    }
 }
 
 impl TraversalFailure {
     pub(crate) fn from_io(path: &Path, error: &io::Error) -> Self {
         Self {
             key: TraversalErrorKey {
-                display_path_bytes: search_display_path(path).into_bytes(),
+                display: search_display_path(path),
                 kind_rank: io_kind_rank(error.kind()),
                 raw_os_error: error.raw_os_error(),
                 normalized_message: normalize_error_message(&error.to_string()),
             },
             message: search_io_error_message(path, error),
+            reason: io_reason(error),
         }
     }
 
-    pub(crate) fn from_other(path: &Path, message: String) -> Self {
+    pub(crate) fn from_other(path: &Path, message: String, reason: String) -> Self {
         Self {
             key: TraversalErrorKey {
-                display_path_bytes: search_display_path(path).into_bytes(),
+                display: search_display_path(path),
                 kind_rank: u8::MAX,
                 raw_os_error: None,
                 normalized_message: normalize_error_message(&message),
             },
             message,
+            reason,
         }
     }
+}
+
+/// Mirrors `path_codec::io_error_message`'s cases without repeating the path,
+/// which skip reports already carry in their own column.
+fn io_reason(error: &io::Error) -> String {
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(32 | 33)) {
+        return "locked by another process".to_string();
+    }
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        return "permission denied".to_string();
+    }
+    error.to_string()
 }
 
 /// Collects lossless grep candidates while reusing the root's sole metadata result.
 pub(crate) fn collect_search_candidates(
     root: &ResolvedRoot,
-    glob: Option<&GlobSet>,
+    glob: Option<&PathGlobFilter>,
     file_type: Option<&str>,
     operation: Option<&OperationCtx>,
     executor: Option<&Arc<GrepGlobExecutor>>,
-) -> Result<Vec<PathRecord>, String> {
+) -> Result<TraversalCollection<PathRecord>, String> {
     if operation_cancelled(operation) {
         return Err("Request cancelled.".to_string());
     }
     let type_filter = build_type_filter(file_type)?;
     let mut candidates = Vec::new();
+    let mut skipped = SkippedPaths::default();
     if root.kind == RootKind::File {
         let candidate =
             PathRecord::from_metadata(&root.native, root.match_root(), &root.metadata, true)
@@ -114,30 +229,36 @@ pub(crate) fn collect_search_candidates(
             candidates.push(candidate);
         }
     } else {
-        candidates =
-            collect_directory_candidates(root, glob, type_filter, operation, executor)?.items;
+        let collected = collect_directory_candidates(root, glob, type_filter, operation, executor)?;
+        candidates = collected.items;
+        skipped = collected.skipped;
     }
-    sort_cancelable(candidates, compare_search_candidates, operation, executor)
+    let items = sort_cancelable(candidates, compare_search_candidates, operation, executor)
         .map(|sorted| sorted.items)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(TraversalCollection { items, skipped })
 }
 
 /// Collects files for replace while preserving its pre-codec display contract.
 pub(crate) fn collect_project_candidates(
     root: &Path,
-    glob: Option<&GlobSet>,
+    glob: Option<&PathGlobFilter>,
     file_type: Option<&str>,
-) -> Result<Vec<ProjectCandidate>, String> {
+) -> Result<TraversalCollection<ProjectCandidate>, String> {
     let metadata =
         fs::metadata(root).map_err(|error| crate::paths::io_error_message(root, &error))?;
     let resolved = ResolvedRoot::from_metadata(root.to_path_buf(), metadata)?;
-    collect_search_candidates(&resolved, glob, file_type, None, None).map(|candidates| {
-        candidates
-            .into_iter()
-            .map(|candidate| ProjectCandidate {
-                display: crate::paths::display_path(&candidate.native),
-            })
-            .collect()
+    collect_search_candidates(&resolved, glob, file_type, None, None).map(|collected| {
+        TraversalCollection {
+            items: collected
+                .items
+                .into_iter()
+                .map(|candidate| ProjectCandidate {
+                    display: crate::paths::display_path(&candidate.native),
+                })
+                .collect(),
+            skipped: collected.skipped,
+        }
     })
 }
 
@@ -157,7 +278,7 @@ fn build_type_filter(file_type: Option<&str>) -> Result<Option<ignore::types::Ty
 
 fn collect_directory_candidates(
     root: &ResolvedRoot,
-    glob: Option<&GlobSet>,
+    glob: Option<&PathGlobFilter>,
     type_filter: Option<ignore::types::Types>,
     operation: Option<&OperationCtx>,
     executor: Option<&Arc<GrepGlobExecutor>>,
@@ -235,7 +356,7 @@ where
     if run.is_err() {
         return Err("Internal traversal worker failure.".to_string());
     }
-    finish_parallel_collection(shared.into_inner(), limit, thread_count)
+    finish_parallel_collection(shared.into_inner(), limit)
 }
 
 fn collect_walk_serial<T, F>(
@@ -249,7 +370,8 @@ where
     F: Fn(&DirEntry) -> Result<Option<T>, TraversalFailure>,
 {
     let mut items = Vec::new();
-    let mut minimum_failure = None;
+    let mut skipped = SkippedPaths::default();
+    let mut entries_seen = 0_usize;
     let mut too_many = false;
     for entry in builder.build() {
         stage_traversal_entry(operation);
@@ -260,11 +382,12 @@ where
             Ok(entry) => entry,
             Err(error) => {
                 for failure in traversal_errors_from_ignore(&error, root) {
-                    select_minimum_failure(&mut minimum_failure, failure);
+                    skipped.record(failure);
                 }
                 continue;
             }
         };
+        entries_seen = entries_seen.saturating_add(1);
         let evaluated = catch_unwind(AssertUnwindSafe(|| evaluate(&entry)));
         match evaluated {
             Ok(Ok(Some(item))) => {
@@ -275,14 +398,8 @@ where
                 items.push(item);
             }
             Ok(Ok(None)) => {}
-            Ok(Err(failure)) => select_minimum_failure(&mut minimum_failure, failure),
-            Err(_) => select_minimum_failure(
-                &mut minimum_failure,
-                TraversalFailure::from_other(
-                    entry.path(),
-                    "Internal traversal failure while evaluating a file candidate.".to_string(),
-                ),
-            ),
+            Ok(Err(failure)) => skipped.record(failure),
+            Err(_) => skipped.record(evaluation_panic(entry.path())),
         }
     }
     if operation_cancelled(operation) {
@@ -294,39 +411,48 @@ where
             None => Err("Internal traversal limit state was inconsistent.".to_string()),
         };
     }
-    if let Some(failure) = minimum_failure {
-        return Err(failure.message);
+    finish_collection(items, skipped, entries_seen)
+}
+
+/// A walk that never yielded a single entry never happened: the root itself was
+/// unreadable, so reporting it as "no results, some paths skipped" would read as
+/// "searched, found nothing". Those still fail whole, with the message the walk
+/// would have produced before partial results existed.
+fn finish_collection<T>(
+    items: Vec<T>,
+    skipped: SkippedPaths,
+    entries_seen: usize,
+) -> Result<TraversalCollection<T>, String> {
+    if entries_seen == 0
+        && let Some(message) = skipped.root_failure_message()
+    {
+        return Err(message);
     }
-    Ok(TraversalCollection {
-        items,
-        #[cfg(test)]
-        metrics: TraversalMetrics {
-            serial_walks: 1,
-            ..TraversalMetrics::default()
-        },
-    })
+    Ok(TraversalCollection { items, skipped })
+}
+
+fn evaluation_panic(path: &Path) -> TraversalFailure {
+    TraversalFailure::from_other(
+        path,
+        "Internal traversal failure while evaluating a file candidate.".to_string(),
+        "internal failure while evaluating this path".to_string(),
+    )
 }
 
 struct ParallelCollectionState<T> {
     items: Vec<T>,
-    minimum_failure: Option<TraversalFailure>,
+    skipped: SkippedPaths,
+    entries_seen: usize,
     too_many: bool,
-    #[cfg(test)]
-    batch_lock_acquisitions: usize,
-    #[cfg(test)]
-    largest_batch: usize,
 }
 
 impl<T> Default for ParallelCollectionState<T> {
     fn default() -> Self {
         Self {
             items: Vec::new(),
-            minimum_failure: None,
+            skipped: SkippedPaths::default(),
+            entries_seen: 0,
             too_many: false,
-            #[cfg(test)]
-            batch_lock_acquisitions: 0,
-            #[cfg(test)]
-            largest_batch: 0,
         }
     }
 }
@@ -338,7 +464,8 @@ struct ParallelLocalBatch<'a, T> {
     operation: Option<&'a OperationCtx>,
     limit: Option<TraversalLimit>,
     items: Vec<T>,
-    minimum_failure: Option<TraversalFailure>,
+    skipped: SkippedPaths,
+    entries_seen: usize,
 }
 
 impl<'a, T> ParallelLocalBatch<'a, T> {
@@ -356,7 +483,8 @@ impl<'a, T> ParallelLocalBatch<'a, T> {
             operation,
             limit,
             items: Vec::with_capacity(TRAVERSAL_BATCH_ITEMS),
-            minimum_failure: None,
+            skipped: SkippedPaths::default(),
+            entries_seen: 0,
         }
     }
 
@@ -368,11 +496,11 @@ impl<'a, T> ParallelLocalBatch<'a, T> {
     }
 
     fn record_failure(&mut self, failure: TraversalFailure) {
-        select_minimum_failure(&mut self.minimum_failure, failure);
+        self.skipped.record(failure);
     }
 
     fn flush(&mut self) {
-        if self.items.is_empty() && self.minimum_failure.is_none() {
+        if self.items.is_empty() && self.skipped.is_empty() && self.entries_seen == 0 {
             return;
         }
         stage_traversal_batch_flush(self.operation);
@@ -380,20 +508,16 @@ impl<'a, T> ParallelLocalBatch<'a, T> {
             self.cancelled.store(true, Ordering::Release);
             self.stop.store(true, Ordering::Release);
             self.items.clear();
-            self.minimum_failure = None;
+            self.skipped = SkippedPaths::default();
+            self.entries_seen = 0;
             return;
         }
 
         let mut shared = self.shared.lock();
-        #[cfg(test)]
-        {
-            let batch_len = self.items.len();
-            shared.batch_lock_acquisitions = shared.batch_lock_acquisitions.saturating_add(1);
-            shared.largest_batch = shared.largest_batch.max(batch_len);
-        }
-        if let Some(failure) = self.minimum_failure.take() {
-            select_minimum_failure(&mut shared.minimum_failure, failure);
-        }
+        shared.skipped.merge(std::mem::take(&mut self.skipped));
+        shared.entries_seen = shared
+            .entries_seen
+            .saturating_add(std::mem::take(&mut self.entries_seen));
         for item in self.items.drain(..) {
             if self
                 .limit
@@ -448,15 +572,13 @@ where
             return WalkState::Continue;
         }
     };
+    local.entries_seen = local.entries_seen.saturating_add(1);
     let evaluated = catch_unwind(AssertUnwindSafe(|| evaluate(&entry)));
     match evaluated {
         Ok(Ok(Some(item))) => local.push(item),
         Ok(Ok(None)) => {}
         Ok(Err(failure)) => local.record_failure(failure),
-        Err(_) => local.record_failure(TraversalFailure::from_other(
-            entry.path(),
-            "Internal traversal failure while evaluating a file candidate.".to_string(),
-        )),
+        Err(_) => local.record_failure(evaluation_panic(entry.path())),
     }
     if local.stop.load(Ordering::Acquire) {
         WalkState::Quit
@@ -468,7 +590,6 @@ where
 fn finish_parallel_collection<T>(
     state: ParallelCollectionState<T>,
     limit: Option<TraversalLimit>,
-    _thread_count: usize,
 ) -> Result<TraversalCollection<T>, String> {
     if state.too_many {
         return match limit {
@@ -476,20 +597,7 @@ fn finish_parallel_collection<T>(
             None => Err("Internal traversal limit state was inconsistent.".to_string()),
         };
     }
-    if let Some(failure) = state.minimum_failure {
-        return Err(failure.message);
-    }
-    Ok(TraversalCollection {
-        items: state.items,
-        #[cfg(test)]
-        metrics: TraversalMetrics {
-            parallel_walks: 1,
-            parallel_threads: _thread_count,
-            batch_lock_acquisitions: state.batch_lock_acquisitions,
-            largest_batch: state.largest_batch,
-            ..TraversalMetrics::default()
-        },
-    })
+    finish_collection(state.items, state.skipped, state.entries_seen)
 }
 
 fn compare_search_candidates(left: &PathRecord, right: &PathRecord) -> std::cmp::Ordering {
@@ -502,7 +610,7 @@ fn compare_search_candidates(left: &PathRecord, right: &PathRecord) -> std::cmp:
 
 fn matches_record(
     candidate: &PathRecord,
-    glob: Option<&GlobSet>,
+    glob: Option<&PathGlobFilter>,
     types: Option<&ignore::types::Types>,
 ) -> bool {
     if let Some(types) = types
@@ -577,15 +685,6 @@ fn stage_traversal_batch_flush(operation: Option<&OperationCtx>) {
     let _ = operation;
 }
 
-fn select_minimum_failure(current: &mut Option<TraversalFailure>, failure: TraversalFailure) {
-    if current
-        .as_ref()
-        .is_none_or(|existing| failure.key < existing.key)
-    {
-        *current = Some(failure);
-    }
-}
-
 pub(crate) fn traversal_errors_from_ignore(
     error: &ignore::Error,
     root: &Path,
@@ -616,6 +715,7 @@ fn collect_ignore_error(
         ignore::Error::Loop { child, .. } => failures.push(TraversalFailure::from_other(
             child,
             format!("Cannot traverse path: {error}"),
+            error.to_string(),
         )),
         ignore::Error::Io(error) => failures.push(TraversalFailure::from_io(
             inherited_path.unwrap_or(root),
@@ -626,6 +726,7 @@ fn collect_ignore_error(
         | ignore::Error::InvalidDefinition => failures.push(TraversalFailure::from_other(
             inherited_path.unwrap_or(root),
             format!("Cannot traverse path: {error}"),
+            error.to_string(),
         )),
     }
 }
@@ -649,206 +750,97 @@ fn io_kind_rank(kind: io::ErrorKind) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TRAVERSAL_BATCH_ITEMS, TraversalCollection, TraversalFailure, collect_walk_batched,
-        traversal_errors_from_ignore,
-    };
-    use crate::file_executor::{BurstUse, GrepGlobExecutor};
-    use crate::operation::{RequestWorkGuard, TestStage};
-    use ignore::WalkBuilder;
-    use rmcp::model::RequestId;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio_util::sync::CancellationToken;
+    use super::*;
+    use std::path::PathBuf;
 
-    fn unfiltered_builder(root: &Path) -> WalkBuilder {
-        let mut builder = WalkBuilder::new(root);
-        builder
-            .standard_filters(false)
-            .hidden(false)
-            .follow_links(false);
-        builder
-    }
-
-    fn collect_file_names(
-        root: &Path,
-        executor: &Arc<GrepGlobExecutor>,
-        operation: Option<&crate::operation::OperationCtx>,
-    ) -> Result<TraversalCollection<String>, String> {
-        collect_walk_batched(
-            unfiltered_builder(root),
-            root,
-            operation,
-            Some(executor),
-            None,
-            |entry| {
-                if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                    Ok(Some(entry.path().to_string_lossy().into_owned()))
-                } else {
-                    Ok(None)
-                }
-            },
+    fn failure(path: &str) -> TraversalFailure {
+        TraversalFailure::from_other(
+            Path::new(path),
+            format!("Cannot traverse path: {path}"),
+            format!("reason for {path}"),
         )
     }
 
-    fn create_batched_fixture() -> tempfile::TempDir {
-        let fixture = tempfile::tempdir().unwrap();
-        for directory_index in 0..8 {
-            let directory = fixture.path().join(format!("batch-{directory_index:02}"));
-            fs::create_dir(&directory).unwrap();
-            for file_index in 0..137 {
-                fs::write(directory.join(format!("item-{file_index:03}.txt")), b"x").unwrap();
-            }
-        }
-        fixture
+    fn listing(skipped: &SkippedPaths) -> Vec<(String, String)> {
+        skipped
+            .listed()
+            .map(|path| (path.display.to_string(), path.reason.to_string()))
+            .collect()
     }
 
+    /// The defect this whole module exists to prevent: one unreadable corner of a
+    /// tree used to discard every result collected around it.
     #[test]
-    fn nested_ignore_error_keeps_the_path_in_its_canonical_key() {
-        let error = ignore::Error::WithDepth {
-            depth: 2,
-            err: Box::new(ignore::Error::WithPath {
-                path: PathBuf::from("nested/private"),
-                err: Box::new(ignore::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "denied",
-                ))),
-            }),
+    fn a_failure_inside_the_tree_keeps_the_items_around_it() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(dir.path().join(name), "x").expect("seed");
+        }
+        let collected = collect_walk_serial(
+            WalkBuilder::new(dir.path()),
+            dir.path(),
+            None,
+            None,
+            &|entry: &DirEntry| -> Result<Option<PathBuf>, TraversalFailure> {
+                if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    return Ok(None);
+                }
+                if entry.file_name() == "b.txt" {
+                    return Err(failure("b.txt"));
+                }
+                Ok(Some(entry.path().to_path_buf()))
+            },
+        )
+        .expect("a failure inside the tree must not fail the walk");
+        assert_eq!(collected.items.len(), 2);
+        assert_eq!(collected.skipped.total(), 1);
+    }
+
+    /// A walk with nothing to report on cannot claim it searched: an unreadable
+    /// root must stay an error rather than become "found nothing".
+    #[test]
+    fn a_walk_that_never_reached_an_entry_still_fails_whole() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let missing = dir.path().join("missing");
+        let error = collect_walk_serial(
+            WalkBuilder::new(&missing),
+            &missing,
+            None,
+            None,
+            &|_: &DirEntry| -> Result<Option<PathBuf>, TraversalFailure> { Ok(None) },
+        )
+        .map(|collected| collected.items)
+        .expect_err("an unreachable root has no partial result to offer");
+        assert!(!error.is_empty());
+    }
+
+    /// Parallel walkers merge thread-local batches in scheduling order, so the
+    /// report has to be a function of the failures alone.
+    #[test]
+    fn skip_reports_stay_identical_regardless_of_arrival_order() {
+        let record = |paths: &[&str]| {
+            let mut skipped = SkippedPaths::default();
+            for path in paths {
+                skipped.record(failure(path));
+            }
+            skipped
         };
-        let failures = traversal_errors_from_ignore(&error, Path::new("root"));
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].key.display_path_bytes, b"nested/private");
-        assert_eq!(failures[0].message, "Permission denied: nested/private");
-    }
+        let forward = record(&["/a", "/b", "/c"]);
+        let mut merged = record(&["/c"]);
+        merged.merge(record(&["/b", "/a"]));
+        assert_eq!(listing(&forward), listing(&merged));
+        assert_eq!(forward.total(), merged.total());
 
-    #[test]
-    fn traversal_failure_reduction_is_schedule_independent() {
-        let fixture = tempfile::tempdir().unwrap();
-        for index in 0..8 {
-            let directory = fixture.path().join(format!("worker-{index}"));
-            fs::create_dir(&directory).unwrap();
-            let name = match index % 3 {
-                0 => "first-other",
-                1 => "first-denied",
-                _ => "last-denied",
-            };
-            fs::write(directory.join(name), b"x").unwrap();
-        }
+        let mut duplicated = record(&["/a", "/a", "/a"]);
+        duplicated.merge(record(&["/a"]));
+        assert_eq!(duplicated.total(), 1);
 
-        for parallelism in [1, 2, 4] {
-            let executor = Arc::new(GrepGlobExecutor::with_test_parallelism(parallelism));
-            for _ in 0..100 {
-                let result = collect_walk_batched(
-                    unfiltered_builder(fixture.path()),
-                    fixture.path(),
-                    None,
-                    Some(&executor),
-                    None,
-                    |entry| {
-                        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
-                            return Ok(None::<()>);
-                        }
-                        let (path, kind, message) = match entry.file_name().to_str() {
-                            Some("first-other") => ("a-first", std::io::ErrorKind::Other, "other"),
-                            Some("first-denied") => {
-                                ("a-first", std::io::ErrorKind::PermissionDenied, "denied")
-                            }
-                            _ => ("z-last", std::io::ErrorKind::PermissionDenied, "z"),
-                        };
-                        let error = std::io::Error::new(kind, message);
-                        Err(TraversalFailure::from_io(Path::new(path), &error))
-                    },
-                );
-                assert_eq!(
-                    result
-                        .err()
-                        .expect("every file injects a traversal failure"),
-                    "Permission denied: a-first"
-                );
-            }
-            executor.wait_for_test_quiescence();
-            let ledger = executor.test_burst_ledger();
-            assert_eq!(ledger.allocated, ledger.released);
-            assert_eq!(ledger.live, 0);
-            assert_eq!(ledger.duplicate_releases, 0);
-        }
-    }
-
-    #[test]
-    fn p1_parallel_and_saturated_p4_have_the_same_set_and_true_serial_fallback() {
-        let fixture = create_batched_fixture();
-        let expected_count = 8 * 137;
-
-        let p1 = Arc::new(GrepGlobExecutor::with_test_parallelism(1));
-        let mut serial = collect_file_names(fixture.path(), &p1, None).unwrap();
-        assert_eq!(serial.items.len(), expected_count);
-        assert_eq!(serial.metrics.serial_walks, 1);
-        assert_eq!(serial.metrics.parallel_walks, 0);
-
-        let p4 = Arc::new(GrepGlobExecutor::with_test_parallelism(4));
-        let mut parallel = collect_file_names(fixture.path(), &p4, None).unwrap();
-        assert_eq!(parallel.items.len(), expected_count);
-        assert_eq!(parallel.metrics.serial_walks, 0);
-        assert_eq!(parallel.metrics.parallel_walks, 1);
-        assert_eq!(parallel.metrics.parallel_threads, 4);
-        assert!(parallel.metrics.largest_batch <= TRAVERSAL_BATCH_ITEMS);
-        assert!(
-            parallel.metrics.batch_lock_acquisitions
-                <= expected_count.div_ceil(TRAVERSAL_BATCH_ITEMS)
-                    + parallel.metrics.parallel_threads
-        );
-
-        serial.items.sort();
-        parallel.items.sort();
-        assert_eq!(parallel.items, serial.items);
-
-        let held = p4.try_bursts(p4.extra_capacity(), BurstUse::SearchSpeculation);
-        assert_eq!(held.len(), p4.extra_capacity());
-        let mut saturated = collect_file_names(fixture.path(), &p4, None).unwrap();
-        assert_eq!(saturated.metrics.serial_walks, 1);
-        assert_eq!(saturated.metrics.parallel_walks, 0);
-        saturated.items.sort();
-        assert_eq!(saturated.items, serial.items);
-        drop(held);
-
-        p4.wait_for_test_quiescence();
-        let ledger = p4.test_burst_ledger();
-        assert_eq!(ledger.allocated, ledger.released);
-        assert_eq!(ledger.live, 0);
-        assert_eq!(ledger.duplicate_releases, 0);
-    }
-
-    #[test]
-    fn traversal_entry_and_batch_flush_cancellation_release_every_walk_credit() {
-        let fixture = create_batched_fixture();
-        for target in [TestStage::TraversalEntry, TestStage::TraversalBatchFlush] {
-            let parent = CancellationToken::new();
-            let cancel = parent.clone();
-            let fired = Arc::new(AtomicBool::new(false));
-            let fired_hook = Arc::clone(&fired);
-            let (mut guard, operation) = RequestWorkGuard::new_with_hook(
-                RequestId::String(Arc::from(format!("traversal-{target:?}"))),
-                parent,
-                Arc::new(move |stage| {
-                    if stage == target && !fired_hook.swap(true, Ordering::AcqRel) {
-                        cancel.cancel();
-                    }
-                }),
-            );
-            let executor = Arc::new(GrepGlobExecutor::with_test_parallelism(4));
-            let error = collect_file_names(fixture.path(), &executor, Some(&operation))
-                .err()
-                .expect("the selected traversal stage must cancel the collection");
-            assert_eq!(error, "Request cancelled.");
-            assert!(fired.load(Ordering::Acquire));
-            guard.disarm();
-            executor.wait_for_test_quiescence();
-            let ledger = executor.test_burst_ledger();
-            assert_eq!(ledger.allocated, ledger.released);
-            assert_eq!(ledger.live, 0);
-            assert_eq!(ledger.duplicate_releases, 0);
-        }
+        let flood = (0..SKIPPED_DETAIL_CAP + 40)
+            .map(|index| format!("/flood/{index:05}"))
+            .collect::<Vec<_>>();
+        let overflowed = record(&flood.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(overflowed.total(), flood.len());
+        assert_eq!(overflowed.listed().len(), SKIPPED_DETAIL_CAP);
+        assert_eq!(overflowed.unlisted(), 40);
     }
 }

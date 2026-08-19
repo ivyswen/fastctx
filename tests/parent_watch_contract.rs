@@ -1,6 +1,6 @@
 mod common;
 
-use common::{McpSession, TEST_HOST_IDLE_MS, mcp_text, normalized};
+use common::{McpSession, TEST_HOST_IDLE_MS, isolate_command, mcp_text, normalized};
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -10,7 +10,19 @@ use std::time::{Duration, Instant};
 
 const PROCESS_DEADLINE: Duration = Duration::from_secs(30);
 const IDLE_PROBE: Duration = Duration::from_millis(1_500);
+/// Upper bound on the promptness this suite claims for an EOF-triggered shutdown.
+///
+/// This one is load-bearing: an in-flight request must not outlive stdin EOF, and the window
+/// has to stay tight enough to catch a shutdown that quietly waits out a drain instead.
 const EOF_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+/// Poll-until budget for a serve that must fail on an unreadable stdin.
+///
+/// Nothing the product promises is bounded here — the assertion is that it exits nonzero at
+/// all. The run starts a cold control center from an empty HOME, which costs over a second on
+/// an idle machine and more inside a full test group, so a tight budget would only report a
+/// busy machine as a defect (observed 2026-08-08 in the local gate).
+#[cfg(windows)]
+const STARTUP_FAILURE_DEADLINE: Duration = Duration::from_secs(30);
 
 #[test]
 fn parent_watch_exits_without_stdin_eof_but_preserves_live_and_opted_out_servers() {
@@ -318,12 +330,12 @@ fn stdin_startup_read_error_is_not_reported_as_clean_eof() {
         .spawn()
         .unwrap();
 
-    let Some(status) = wait_for_child_exit(&mut server, EOF_SHUTDOWN_DEADLINE) else {
+    let Some(status) = wait_for_child_exit(&mut server, STARTUP_FAILURE_DEADLINE) else {
         let _ = server.kill();
         let _ = server.wait();
         panic!(
             "serve did not report a startup stdin read error within {:?}",
-            EOF_SHUTDOWN_DEADLINE
+            STARTUP_FAILURE_DEADLINE
         );
     };
     let mut stderr = String::new();
@@ -365,6 +377,7 @@ fn spawn_controlled_parent(root: &Path, label: &str, enable_shell: bool) -> Cont
     std::fs::create_dir_all(&temp).unwrap();
     let (stdin_reader, stdin_writer) = anonymous_pipe();
     let mut helper = Command::new(std::env::current_exe().unwrap());
+    isolate_command(&mut helper, root);
     helper
         .args([
             "--ignored",
@@ -442,6 +455,7 @@ fn shell_server_command(root: &Path) -> Command {
     let temp = root.join("tmp");
     std::fs::create_dir_all(&temp).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_fastctx"));
+    isolate_command(&mut command, root);
     command
         .args(["serve", "--enable-shell"])
         .current_dir(root)
@@ -516,6 +530,7 @@ fn spawn_through_short_lived_parent(
     let response_path = root.join(format!("{label}-response.jsonl"));
     let (stdin_reader, mut stdin_writer) = anonymous_pipe();
     let mut helper = Command::new(std::env::current_exe().unwrap());
+    isolate_command(&mut helper, root);
     helper
         .args([
             "--ignored",

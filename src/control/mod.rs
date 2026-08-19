@@ -9,6 +9,7 @@ pub(crate) mod guard_i18n;
 pub mod i18n;
 pub(crate) mod job_i18n;
 pub(crate) mod leftovers;
+pub mod link;
 pub mod paths;
 pub(crate) mod processes;
 pub mod provider;

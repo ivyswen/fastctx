@@ -50,6 +50,32 @@ struct ResponseReservationState {
 
 thread_local! {
     static RESPONSE_RESERVATION: RefCell<Option<ResponseReservationState>> = const { RefCell::new(None) };
+    static RESPONSE_BUDGET_CEILING: RefCell<Option<usize>> = const { RefCell::new(None) };
+}
+
+/// One thread-local aggregate-burst ceiling installed around a single formatter.
+pub(crate) struct ResponseBudgetCeiling {
+    previous: Option<usize>,
+    active: bool,
+}
+
+impl ResponseBudgetCeiling {
+    pub(crate) fn install(budget: usize) -> Self {
+        let previous = RESPONSE_BUDGET_CEILING.with(|slot| slot.borrow_mut().replace(budget));
+        Self {
+            previous,
+            active: true,
+        }
+    }
+}
+
+impl Drop for ResponseBudgetCeiling {
+    fn drop(&mut self) {
+        if self.active {
+            RESPONSE_BUDGET_CEILING.with(|slot| *slot.borrow_mut() = self.previous.take());
+            self.active = false;
+        }
+    }
 }
 
 /// One thread-local response-budget reservation installed around a single tool formatter.
@@ -72,7 +98,8 @@ impl ResponseReservation {
         full_line: String,
         summary_line: String,
     ) -> Option<Self> {
-        let configured_budget = configured_tool_token_budget(variable).ok()?.value;
+        let configured_budget =
+            apply_response_ceiling(configured_tool_token_budget(variable).ok()?.value);
         Some(Self::install_with_budget(
             variable,
             configured_budget,
@@ -165,7 +192,7 @@ impl Drop for ResponseReservation {
 
 /// Reads the global text budget, rejecting invalid configuration instead of silently falling back.
 pub fn token_budget() -> Result<usize, String> {
-    let configured = configured_token_budget()?;
+    let configured = apply_response_ceiling(configured_token_budget()?);
     Ok(apply_response_reservation(
         GLOBAL_TOKEN_BUDGET_ENV,
         configured,
@@ -185,6 +212,7 @@ fn configured_token_budget() -> Result<usize, String> {
 /// Reads a tool budget; omission inherits the global value and explicit values may not exceed it.
 pub fn tool_token_budget(variable: &'static str) -> Result<TokenBudget, String> {
     let mut budget = configured_tool_token_budget(variable)?;
+    budget.value = apply_response_ceiling(budget.value);
     budget.value = apply_response_reservation(variable, budget.value);
     Ok(budget)
 }
@@ -215,15 +243,23 @@ fn configured_tool_token_budget(variable: &'static str) -> Result<TokenBudget, S
 /// the requested tool budget itself can be trusted.
 pub(crate) fn error_budget_hint(variable: &'static str) -> usize {
     let Ok(global) = configured_token_budget() else {
-        return DEFAULT_TOKEN_BUDGET;
+        return apply_response_ceiling(DEFAULT_TOKEN_BUDGET);
     };
-    match crate::session::var(variable) {
+    let budget = match crate::session::var(variable) {
         Ok(value) => parse_token_budget(variable, &value)
             .ok()
             .filter(|value| *value <= global)
             .unwrap_or(global),
         Err(_) => global,
-    }
+    };
+    apply_response_ceiling(budget)
+}
+
+fn apply_response_ceiling(configured: usize) -> usize {
+    RESPONSE_BUDGET_CEILING.with(|slot| {
+        slot.borrow()
+            .map_or(configured, |ceiling| configured.min(ceiling))
+    })
 }
 
 fn apply_response_reservation(variable: &'static str, configured: usize) -> usize {
@@ -411,22 +447,12 @@ impl fmt::Display for TokenCountError {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ExactPrefixMetrics {
-    pub(crate) prefix_appends: usize,
-    pub(crate) suffix_probes: usize,
-    pub(crate) full_tokenizer_calls: usize,
-}
-
 /// Exact o200k counter that permanently commits closed pre-token pieces and
 /// retains only the final piece that a later append can still change.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ExactPrefixCounter {
     committed_tokens: usize,
     unresolved_tail: String,
-    #[cfg(test)]
-    metrics: ExactPrefixMetrics,
 }
 
 impl ExactPrefixCounter {
@@ -435,8 +461,6 @@ impl ExactPrefixCounter {
         Self {
             committed_tokens: checkpoint.committed_tokens,
             unresolved_tail: checkpoint.unresolved_tail.to_string(),
-            #[cfg(test)]
-            metrics: ExactPrefixMetrics::default(),
         }
     }
 
@@ -447,10 +471,6 @@ impl ExactPrefixCounter {
         operation: Option<&dyn WorkCheckpoint>,
     ) -> Result<(), TokenCountError> {
         check_token_work(operation)?;
-        #[cfg(test)]
-        {
-            self.metrics.prefix_appends = self.metrics.prefix_appends.saturating_add(1);
-        }
         if fragment.is_empty() {
             return Ok(());
         }
@@ -496,10 +516,6 @@ impl ExactPrefixCounter {
         suffix: &str,
         operation: Option<&dyn WorkCheckpoint>,
     ) -> Result<usize, TokenCountError> {
-        #[cfg(test)]
-        {
-            self.metrics.suffix_probes = self.metrics.suffix_probes.saturating_add(1);
-        }
         let mut tail = String::with_capacity(checkpoint.unresolved_tail.len() + suffix.len());
         tail.push_str(&checkpoint.unresolved_tail);
         tail.push_str(suffix);
@@ -516,18 +532,9 @@ impl ExactPrefixCounter {
         operation: Option<&dyn WorkCheckpoint>,
     ) -> Result<usize, TokenCountError> {
         check_token_work(operation)?;
-        #[cfg(test)]
-        {
-            self.metrics.full_tokenizer_calls = self.metrics.full_tokenizer_calls.saturating_add(1);
-        }
         let count = estimate_tokens(text);
         check_token_work(operation)?;
         Ok(count)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn metrics(&self) -> ExactPrefixMetrics {
-        self.metrics
     }
 }
 
